@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Protocol, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .models import CreateJobRequest, JobRecord, JobStatus, TransformSpec, utc_now
+from .models import (
+    CreateJobRequest,
+    JobProgressUpdate,
+    JobRecord,
+    JobStatus,
+    TransformSpec,
+    utc_now,
+)
 
 
 class JobStore(Protocol):
@@ -18,10 +26,13 @@ class JobStore(Protocol):
 
     def update_job_status(self, job_id: str, status: JobStatus) -> JobRecord | None: ...
 
+    def update_job_progress(self, payload: JobProgressUpdate) -> JobRecord | None: ...
+
 
 class InMemoryJobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, JobRecord] = {}
+        self._lock = threading.Lock()
 
     def create_job(self, request: CreateJobRequest) -> JobRecord:
         record = JobRecord(
@@ -29,30 +40,59 @@ class InMemoryJobStore:
             sink=request.sink,
             transforms=request.transforms,
         )
-        self._jobs[record.id] = record
+        with self._lock:
+            self._jobs[record.id] = record
         return record
 
     def get_job(self, job_id: str) -> JobRecord | None:
-        return self._jobs.get(job_id)
+        with self._lock:
+            return self._jobs.get(job_id)
 
     def list_jobs(self) -> list[JobRecord]:
-        return sorted(
-            self._jobs.values(),
-            key=lambda job: job.created_at,
-            reverse=True,
-        )
+        with self._lock:
+            jobs = list(self._jobs.values())
+        return sorted(jobs, key=lambda job: job.created_at, reverse=True)
 
     def update_job_status(self, job_id: str, status: JobStatus) -> JobRecord | None:
-        record = self._jobs.get(job_id)
-        if record is None:
-            return None
-        updated = record.model_copy(
-            update={
-                "status": status,
-                "updated_at": utc_now(),
-            }
-        )
-        self._jobs[job_id] = updated
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None:
+                return None
+            updated = record.model_copy(
+                update={
+                    "status": status,
+                    "updated_at": utc_now(),
+                }
+            )
+            self._jobs[job_id] = updated
+        return updated
+
+    def update_job_progress(self, payload: JobProgressUpdate) -> JobRecord | None:
+        with self._lock:
+            record = self._jobs.get(payload.job_id)
+            if record is None:
+                return None
+            update: dict[str, object] = {"updated_at": utc_now()}
+            if payload.status is not None:
+                update["status"] = payload.status
+            if payload.completed_objects is not None:
+                update["completed_objects"] = payload.completed_objects
+            if payload.completed_bytes is not None:
+                update["completed_bytes"] = payload.completed_bytes
+            if payload.current_workers is not None:
+                update["current_workers"] = payload.current_workers
+            if payload.desired_workers is not None:
+                update["desired_workers"] = payload.desired_workers
+            if payload.region is not None:
+                update["region"] = payload.region
+            if payload.instance_type is not None:
+                update["instance_type"] = payload.instance_type
+            if payload.total_objects is not None:
+                update["total_objects"] = payload.total_objects
+            if payload.total_bytes is not None:
+                update["total_bytes"] = payload.total_bytes
+            updated = record.model_copy(update=update)
+            self._jobs[payload.job_id] = updated
         return updated
 
 
@@ -80,11 +120,22 @@ class PostgresJobStore:
                         source,
                         sink,
                         transforms,
+                        region,
+                        instance_type,
+                        total_objects,
+                        total_bytes,
+                        completed_objects,
+                        completed_bytes,
+                        current_workers,
+                        desired_workers,
                         created_at,
                         updated_at
                     )
-                    values (%s, %s, %s, %s, %s, %s, %s)
-                    returning id, status, source, sink, transforms, created_at, updated_at
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    returning
+                        id, status, source, sink, transforms, region, instance_type,
+                        total_objects, total_bytes, completed_objects, completed_bytes,
+                        current_workers, desired_workers, created_at, updated_at
                     """,
                     (
                         record.id,
@@ -92,6 +143,14 @@ class PostgresJobStore:
                         record.source,
                         record.sink,
                         self._jsonb(transforms),
+                        record.region,
+                        record.instance_type,
+                        record.total_objects,
+                        record.total_bytes,
+                        record.completed_objects,
+                        record.completed_bytes,
+                        record.current_workers,
+                        record.desired_workers,
                         record.created_at,
                         record.updated_at,
                     ),
@@ -104,7 +163,10 @@ class PostgresJobStore:
             with conn.cursor(row_factory=self._dict_row) as cur:
                 cur.execute(
                     """
-                    select id, status, source, sink, transforms, created_at, updated_at
+                    select
+                        id, status, source, sink, transforms, region, instance_type,
+                        total_objects, total_bytes, completed_objects, completed_bytes,
+                        current_workers, desired_workers, created_at, updated_at
                     from jobs
                     where id = %s
                     """,
@@ -120,7 +182,10 @@ class PostgresJobStore:
             with conn.cursor(row_factory=self._dict_row) as cur:
                 cur.execute(
                     """
-                    select id, status, source, sink, transforms, created_at, updated_at
+                    select
+                        id, status, source, sink, transforms, region, instance_type,
+                        total_objects, total_bytes, completed_objects, completed_bytes,
+                        current_workers, desired_workers, created_at, updated_at
                     from jobs
                     order by created_at desc
                     """
@@ -136,9 +201,63 @@ class PostgresJobStore:
                     update jobs
                     set status = %s, updated_at = %s
                     where id = %s
-                    returning id, status, source, sink, transforms, created_at, updated_at
+                    returning
+                        id, status, source, sink, transforms, region, instance_type,
+                        total_objects, total_bytes, completed_objects, completed_bytes,
+                        current_workers, desired_workers, created_at, updated_at
                     """,
                     (status.value, utc_now(), job_id),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return self._row_to_job(row)
+
+    def update_job_progress(self, payload: JobProgressUpdate) -> JobRecord | None:
+        update_fields: list[str] = ["updated_at = %s"]
+        params: list[object] = [utc_now()]
+        if payload.status is not None:
+            update_fields.append("status = %s")
+            params.append(payload.status.value)
+        if payload.completed_objects is not None:
+            update_fields.append("completed_objects = %s")
+            params.append(payload.completed_objects)
+        if payload.completed_bytes is not None:
+            update_fields.append("completed_bytes = %s")
+            params.append(payload.completed_bytes)
+        if payload.current_workers is not None:
+            update_fields.append("current_workers = %s")
+            params.append(payload.current_workers)
+        if payload.desired_workers is not None:
+            update_fields.append("desired_workers = %s")
+            params.append(payload.desired_workers)
+        if payload.region is not None:
+            update_fields.append("region = %s")
+            params.append(payload.region)
+        if payload.instance_type is not None:
+            update_fields.append("instance_type = %s")
+            params.append(payload.instance_type)
+        if payload.total_objects is not None:
+            update_fields.append("total_objects = %s")
+            params.append(payload.total_objects)
+        if payload.total_bytes is not None:
+            update_fields.append("total_bytes = %s")
+            params.append(payload.total_bytes)
+        params.append(payload.job_id)
+
+        with self._connect(self._dsn, autocommit=True) as conn:
+            with conn.cursor(row_factory=self._dict_row) as cur:
+                cur.execute(
+                    f"""
+                    update jobs
+                    set {", ".join(update_fields)}
+                    where id = %s
+                    returning
+                        id, status, source, sink, transforms, region, instance_type,
+                        total_objects, total_bytes, completed_objects, completed_bytes,
+                        current_workers, desired_workers, created_at, updated_at
+                    """,
+                    params,
                 )
                 row = cur.fetchone()
         if row is None:
@@ -164,10 +283,34 @@ class PostgresJobStore:
                         source text not null,
                         sink text not null,
                         transforms jsonb not null,
+                        region text,
+                        instance_type text,
+                        total_objects bigint,
+                        total_bytes bigint,
+                        completed_objects bigint not null default 0,
+                        completed_bytes bigint not null default 0,
+                        current_workers integer not null default 0,
+                        desired_workers integer not null default 0,
                         created_at timestamptz not null,
                         updated_at timestamptz not null
                     )
                     """
+                )
+                cur.execute("alter table jobs add column if not exists region text")
+                cur.execute("alter table jobs add column if not exists instance_type text")
+                cur.execute("alter table jobs add column if not exists total_objects bigint")
+                cur.execute("alter table jobs add column if not exists total_bytes bigint")
+                cur.execute(
+                    "alter table jobs add column if not exists completed_objects bigint not null default 0"
+                )
+                cur.execute(
+                    "alter table jobs add column if not exists completed_bytes bigint not null default 0"
+                )
+                cur.execute(
+                    "alter table jobs add column if not exists current_workers integer not null default 0"
+                )
+                cur.execute(
+                    "alter table jobs add column if not exists desired_workers integer not null default 0"
                 )
 
     def _row_to_job(self, row: object) -> JobRecord:
@@ -184,6 +327,14 @@ class PostgresJobStore:
             source=str(data["source"]),
             sink=str(data["sink"]),
             transforms=transforms,
+            region=cast(str | None, data.get("region")),
+            instance_type=cast(str | None, data.get("instance_type")),
+            total_objects=cast(int | None, data.get("total_objects")),
+            total_bytes=cast(int | None, data.get("total_bytes")),
+            completed_objects=int(cast(int | None, data.get("completed_objects")) or 0),
+            completed_bytes=int(cast(int | None, data.get("completed_bytes")) or 0),
+            current_workers=int(cast(int | None, data.get("current_workers")) or 0),
+            desired_workers=int(cast(int | None, data.get("desired_workers")) or 0),
             created_at=cast(datetime, data["created_at"]),
             updated_at=cast(datetime, data["updated_at"]),
         )

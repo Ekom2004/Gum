@@ -11,6 +11,7 @@ router = APIRouter(prefix="/v1/jobs", tags=["jobs"])
 def create_job(payload: CreateJobRequest, request: Request) -> JobRecord:
     store = request.app.state.store
     launcher = request.app.state.launcher
+    scaler = request.app.state.scaler
     record = store.create_job(payload)
     try:
         launcher.launch(record, str(request.base_url).rstrip("/"))
@@ -24,6 +25,7 @@ def create_job(payload: CreateJobRequest, request: Request) -> JobRecord:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="job launched but failed to persist queued status",
         )
+    scaler.wake()
     return queued
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 import math
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
@@ -167,6 +167,14 @@ class JobRecord(BaseModel):
     source: str
     sink: str
     transforms: list[TransformSpec]
+    region: Optional[str] = None
+    instance_type: Optional[str] = None
+    total_objects: Optional[int] = None
+    total_bytes: Optional[int] = None
+    completed_objects: int = 0
+    completed_bytes: int = 0
+    current_workers: int = 0
+    desired_workers: int = 0
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -175,6 +183,20 @@ class JobStatusUpdate(BaseModel):
     status: JobStatus
 
 
+class JobProgressUpdate(BaseModel):
+    job_id: str
+    status: Optional[JobStatus] = None
+    completed_objects: Optional[int] = None
+    completed_bytes: Optional[int] = None
+    current_workers: Optional[int] = None
+    desired_workers: Optional[int] = None
+    region: Optional[str] = None
+    instance_type: Optional[str] = None
+    total_objects: Optional[int] = None
+    total_bytes: Optional[int] = None
+
+
 class JobCompletionWebhook(BaseModel):
     job_id: str
     total_bytes_processed: int = 0
+    total_objects_processed: int = 0

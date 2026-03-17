@@ -46,14 +46,21 @@ static STATE_STORE: OnceLock<Arc<state_store::FileCoordinatorStore>> = OnceLock:
 static JOB_SPEC_TEMPLATE: OnceLock<Option<ConfiguredJobSpec>> = OnceLock::new();
 
 #[derive(Debug, serde::Serialize)]
-struct JobStatusWebhook<'a> {
+struct JobProgressWebhook<'a> {
+    job_id: &'a str,
     status: &'a str,
+    completed_objects: u64,
+    completed_bytes: u64,
+    current_workers: u32,
+    total_objects: u64,
+    total_bytes: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
 struct JobCompleteWebhook<'a> {
     job_id: &'a str,
     total_bytes_processed: u64,
+    total_objects_processed: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -269,36 +276,48 @@ struct JobStatusNotifier {
     api_base_url: String,
     running_sent: AtomicBool,
     complete_sent: AtomicBool,
+    total_objects: u64,
+    total_bytes: u64,
 }
 
 impl JobStatusNotifier {
-    fn new(job_id: String, api_base_url: String) -> Self {
+    fn new(job_id: String, api_base_url: String, total_objects: u64, total_bytes: u64) -> Self {
         Self {
             client: reqwest::Client::new(),
             job_id,
             api_base_url: api_base_url.trim_end_matches('/').to_string(),
             running_sent: AtomicBool::new(false),
             complete_sent: AtomicBool::new(false),
+            total_objects,
+            total_bytes,
         }
     }
 
-    fn notify_running(self: &Arc<Self>) {
-        if self.running_sent.swap(true, Ordering::AcqRel) {
-            return;
-        }
+    fn notify_progress(
+        self: &Arc<Self>,
+        completed_objects: u64,
+        completed_bytes: u64,
+        current_workers: u32,
+    ) {
+        self.running_sent.store(true, Ordering::Release);
         let notifier = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(err) = notifier
                 .client
-                .post(format!(
-                    "{}/internal/job-status/{}",
-                    notifier.api_base_url, notifier.job_id
-                ))
-                .json(&JobStatusWebhook { status: "RUNNING" })
+                .post(format!("{}/internal/job-progress", notifier.api_base_url))
+                .json(&JobProgressWebhook {
+                    job_id: &notifier.job_id,
+                    status: "RUNNING",
+                    completed_objects,
+                    completed_bytes,
+                    current_workers,
+                    total_objects: notifier.total_objects,
+                    total_bytes: notifier.total_bytes,
+                })
                 .send()
                 .await
             {
-                tracing::warn!(error = %err, job_id = %notifier.job_id, "failed to notify API that job is RUNNING");
+                tracing::warn!(error = %err, job_id = %notifier.job_id, "failed to notify API with job progress");
             }
         });
     }
@@ -314,7 +333,8 @@ impl JobStatusNotifier {
                 .post(format!("{}/internal/job-complete", notifier.api_base_url))
                 .json(&JobCompleteWebhook {
                     job_id: &notifier.job_id,
-                    total_bytes_processed: 0,
+                    total_bytes_processed: notifier.total_bytes,
+                    total_objects_processed: notifier.total_objects,
                 })
                 .send()
                 .await
@@ -391,6 +411,43 @@ fn count_samples_in_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<u64> 
             .ok_or_else(|| anyhow::anyhow!("manifest row count overflow"))?;
     }
     Ok(n)
+}
+
+fn manifest_stats_from_canonical_manifest_tsv(bytes: &[u8]) -> anyhow::Result<(u64, u64)> {
+    let s = std::str::from_utf8(bytes).map_err(|e| anyhow::anyhow!("manifest not utf-8: {e}"))?;
+    let mut lines = s.lines();
+    let first = lines
+        .by_ref()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("empty manifest"))?;
+    anyhow::ensure!(
+        first.trim_start().starts_with("schema_version="),
+        "manifest header missing schema_version"
+    );
+
+    let mut object_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    for raw in lines {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let cols = raw.split('\t').collect::<Vec<_>>();
+        anyhow::ensure!(cols.len() >= 4, "manifest row expected at least 4 columns");
+        object_count = object_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("manifest object count overflow"))?;
+        let byte_length = cols[3].trim();
+        if !byte_length.is_empty() {
+            total_bytes = total_bytes
+                .checked_add(
+                    byte_length
+                        .parse::<u64>()
+                        .map_err(|e| anyhow::anyhow!("invalid manifest byte_length: {e}"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("manifest total_bytes overflow"))?;
+        }
+    }
+    Ok((object_count, total_bytes))
 }
 
 fn build_available_ranges_with_recovery(
@@ -708,6 +765,38 @@ impl CoordinatorSvc {
 
     fn active_node_count_locked(state: &CoordinatorState) -> u32 {
         (state.nodes.len().saturating_sub(state.departed_nodes.len())) as u32
+    }
+
+    fn completed_object_count_locked(state: &CoordinatorState) -> u64 {
+        let completed_ranges = state
+            .completed_ranges
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .sum::<u64>();
+        let in_flight_progress = state
+            .leases
+            .values()
+            .filter_map(|lease| {
+                lease.range
+                    .as_ref()
+                    .map(|range| lease.cursor.saturating_sub(range.start_id))
+            })
+            .sum::<u64>();
+        completed_ranges.saturating_add(in_flight_progress)
+    }
+
+    fn approximate_completed_bytes(
+        total_objects: u64,
+        total_bytes: u64,
+        completed_objects: u64,
+    ) -> u64 {
+        if total_objects == 0 || total_bytes == 0 {
+            return 0;
+        }
+        ((completed_objects as u128)
+            .saturating_mul(total_bytes as u128)
+            .checked_div(total_objects as u128)
+            .unwrap_or(0)) as u64
     }
 
     fn elastic_view_locked(state: &CoordinatorState) -> ElasticTransitionView {
@@ -1629,12 +1718,12 @@ impl CoordinatorSvc {
                 intervals_snapshot = Some(s);
             }
 
-            let job_ready = state.nodes.len() as u32 >= self.world_size;
+            let job_started = state.frozen_membership.is_some();
             let rank_ranges_empty = match &state.rank_ranges {
                 None => true,
                 Some(qs) => qs.iter().all(|q| q.is_empty()),
             };
-            if job_ready
+            if job_started
                 && !state.drained_emitted
                 && state.leases.is_empty()
                 && state.available_ranges.is_empty()
@@ -2303,7 +2392,20 @@ impl Coordinator for CoordinatorSvc {
                 }
             }
             if let Some(notifier) = self.job_status_notifier.as_ref() {
-                notifier.notify_running();
+                let state = self.state.read().await;
+                let completed_objects = Self::completed_object_count_locked(&state);
+                let current_workers = Self::active_node_count_locked(&state);
+                let completed_bytes = Self::approximate_completed_bytes(
+                    notifier.total_objects,
+                    notifier.total_bytes,
+                    completed_objects,
+                );
+                drop(state);
+                notifier.notify_progress(
+                    completed_objects,
+                    completed_bytes,
+                    current_workers,
+                );
             }
             self.update_gauges().await;
             self.persist_state_store_snapshot().await?;
@@ -2353,7 +2455,20 @@ impl Coordinator for CoordinatorSvc {
             "progress accepted"
         );
         if let Some(notifier) = self.job_status_notifier.as_ref() {
-            notifier.notify_running();
+            let state = self.state.read().await;
+            let completed_objects = Self::completed_object_count_locked(&state);
+            let current_workers = Self::active_node_count_locked(&state);
+            let completed_bytes = Self::approximate_completed_bytes(
+                notifier.total_objects,
+                notifier.total_bytes,
+                completed_objects,
+            );
+            drop(state);
+            notifier.notify_progress(
+                completed_objects,
+                completed_bytes,
+                current_workers,
+            );
         }
         self.persist_state_store_snapshot().await?;
         Ok(Response::new(ReportProgressResponse {}))
@@ -2667,6 +2782,16 @@ async fn main() -> Result<()> {
         } else {
             0
         };
+        let total_bytes = if resolved_manifest_hash != "dev" {
+            match store.get_manifest_bytes(&ManifestHash(resolved_manifest_hash.clone())) {
+                Ok(bytes) => manifest_stats_from_canonical_manifest_tsv(&bytes)
+                    .map(|(_, total_bytes)| total_bytes)
+                    .unwrap_or(0),
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
 
         let (available_ranges, skipped_ranges, resumed_ranges, terminal_progress_completed) =
             build_available_ranges_with_recovery(
@@ -2711,7 +2836,14 @@ async fn main() -> Result<()> {
         let job_status_notifier = args
             .api_base_url
             .as_ref()
-            .map(|base_url| Arc::new(JobStatusNotifier::new(args.job_id.clone(), base_url.clone())));
+            .map(|base_url| {
+                Arc::new(JobStatusNotifier::new(
+                    args.job_id.clone(),
+                    base_url.clone(),
+                    total_samples,
+                    total_bytes,
+                ))
+            });
 
         let svc = CoordinatorSvc {
             state: Arc::new(RwLock::new(CoordinatorState {
