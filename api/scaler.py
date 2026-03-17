@@ -119,7 +119,13 @@ class JobScaler:
                 )
                 if updated is not None:
                     record = updated
-            self._launcher.scale_local_agents(record, api_base_url, plan.worker_count)
+            self._launcher.scale_workers(
+                record,
+                api_base_url,
+                plan.worker_count,
+                plan.region,
+                plan.instance_type,
+            )
 
     def _plan(self, record: JobRecord) -> FleetPlan:
         media_family = self._media_family(record)
