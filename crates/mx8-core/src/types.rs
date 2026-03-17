@@ -93,8 +93,10 @@ impl TransformSpec {
     pub fn validate(&self) -> Result<(), TransformSpecError> {
         match self {
             Self::VideoTranscode { codec, crf } => {
-                if codec.trim().is_empty() {
-                    return Err(TransformSpecError::EmptyStringField("codec"));
+                if normalize_video_codec(codec).is_none() {
+                    return Err(TransformSpecError::UnsupportedVideoCodec(
+                        codec.trim().to_string(),
+                    ));
                 }
                 if *crf > 51 {
                     return Err(TransformSpecError::CrfOutOfRange(*crf));
@@ -110,13 +112,17 @@ impl TransformSpec {
                 if !fps.is_finite() || *fps <= 0.0 {
                     return Err(TransformSpecError::FpsOutOfRange(*fps));
                 }
-                if format.trim().is_empty() {
-                    return Err(TransformSpecError::EmptyStringField("format"));
+                if normalize_frame_format(format).is_none() {
+                    return Err(TransformSpecError::UnsupportedFrameFormat(
+                        format.trim().to_string(),
+                    ));
                 }
             }
             Self::VideoExtractAudio { format, bitrate } => {
-                if format.trim().is_empty() {
-                    return Err(TransformSpecError::EmptyStringField("format"));
+                if normalize_audio_format(format).is_none() {
+                    return Err(TransformSpecError::UnsupportedAudioFormat(
+                        format.trim().to_string(),
+                    ));
                 }
                 if bitrate.trim().is_empty() {
                     return Err(TransformSpecError::EmptyStringField("bitrate"));
@@ -158,6 +164,32 @@ pub fn normalize_image_format(format: &str) -> Option<&'static str> {
         "jpg" | "jpeg" => Some("jpg"),
         "png" => Some("png"),
         "webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+pub fn normalize_video_codec(codec: &str) -> Option<&'static str> {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "h264" => Some("h264"),
+        "h265" | "hevc" => Some("h265"),
+        "av1" => Some("av1"),
+        _ => None,
+    }
+}
+
+pub fn normalize_audio_format(format: &str) -> Option<&'static str> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "mp3" => Some("mp3"),
+        "wav" => Some("wav"),
+        "flac" => Some("flac"),
+        _ => None,
+    }
+}
+
+pub fn normalize_frame_format(format: &str) -> Option<&'static str> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("jpg"),
+        "png" => Some("png"),
         _ => None,
     }
 }
@@ -293,6 +325,12 @@ pub enum TransformSpecError {
     ImageQualityOutOfRange(u32),
     #[error("video crf must be in 0..=51 (got {0})")]
     CrfOutOfRange(u32),
+    #[error("video codec must be one of h264, h265, av1 (got {0})")]
+    UnsupportedVideoCodec(String),
+    #[error("audio format must be one of mp3, wav, flac (got {0})")]
+    UnsupportedAudioFormat(String),
+    #[error("frame format must be one of jpg, png (got {0})")]
+    UnsupportedFrameFormat(String),
     #[error("audio loudness must be finite (got {0})")]
     InvalidLoudness(f32),
 }
@@ -390,5 +428,47 @@ mod tests {
         .validate()
         .expect_err("expected invalid quality");
         assert_eq!(err, TransformSpecError::ImageQualityOutOfRange(101));
+    }
+
+    #[test]
+    fn video_transcode_validate_rejects_unsupported_codec() {
+        let err = TransformSpec::VideoTranscode {
+            codec: "vp9".to_string(),
+            crf: 23,
+        }
+        .validate()
+        .expect_err("expected unsupported codec");
+        assert_eq!(
+            err,
+            TransformSpecError::UnsupportedVideoCodec("vp9".to_string())
+        );
+    }
+
+    #[test]
+    fn video_extract_audio_validate_rejects_unsupported_format() {
+        let err = TransformSpec::VideoExtractAudio {
+            format: "aac".to_string(),
+            bitrate: "128k".to_string(),
+        }
+        .validate()
+        .expect_err("expected unsupported audio format");
+        assert_eq!(
+            err,
+            TransformSpecError::UnsupportedAudioFormat("aac".to_string())
+        );
+    }
+
+    #[test]
+    fn video_extract_frames_validate_rejects_unsupported_format() {
+        let err = TransformSpec::VideoExtractFrames {
+            fps: 1.0,
+            format: "webp".to_string(),
+        }
+        .validate()
+        .expect_err("expected unsupported frame format");
+        assert_eq!(
+            err,
+            TransformSpecError::UnsupportedFrameFormat("webp".to_string())
+        );
     }
 }

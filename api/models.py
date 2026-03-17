@@ -63,6 +63,65 @@ class TransformSpec(BaseModel):
                 raise ValueError("image.convert only accepts format and quality")
             self.params["format"] = normalized
             self.params["quality"] = quality
+        elif self.type == "video.transcode":
+            allowed = {"codec", "crf"}
+            codec = self.params.get("codec")
+            crf = self.params.get("crf", 23)
+            if not isinstance(codec, str):
+                raise ValueError("video.transcode requires codec")
+            normalized_codec = codec.strip().lower()
+            if normalized_codec == "hevc":
+                normalized_codec = "h265"
+            if normalized_codec not in {"h264", "h265", "av1"}:
+                raise ValueError("video.transcode codec must be one of h264, h265, av1")
+            if not isinstance(crf, int) or not 0 <= crf <= 51:
+                raise ValueError("video.transcode crf must be in 0..=51")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("video.transcode only accepts codec and crf")
+            self.params["codec"] = normalized_codec
+            self.params["crf"] = crf
+        elif self.type == "video.resize":
+            allowed = {"width", "height", "maintain_aspect"}
+            width = self.params.get("width")
+            height = self.params.get("height")
+            if not isinstance(width, int) or width <= 0:
+                raise ValueError("video.resize requires width > 0")
+            if not isinstance(height, int) or height <= 0:
+                raise ValueError("video.resize requires height > 0")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("video.resize only accepts width, height, maintain_aspect")
+        elif self.type == "video.extract_audio":
+            allowed = {"format", "bitrate"}
+            format_value = self.params.get("format")
+            bitrate = self.params.get("bitrate", "128k")
+            if not isinstance(format_value, str):
+                raise ValueError("video.extract_audio requires format")
+            normalized = format_value.strip().lower()
+            if normalized not in {"mp3", "wav", "flac"}:
+                raise ValueError("video.extract_audio format must be one of mp3, wav, flac")
+            if not isinstance(bitrate, str) or not bitrate.strip():
+                raise ValueError("video.extract_audio bitrate must be non-empty")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("video.extract_audio only accepts format and bitrate")
+            self.params["format"] = normalized
+            self.params["bitrate"] = bitrate.strip()
+        elif self.type == "video.extract_frames":
+            allowed = {"fps", "format"}
+            fps = self.params.get("fps")
+            format_value = self.params.get("format")
+            if not isinstance(fps, (int, float)) or fps <= 0:
+                raise ValueError("video.extract_frames fps must be > 0")
+            if not isinstance(format_value, str):
+                raise ValueError("video.extract_frames requires format")
+            normalized = format_value.strip().lower()
+            if normalized == "jpeg":
+                normalized = "jpg"
+            if normalized not in {"jpg", "png"}:
+                raise ValueError("video.extract_frames format must be one of jpg, png")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("video.extract_frames only accepts fps and format")
+            self.params["fps"] = float(fps)
+            self.params["format"] = normalized
         return self
 
 
