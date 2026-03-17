@@ -1,0 +1,3807 @@
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::{io::BufRead, io::BufReader};
+
+use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+
+use mx8_observe::metrics::{Counter, Gauge};
+
+use crate::sink::Sink;
+use crate::types::Batch;
+
+#[cfg(feature = "s3")]
+use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
+
+#[cfg(feature = "s3")]
+type S3Client = aws_sdk_s3::Client;
+
+#[cfg(feature = "s3")]
+type S3SdkError<E> = aws_sdk_s3::error::SdkError<E>;
+
+#[cfg(not(feature = "s3"))]
+type S3Client = ();
+
+#[cfg(feature = "gcs")]
+type GcsClient = google_cloud_storage::client::Client;
+
+#[cfg(not(feature = "gcs"))]
+type GcsClient = ();
+
+#[cfg(feature = "azure")]
+type AzureClient = azure_storage_blobs::prelude::ClientBuilder;
+
+#[cfg(not(feature = "azure"))]
+type AzureClient = ();
+
+type HttpClient = reqwest::Client;
+
+#[derive(Clone)]
+struct StorageClients<'a> {
+    s3: Option<&'a S3Client>,
+    gcs: Option<&'a GcsClient>,
+    azure: Option<&'a AzureClient>,
+    http: Option<&'a HttpClient>,
+}
+
+const PERMIT_UNIT_BYTES: u64 = 1024;
+const BATCH_JITTER_WINDOW: usize = 128;
+const BYTE_BAND_LOWER_PCT: u64 = 85;
+const BYTE_BAND_UPPER_PCT: u64 = 115;
+const BYTE_BAND_UPPER_MAX_PCT: u64 = 130;
+const BYTE_BAND_MIN_SPREAD_PCT: u64 = 10;
+const BATCH_JITTER_SLO_MAX_MILLI: u64 = 1250;
+const BATCH_JITTER_RELAX_MILLI: u64 = 1100;
+const BATCH_JITTER_ADJUST_COOLDOWN_BATCHES: u64 = 16;
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 2;
+const HTTP_REQUEST_TIMEOUT_SECS: u64 = 15;
+const HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeCaps {
+    pub max_inflight_bytes: u64,
+    pub max_queue_batches: usize,
+    pub batch_size_samples: usize,
+    pub prefetch_batches: usize,
+    pub target_batch_bytes: Option<u64>,
+    pub max_batch_bytes: Option<u64>,
+    pub max_process_rss_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeMetrics {
+    pub delivered_batches_total: Counter,
+    pub delivered_samples_total: Counter,
+    pub inflight_bytes: Gauge,
+    pub inflight_bytes_high_water: Gauge,
+    pub process_rss_bytes: Gauge,
+    pub ram_high_water_bytes: Gauge,
+    pub batch_payload_bytes_p50: Gauge,
+    pub batch_payload_bytes_p95: Gauge,
+    pub batch_payload_bytes_p95_over_p50_milli: Gauge,
+    pub batch_payload_window_size: Gauge,
+    pub batch_jitter_slo_breaches_total: Counter,
+    pub batch_jitter_band_adjustments_total: Counter,
+    pub batch_jitter_band_lower_pct: Gauge,
+    pub batch_jitter_band_upper_pct: Gauge,
+    batch_payload_window: Mutex<VecDeque<u64>>,
+}
+
+impl RuntimeMetrics {
+    fn on_inflight_add(&self, delta: u64) {
+        let now = self.inflight_bytes.add(delta);
+        self.inflight_bytes_high_water.max(now);
+        self.ram_high_water_bytes.max(now);
+    }
+
+    fn on_inflight_sub(&self, delta: u64) {
+        self.inflight_bytes.sub(delta);
+    }
+
+    fn on_process_rss_sample(&self, rss: u64) {
+        self.process_rss_bytes.set(rss);
+        self.ram_high_water_bytes.max(rss);
+    }
+
+    fn on_batch_payload_bytes(&self, payload_bytes: u64) {
+        let mut window = match self.batch_payload_window.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if window.len() >= BATCH_JITTER_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(payload_bytes);
+        let mut sorted: Vec<u64> = window.iter().copied().collect();
+        sorted.sort_unstable();
+        if sorted.is_empty() {
+            return;
+        }
+        let len = sorted.len();
+        let p50_idx = (len - 1) / 2;
+        let p95_idx = ((len - 1) * 95) / 100;
+        let p50 = sorted[p50_idx];
+        let p95 = sorted[p95_idx];
+        let ratio_milli = if p50 == 0 {
+            0
+        } else {
+            ((p95 as f64 / p50 as f64) * 1000.0).round() as u64
+        };
+        self.batch_payload_bytes_p50.set(p50);
+        self.batch_payload_bytes_p95.set(p95);
+        self.batch_payload_bytes_p95_over_p50_milli.set(ratio_milli);
+        self.batch_payload_window_size.set(len as u64);
+    }
+}
+
+fn byte_mode_band(
+    target_batch_bytes: u64,
+    max_batch_bytes: u64,
+    lower_pct: u64,
+    upper_pct: u64,
+) -> (u64, u64) {
+    let lower = target_batch_bytes
+        .saturating_mul(lower_pct)
+        .div_ceil(100)
+        .max(1)
+        .min(max_batch_bytes);
+    let upper = target_batch_bytes
+        .saturating_mul(upper_pct)
+        .div_ceil(100)
+        .max(lower)
+        .min(max_batch_bytes);
+    (lower, upper)
+}
+
+pub struct BatchLease {
+    pub batch: Batch,
+    pub bytes: u64,
+    metrics: Arc<RuntimeMetrics>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for BatchLease {
+    fn drop(&mut self) {
+        self.metrics.on_inflight_sub(self.bytes);
+    }
+}
+
+pub struct ExtraInFlightLease {
+    pub bytes: u64,
+    metrics: Arc<RuntimeMetrics>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ExtraInFlightLease {
+    fn drop(&mut self) {
+        self.metrics.on_inflight_sub(self.bytes);
+    }
+}
+
+#[derive(Clone)]
+pub struct Pipeline {
+    caps: RuntimeCaps,
+    metrics: Arc<RuntimeMetrics>,
+    inflight_sem: Arc<Semaphore>,
+    rss_check_counter: Arc<AtomicU64>,
+    prefetch_batches: Arc<AtomicUsize>,
+    max_queue_batches: Arc<AtomicUsize>,
+    batch_band_lower_pct: Arc<AtomicU64>,
+    batch_band_upper_pct: Arc<AtomicU64>,
+    batch_jitter_adjust_cooldown: Arc<AtomicU64>,
+}
+
+impl Pipeline {
+    pub fn new(caps: RuntimeCaps) -> Self {
+        let max_units = caps.max_inflight_bytes.div_ceil(PERMIT_UNIT_BYTES).max(1);
+        let max = usize::try_from(max_units).unwrap_or(usize::MAX);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        metrics.batch_jitter_band_lower_pct.set(BYTE_BAND_LOWER_PCT);
+        metrics.batch_jitter_band_upper_pct.set(BYTE_BAND_UPPER_PCT);
+        Self {
+            caps,
+            metrics,
+            inflight_sem: Arc::new(Semaphore::new(max)),
+            rss_check_counter: Arc::new(AtomicU64::new(0)),
+            prefetch_batches: Arc::new(AtomicUsize::new(caps.prefetch_batches.max(1))),
+            max_queue_batches: Arc::new(AtomicUsize::new(caps.max_queue_batches.max(1))),
+            batch_band_lower_pct: Arc::new(AtomicU64::new(BYTE_BAND_LOWER_PCT)),
+            batch_band_upper_pct: Arc::new(AtomicU64::new(BYTE_BAND_UPPER_PCT)),
+            batch_jitter_adjust_cooldown: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn metrics(&self) -> Arc<RuntimeMetrics> {
+        self.metrics.clone()
+    }
+
+    pub fn effective_prefetch_batches(&self) -> usize {
+        self.prefetch_batches.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn effective_max_queue_batches(&self) -> usize {
+        self.max_queue_batches.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn set_prefetch_batches(&self, prefetch_batches: usize) {
+        self.prefetch_batches
+            .store(prefetch_batches.max(1), Ordering::Relaxed);
+    }
+
+    pub fn set_max_queue_batches(&self, max_queue_batches: usize) {
+        self.max_queue_batches
+            .store(max_queue_batches.max(1), Ordering::Relaxed);
+    }
+
+    pub async fn reserve_extra_inflight(
+        &self,
+        extra_bytes: u64,
+    ) -> Result<Option<ExtraInFlightLease>> {
+        if extra_bytes == 0 {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            extra_bytes <= self.caps.max_inflight_bytes,
+            "extra inflight bytes {} exceeds max_inflight_bytes {}",
+            extra_bytes,
+            self.caps.max_inflight_bytes
+        );
+
+        let permit_units = extra_bytes.div_ceil(PERMIT_UNIT_BYTES).max(1);
+        anyhow::ensure!(
+            permit_units <= u32::MAX as u64,
+            "extra inflight reservation too large for permit accounting ({} units)",
+            permit_units
+        );
+        let permit = self
+            .inflight_sem
+            .clone()
+            .acquire_many_owned(permit_units as u32)
+            .await?;
+        self.metrics.on_inflight_add(extra_bytes);
+        Ok(Some(ExtraInFlightLease {
+            bytes: extra_bytes,
+            metrics: self.metrics.clone(),
+            _permit: permit,
+        }))
+    }
+
+    fn current_batch_band_pcts(&self) -> (u64, u64) {
+        let lower = self.batch_band_lower_pct.load(Ordering::Relaxed);
+        let upper = self.batch_band_upper_pct.load(Ordering::Relaxed);
+        (
+            lower,
+            upper.max(lower.saturating_add(BYTE_BAND_MIN_SPREAD_PCT)),
+        )
+    }
+
+    fn maybe_adjust_jitter_guardrail(&self) {
+        let window_size = self.metrics.batch_payload_window_size.get() as usize;
+        if window_size < BATCH_JITTER_WINDOW {
+            return;
+        }
+
+        let cooldown = self.batch_jitter_adjust_cooldown.load(Ordering::Relaxed);
+        if cooldown > 0 {
+            self.batch_jitter_adjust_cooldown
+                .store(cooldown.saturating_sub(1), Ordering::Relaxed);
+            return;
+        }
+
+        let ratio_milli = self.metrics.batch_payload_bytes_p95_over_p50_milli.get();
+        let (lower, upper) = self.current_batch_band_pcts();
+        let mut next_lower = lower;
+        let mut next_upper = upper;
+
+        if ratio_milli > BATCH_JITTER_SLO_MAX_MILLI {
+            self.metrics.batch_jitter_slo_breaches_total.inc();
+            next_lower = (lower.saturating_add(2)).min(95);
+            next_upper = upper
+                .saturating_sub(2)
+                .max(next_lower.saturating_add(BYTE_BAND_MIN_SPREAD_PCT));
+            next_upper = next_upper.min(BYTE_BAND_UPPER_MAX_PCT);
+            tracing::warn!(
+                target: "mx8_proof",
+                event = "batch_jitter_slo_breached",
+                p95_over_p50 = ratio_milli as f64 / 1000.0,
+                slo_max = BATCH_JITTER_SLO_MAX_MILLI as f64 / 1000.0,
+                old_band_lower_pct = lower,
+                old_band_upper_pct = upper,
+                new_band_lower_pct = next_lower,
+                new_band_upper_pct = next_upper,
+                "batch payload jitter exceeded SLO"
+            );
+        } else if ratio_milli < BATCH_JITTER_RELAX_MILLI {
+            if lower > BYTE_BAND_LOWER_PCT {
+                next_lower = lower.saturating_sub(1).max(BYTE_BAND_LOWER_PCT);
+            }
+            if upper < BYTE_BAND_UPPER_PCT {
+                next_upper = upper.saturating_add(1).min(BYTE_BAND_UPPER_PCT);
+            }
+            next_upper = next_upper.max(next_lower.saturating_add(BYTE_BAND_MIN_SPREAD_PCT));
+        }
+
+        if next_lower != lower || next_upper != upper {
+            self.batch_band_lower_pct
+                .store(next_lower, Ordering::Relaxed);
+            self.batch_band_upper_pct
+                .store(next_upper, Ordering::Relaxed);
+            self.batch_jitter_adjust_cooldown
+                .store(BATCH_JITTER_ADJUST_COOLDOWN_BATCHES, Ordering::Relaxed);
+            self.metrics.batch_jitter_band_adjustments_total.inc();
+            self.metrics.batch_jitter_band_lower_pct.set(next_lower);
+            self.metrics.batch_jitter_band_upper_pct.set(next_upper);
+            tracing::info!(
+                target: "mx8_proof",
+                event = "batch_jitter_band_adjusted",
+                p95_over_p50 = ratio_milli as f64 / 1000.0,
+                old_band_lower_pct = lower,
+                old_band_upper_pct = upper,
+                new_band_lower_pct = next_lower,
+                new_band_upper_pct = next_upper,
+                "adjusted byte-batch jitter guardrail band"
+            );
+        }
+    }
+
+    /// Spawn a manifest-driven producer which streams `BatchLease`s to the caller.
+    ///
+    /// The returned lease holds the inflight RAM permit until it is dropped, so a consumer
+    /// (e.g., a Python iterator) can apply backpressure by holding onto batches.
+    pub async fn spawn_manifest_bytes_stream(
+        &self,
+        manifest_bytes: Vec<u8>,
+    ) -> Result<(
+        mpsc::Receiver<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let records = parse_canonical_manifest_tsv(&manifest_bytes)?;
+        let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_gcs = records.iter().any(|r| r.location.starts_with("gs://"));
+        let has_http = records
+            .iter()
+            .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
+        let s3_client: Option<S3Client> = if has_s3 {
+            #[cfg(feature = "s3")]
+            {
+                Some(crate::s3::client_from_env().await?)
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let gcs_client: Option<GcsClient> = if has_gcs {
+            #[cfg(feature = "gcs")]
+            {
+                Some(crate::gcs::client_from_env().await?)
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                anyhow::bail!(
+                    "manifest contains gs:// locations but mx8-runtime was built without feature 'gcs'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let has_azure = records.iter().any(|r| r.location.starts_with("az://"));
+        let azure_client: Option<AzureClient> = if has_azure {
+            #[cfg(feature = "azure")]
+            {
+                Some(crate::azure::client_builder_from_env()?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!(
+                    "manifest contains az:// locations but mx8-runtime was built without feature 'azure'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let http_client: Option<HttpClient> = if has_http {
+            Some(build_http_client()?)
+        } else {
+            None
+        };
+
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
+        let pipeline = self.clone();
+        let task = tokio::spawn(async move {
+            pipeline
+                .produce_manifest_batches(
+                    tx,
+                    records,
+                    s3_client,
+                    gcs_client,
+                    azure_client,
+                    http_client,
+                )
+                .await
+        });
+        Ok((rx, task))
+    }
+
+    pub async fn spawn_manifest_bytes_range_stream(
+        &self,
+        manifest_bytes: Vec<u8>,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<(
+        mpsc::Receiver<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let records = parse_canonical_manifest_tsv(&manifest_bytes)?;
+        let records = select_record_range(records, start_id, end_id)?;
+
+        let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_gcs = records.iter().any(|r| r.location.starts_with("gs://"));
+        let has_http = records
+            .iter()
+            .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
+        let s3_client: Option<S3Client> = if has_s3 {
+            #[cfg(feature = "s3")]
+            {
+                Some(crate::s3::client_from_env().await?)
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let gcs_client: Option<GcsClient> = if has_gcs {
+            #[cfg(feature = "gcs")]
+            {
+                Some(crate::gcs::client_from_env().await?)
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                anyhow::bail!(
+                    "manifest contains gs:// locations but mx8-runtime was built without feature 'gcs'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let has_azure = records.iter().any(|r| r.location.starts_with("az://"));
+        let azure_client: Option<AzureClient> = if has_azure {
+            #[cfg(feature = "azure")]
+            {
+                Some(crate::azure::client_builder_from_env()?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!(
+                    "manifest contains az:// locations but mx8-runtime was built without feature 'azure'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let http_client: Option<HttpClient> = if has_http {
+            Some(build_http_client()?)
+        } else {
+            None
+        };
+
+        tracing::info!(
+            target: "mx8_proof",
+            event = "range_selected",
+            start_id = start_id,
+            end_id = end_id,
+            samples = records.len() as u64,
+            "selected manifest range"
+        );
+
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
+        let pipeline = self.clone();
+        let task = tokio::spawn(async move {
+            pipeline
+                .produce_manifest_batches(
+                    tx,
+                    records,
+                    s3_client,
+                    gcs_client,
+                    azure_client,
+                    http_client,
+                )
+                .await
+        });
+        Ok((rx, task))
+    }
+
+    #[cfg(feature = "s3")]
+    pub async fn spawn_s3_scan(
+        &self,
+        s3_prefix: &str,
+        recursive: bool,
+        reservoir_size: usize,
+        start_id: Option<u64>,
+        end_id: Option<u64>,
+    ) -> Result<(
+        mpsc::Receiver<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        if start_id.is_some() ^ end_id.is_some() {
+            anyhow::bail!("start_id and end_id must be set together");
+        }
+        if let (Some(s), Some(e)) = (start_id, end_id) {
+            anyhow::ensure!(s <= e, "invalid range (start_id > end_id)");
+        }
+
+        let (bucket, list_prefix) = parse_s3_bucket_prefix(s3_prefix)?;
+        let s3_client = crate::s3::client_from_env().await?;
+        let precomputed_manifest_key = s3_precomputed_manifest_key(list_prefix.as_deref());
+        let precomputed_exists = match s3_client
+            .head_object()
+            .bucket(&bucket)
+            .key(&precomputed_manifest_key)
+            .send()
+            .await
+        {
+            Ok(_) => true,
+            Err(err) => {
+                let is_not_found = err
+                    .raw_response()
+                    .map(|raw| {
+                        let status_u16: u16 = raw.status().into();
+                        status_u16 == 404
+                    })
+                    .unwrap_or(false);
+                if is_not_found {
+                    false
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "zero-manifest preflight head_object failed for s3://{}/{}: {err:?}",
+                        bucket,
+                        precomputed_manifest_key
+                    ));
+                }
+            }
+        };
+        if precomputed_exists {
+            anyhow::bail!(
+                "zero-manifest preflight precomputed_manifest_exists s3://{}/{}",
+                bucket,
+                precomputed_manifest_key
+            );
+        }
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
+        let pipeline = self.clone();
+        let task = tokio::spawn(async move {
+            let record_channel_capacity = pipeline
+                .effective_prefetch_batches()
+                .saturating_mul(std::cmp::max(1, pipeline.caps.batch_size_samples))
+                .max(1024);
+            let (record_tx, record_rx) =
+                mpsc::channel::<mx8_core::types::ManifestRecord>(record_channel_capacity);
+
+            let scanner_client = s3_client.clone();
+            let scan_cfg = S3ScanConfig {
+                bucket,
+                list_prefix,
+                recursive,
+                reservoir_size: std::cmp::max(1, reservoir_size),
+                start_id,
+                end_id,
+            };
+            let scanner = tokio::spawn(async move {
+                scan_s3_prefix_records_to_channel(scan_cfg, scanner_client, record_tx).await
+            });
+
+            let producer_res = pipeline
+                .produce_manifest_record_batches(tx, record_rx, Some(s3_client), None, None, None)
+                .await;
+            let scan_res = scanner.await.map_err(anyhow::Error::from)?;
+            producer_res?;
+            scan_res?;
+            Ok(())
+        });
+        Ok((rx, task))
+    }
+
+    #[cfg(feature = "gcs")]
+    pub async fn spawn_gcs_scan(
+        &self,
+        gcs_prefix: &str,
+        recursive: bool,
+        reservoir_size: usize,
+        start_id: Option<u64>,
+        end_id: Option<u64>,
+    ) -> Result<(
+        mpsc::Receiver<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        if start_id.is_some() ^ end_id.is_some() {
+            anyhow::bail!("start_id and end_id must be set together");
+        }
+        if let (Some(s), Some(e)) = (start_id, end_id) {
+            anyhow::ensure!(s <= e, "invalid range (start_id > end_id)");
+        }
+
+        let (bucket, list_prefix) = parse_gcs_bucket_prefix(gcs_prefix)?;
+        let gcs_client = crate::gcs::client_from_env().await?;
+
+        let (tx, rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
+        let pipeline = self.clone();
+        let task = tokio::spawn(async move {
+            let record_channel_capacity = pipeline
+                .effective_prefetch_batches()
+                .saturating_mul(std::cmp::max(1, pipeline.caps.batch_size_samples))
+                .max(1024);
+            let (record_tx, record_rx) =
+                mpsc::channel::<mx8_core::types::ManifestRecord>(record_channel_capacity);
+
+            let scanner_client = gcs_client.clone();
+            let scan_cfg = GcsScanConfig {
+                bucket,
+                list_prefix,
+                recursive,
+                reservoir_size: std::cmp::max(1, reservoir_size),
+                start_id,
+                end_id,
+            };
+            let scanner = tokio::spawn(async move {
+                scan_gcs_prefix_records_to_channel(scan_cfg, scanner_client, record_tx).await
+            });
+
+            let producer_res = pipeline
+                .produce_manifest_record_batches(tx, record_rx, None, Some(gcs_client), None, None)
+                .await;
+            let scan_res = scanner.await.map_err(anyhow::Error::from)?;
+            producer_res?;
+            scan_res?;
+            Ok(())
+        });
+        Ok((rx, task))
+    }
+
+    pub async fn run_synthetic<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        total_samples: u64,
+        bytes_per_sample: usize,
+    ) -> Result<()> {
+        let (tx, sink_task) = self.spawn_sink(sink)?;
+        self.produce_synthetic_batches(tx.clone(), total_samples, bytes_per_sample)
+            .await?;
+        drop(tx);
+        sink_task.await??;
+        Ok(())
+    }
+
+    pub async fn run_manifest_cache_dir<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_cache_dir: impl AsRef<Path>,
+        manifest_hash: &str,
+    ) -> Result<()> {
+        let path = manifest_cache_dir.as_ref().join(manifest_hash);
+        self.run_manifest_path(sink, &path).await
+    }
+
+    pub async fn run_manifest_cache_dir_range<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_cache_dir: impl AsRef<Path>,
+        manifest_hash: &str,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<()> {
+        let path = manifest_cache_dir.as_ref().join(manifest_hash);
+        self.run_manifest_path_range(sink, &path, start_id, end_id)
+            .await
+    }
+
+    pub async fn run_manifest_path<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let records = parse_canonical_manifest_tsv_path(manifest_path.as_ref())?;
+        self.run_manifest_records(sink, records).await
+    }
+
+    pub async fn run_manifest_path_range<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_path: impl AsRef<Path>,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<()> {
+        let records =
+            parse_canonical_manifest_tsv_path_range(manifest_path.as_ref(), start_id, end_id)?;
+        self.run_manifest_records(sink, records).await
+    }
+
+    pub async fn run_manifest_bytes<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_bytes: &[u8],
+    ) -> Result<()> {
+        let records = parse_canonical_manifest_tsv(manifest_bytes)?;
+        self.run_manifest_records(sink, records).await
+    }
+
+    pub async fn run_manifest_bytes_range<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        manifest_bytes: &[u8],
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<()> {
+        let records = parse_canonical_manifest_tsv(manifest_bytes)?;
+        self.run_manifest_records_range(sink, &records, start_id, end_id)
+            .await
+    }
+
+    pub async fn run_manifest_reader<S: Sink, R: std::io::Read>(
+        &self,
+        sink: Arc<S>,
+        reader: R,
+    ) -> Result<()> {
+        let records = load_manifest_records_from_read(reader)?;
+        self.run_manifest_records(sink, records).await
+    }
+
+    pub async fn run_manifest_records<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        records: Vec<mx8_core::types::ManifestRecord>,
+    ) -> Result<()> {
+        let has_s3 = records.iter().any(|r| r.location.starts_with("s3://"));
+        let has_gcs = records.iter().any(|r| r.location.starts_with("gs://"));
+        let has_http = records
+            .iter()
+            .any(|r| r.location.starts_with("http://") || r.location.starts_with("https://"));
+        let s3_client: Option<S3Client> = if has_s3 {
+            #[cfg(feature = "s3")]
+            {
+                Some(crate::s3::client_from_env().await?)
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "manifest contains s3:// locations but mx8-runtime was built without feature 's3'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let gcs_client: Option<GcsClient> = if has_gcs {
+            #[cfg(feature = "gcs")]
+            {
+                Some(crate::gcs::client_from_env().await?)
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                anyhow::bail!(
+                    "manifest contains gs:// locations but mx8-runtime was built without feature 'gcs'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let has_azure = records.iter().any(|r| r.location.starts_with("az://"));
+        let azure_client: Option<AzureClient> = if has_azure {
+            #[cfg(feature = "azure")]
+            {
+                Some(crate::azure::client_builder_from_env()?)
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                anyhow::bail!(
+                    "manifest contains az:// locations but mx8-runtime was built without feature 'azure'"
+                );
+            }
+        } else {
+            None
+        };
+
+        let http_client: Option<HttpClient> = if has_http {
+            Some(build_http_client()?)
+        } else {
+            None
+        };
+
+        let (tx, sink_task) = self.spawn_sink(sink)?;
+        self.produce_manifest_batches(
+            tx.clone(),
+            records,
+            s3_client,
+            gcs_client,
+            azure_client,
+            http_client,
+        )
+        .await?;
+        drop(tx);
+        sink_task.await??;
+        Ok(())
+    }
+
+    pub async fn run_manifest_records_range<S: Sink>(
+        &self,
+        sink: Arc<S>,
+        records: &[mx8_core::types::ManifestRecord],
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<()> {
+        let records = select_record_range_slice(records, start_id, end_id)?;
+        tracing::info!(
+            target: "mx8_proof",
+            event = "range_selected",
+            start_id = start_id,
+            end_id = end_id,
+            samples = records.len() as u64,
+            "selected manifest range"
+        );
+        self.run_manifest_records(sink, records).await
+    }
+
+    fn spawn_sink<S: Sink>(
+        &self,
+        sink: Arc<S>,
+    ) -> Result<(
+        mpsc::Sender<BatchLease>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        let (tx, mut rx) = mpsc::channel::<BatchLease>(self.effective_max_queue_batches());
+        let metrics = self.metrics.clone();
+
+        let sink_task = {
+            let sink = sink.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                while let Some(inflight) = rx.recv().await {
+                    let bytes = inflight.bytes;
+                    let batch = inflight.batch.clone();
+                    let sample_count = u64::try_from(batch.sample_count()).unwrap_or_default();
+                    // Run delivery in a blocking thread so a slow sink exerts backpressure
+                    // without stalling the entire tokio runtime.
+                    let sink = sink.clone();
+                    tokio::task::spawn_blocking(move || sink.deliver(batch))
+                        .await
+                        .map_err(anyhow::Error::from)??;
+
+                    metrics.delivered_batches_total.inc();
+                    metrics.delivered_samples_total.inc_by(sample_count);
+                    drop(inflight);
+                    tracing::info!(
+                        target: "mx8_proof",
+                        event = "delivered",
+                        batch_bytes = bytes,
+                        inflight_bytes = metrics.inflight_bytes.get(),
+                        "delivered batch"
+                    );
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+        };
+
+        Ok((tx, sink_task))
+    }
+
+    async fn produce_synthetic_batches(
+        &self,
+        tx: mpsc::Sender<BatchLease>,
+        total_samples: u64,
+        bytes_per_sample: usize,
+    ) -> Result<()> {
+        let mut current_ids: Vec<u64> = Vec::with_capacity(self.caps.batch_size_samples);
+        let mut current_offsets: Vec<u64> =
+            Vec::with_capacity(self.caps.batch_size_samples.saturating_add(1));
+        current_offsets.push(0);
+        let mut current_payload: Vec<u8> = Vec::with_capacity(
+            self.caps
+                .batch_size_samples
+                .saturating_mul(bytes_per_sample),
+        );
+
+        let mut sender = tx;
+        for sample_id in 0..total_samples {
+            current_ids.push(sample_id);
+            current_payload.extend(std::iter::repeat_n(0u8, bytes_per_sample));
+            current_offsets.push(u64::try_from(current_payload.len()).unwrap_or(u64::MAX));
+
+            if current_ids.len() >= self.caps.batch_size_samples {
+                self.send_batch(
+                    &mut sender,
+                    &mut current_ids,
+                    &mut current_offsets,
+                    &mut current_payload,
+                )
+                .await?;
+            }
+        }
+
+        if !current_ids.is_empty() {
+            self.send_batch(
+                &mut sender,
+                &mut current_ids,
+                &mut current_offsets,
+                &mut current_payload,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn produce_manifest_batches(
+        &self,
+        tx: mpsc::Sender<BatchLease>,
+        records: Vec<mx8_core::types::ManifestRecord>,
+        s3_client: Option<S3Client>,
+        gcs_client: Option<GcsClient>,
+        azure_client: Option<AzureClient>,
+        http_client: Option<HttpClient>,
+    ) -> Result<()> {
+        let (band_lower_pct, band_upper_pct) = self.current_batch_band_pcts();
+        let ranges =
+            build_manifest_batch_ranges(&records, self.caps, band_lower_pct, band_upper_pct)?;
+        let prefetch = self.effective_prefetch_batches();
+        if prefetch <= 1 {
+            let sender = tx;
+            for range in ranges {
+                let inflight = build_manifest_inflight_batch(
+                    self.caps,
+                    self.metrics.clone(),
+                    self.inflight_sem.clone(),
+                    self.rss_check_counter.clone(),
+                    &records[range.start..range.end],
+                    StorageClients {
+                        s3: s3_client.as_ref(),
+                        gcs: gcs_client.as_ref(),
+                        azure: azure_client.as_ref(),
+                        http: http_client.as_ref(),
+                    },
+                )
+                .await?;
+                sender.send(inflight).await?;
+            }
+            return Ok(());
+        }
+
+        let records = Arc::new(records);
+        let ranges = Arc::new(ranges);
+        let mut joinset = tokio::task::JoinSet::new();
+        let mut buffer: std::collections::BTreeMap<usize, BatchLease> =
+            std::collections::BTreeMap::new();
+        let mut next_to_send: usize = 0;
+        let mut next_batch_id: usize = 0;
+        let mut next_range_id: usize = 0;
+
+        while next_range_id < ranges.len() || !joinset.is_empty() {
+            while next_range_id < ranges.len() && joinset.len() < prefetch {
+                let range_id = next_range_id;
+                let batch_id = next_batch_id;
+                next_batch_id = next_batch_id.saturating_add(1);
+
+                let caps = self.caps;
+                let metrics = self.metrics.clone();
+                let sem = self.inflight_sem.clone();
+                let rss_check_counter = self.rss_check_counter.clone();
+                let records = records.clone();
+                let ranges = ranges.clone();
+                let s3_client = s3_client.clone();
+                let gcs_client = gcs_client.clone();
+                #[allow(clippy::clone_on_copy)]
+                let azure_client = azure_client.clone();
+                let http_client = http_client.clone();
+
+                joinset.spawn(async move {
+                    let range = ranges[range_id];
+                    let inflight = build_manifest_inflight_batch(
+                        caps,
+                        metrics,
+                        sem,
+                        rss_check_counter,
+                        &records[range.start..range.end],
+                        StorageClients {
+                            s3: s3_client.as_ref(),
+                            gcs: gcs_client.as_ref(),
+                            azure: azure_client.as_ref(),
+                            http: http_client.as_ref(),
+                        },
+                    )
+                    .await;
+                    (batch_id, inflight)
+                });
+
+                next_range_id = next_range_id.saturating_add(1);
+            }
+
+            let Some(res) = joinset.join_next().await else {
+                break;
+            };
+            let (batch_id, inflight) = res.map_err(anyhow::Error::from)?;
+            let inflight = inflight?;
+            buffer.insert(batch_id, inflight);
+
+            while let Some(inflight) = buffer.remove(&next_to_send) {
+                self.maybe_adjust_jitter_guardrail();
+                tx.send(inflight).await?;
+                next_to_send = next_to_send.saturating_add(1);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+    async fn produce_manifest_record_batches(
+        &self,
+        tx: mpsc::Sender<BatchLease>,
+        mut records_rx: mpsc::Receiver<mx8_core::types::ManifestRecord>,
+        s3_client: Option<S3Client>,
+        gcs_client: Option<GcsClient>,
+        azure_client: Option<AzureClient>,
+        http_client: Option<HttpClient>,
+    ) -> Result<()> {
+        let sample_cap = std::cmp::max(1, self.caps.batch_size_samples);
+        let byte_mode_enabled =
+            self.caps.target_batch_bytes.is_some() || self.caps.max_batch_bytes.is_some();
+        let max_batch_bytes = self
+            .caps
+            .max_batch_bytes
+            .unwrap_or(self.caps.max_inflight_bytes);
+        if byte_mode_enabled {
+            anyhow::ensure!(max_batch_bytes > 0, "max_batch_bytes must be > 0");
+            anyhow::ensure!(
+                max_batch_bytes <= self.caps.max_inflight_bytes,
+                "max_batch_bytes {} exceeds max_inflight_bytes {}",
+                max_batch_bytes,
+                self.caps.max_inflight_bytes
+            );
+        }
+        let target_batch_bytes = self
+            .caps
+            .target_batch_bytes
+            .unwrap_or(max_batch_bytes)
+            .min(max_batch_bytes)
+            .max(1);
+        let (band_lower_bytes, band_upper_bytes) = if byte_mode_enabled {
+            let (band_lower_pct, band_upper_pct) = self.current_batch_band_pcts();
+            byte_mode_band(
+                target_batch_bytes,
+                max_batch_bytes,
+                band_lower_pct,
+                band_upper_pct,
+            )
+        } else {
+            (0, 0)
+        };
+
+        let mut sender = tx;
+        let mut batch_records: Vec<mx8_core::types::ManifestRecord> =
+            Vec::with_capacity(sample_cap);
+        let mut batch_bytes: u64 = 0;
+        while let Some(record) = records_rx.recv().await {
+            let sample_bytes = if byte_mode_enabled {
+                let len = record.byte_length.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "byte-aware batching requires byte_length for every sample (missing sample_id={})",
+                        record.sample_id
+                    )
+                })?;
+                anyhow::ensure!(
+                    len <= max_batch_bytes,
+                    "sample {} has byte_length {} > max_batch_bytes {}",
+                    record.sample_id,
+                    len,
+                    max_batch_bytes
+                );
+                len
+            } else {
+                0
+            };
+
+            let would_exceed_max = byte_mode_enabled
+                && !batch_records.is_empty()
+                && batch_bytes
+                    .checked_add(sample_bytes)
+                    .map(|v| v > max_batch_bytes)
+                    .unwrap_or(true);
+            let would_exceed_band = byte_mode_enabled
+                && !batch_records.is_empty()
+                && batch_bytes >= band_lower_bytes
+                && batch_bytes
+                    .checked_add(sample_bytes)
+                    .map(|v| v > band_upper_bytes)
+                    .unwrap_or(true);
+
+            if batch_records.len() >= sample_cap
+                || (byte_mode_enabled
+                    && (batch_bytes >= target_batch_bytes || would_exceed_max || would_exceed_band))
+            {
+                self.flush_manifest_record_batch(
+                    &mut sender,
+                    &mut batch_records,
+                    s3_client.as_ref(),
+                    gcs_client.as_ref(),
+                    azure_client.as_ref(),
+                    http_client.as_ref(),
+                )
+                .await?;
+                batch_bytes = 0;
+            }
+
+            if byte_mode_enabled {
+                batch_bytes = batch_bytes
+                    .checked_add(sample_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("batch byte accounting overflow"))?;
+            }
+            batch_records.push(record);
+        }
+
+        if !batch_records.is_empty() {
+            self.flush_manifest_record_batch(
+                &mut sender,
+                &mut batch_records,
+                s3_client.as_ref(),
+                gcs_client.as_ref(),
+                azure_client.as_ref(),
+                http_client.as_ref(),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+    async fn flush_manifest_record_batch(
+        &self,
+        sender: &mut mpsc::Sender<BatchLease>,
+        records: &mut Vec<mx8_core::types::ManifestRecord>,
+        s3_client: Option<&S3Client>,
+        gcs_client: Option<&GcsClient>,
+        azure_client: Option<&AzureClient>,
+        http_client: Option<&HttpClient>,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let owned = std::mem::take(records);
+        let inflight = build_manifest_inflight_batch(
+            self.caps,
+            self.metrics.clone(),
+            self.inflight_sem.clone(),
+            self.rss_check_counter.clone(),
+            owned.as_slice(),
+            StorageClients {
+                s3: s3_client,
+                gcs: gcs_client,
+                azure: azure_client,
+                http: http_client,
+            },
+        )
+        .await?;
+        self.maybe_adjust_jitter_guardrail();
+        sender.send(inflight).await?;
+        Ok(())
+    }
+
+    async fn send_batch(
+        &self,
+        tx: &mut mpsc::Sender<BatchLease>,
+        ids: &mut Vec<u64>,
+        offsets: &mut Vec<u64>,
+        payload: &mut Vec<u8>,
+    ) -> Result<()> {
+        enforce_process_rss_cap(self.caps, self.metrics.as_ref(), &self.rss_check_counter)?;
+        let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        anyhow::ensure!(
+            bytes <= self.caps.max_inflight_bytes,
+            "batch payload bytes {} exceeds max_inflight_bytes {}",
+            bytes,
+            self.caps.max_inflight_bytes
+        );
+        let permit_units = if bytes == 0 {
+            0u64
+        } else {
+            bytes.div_ceil(PERMIT_UNIT_BYTES).max(1)
+        };
+
+        anyhow::ensure!(
+            permit_units <= u32::MAX as u64,
+            "batch too large for permit accounting ({} units)",
+            permit_units
+        );
+
+        let permit = self
+            .inflight_sem
+            .clone()
+            .acquire_many_owned(permit_units as u32)
+            .await?;
+
+        anyhow::ensure!(
+            offsets.len() == ids.len().saturating_add(1),
+            "offsets length {} must equal sample_ids length + 1 ({})",
+            offsets.len(),
+            ids.len().saturating_add(1),
+        );
+        anyhow::ensure!(
+            offsets.first().copied().unwrap_or_default() == 0,
+            "offsets must start at 0"
+        );
+        anyhow::ensure!(
+            offsets.last().copied().unwrap_or_default() == bytes,
+            "offsets must end at payload length ({}), got {}",
+            bytes,
+            offsets.last().copied().unwrap_or_default()
+        );
+
+        let batch = Batch {
+            sample_ids: Arc::from(ids.as_slice()),
+            label_ids: None,
+            offsets: Arc::from(offsets.as_slice()),
+            payload: Arc::from(payload.as_slice()),
+        };
+
+        ids.clear();
+        offsets.clear();
+        offsets.push(0);
+        payload.clear();
+
+        self.metrics.on_inflight_add(bytes);
+        self.metrics.on_batch_payload_bytes(bytes);
+        self.maybe_adjust_jitter_guardrail();
+
+        tx.send(BatchLease {
+            batch,
+            bytes,
+            metrics: self.metrics.clone(),
+            _permit: permit,
+        })
+        .await?;
+
+        Ok(())
+    }
+}
+
+pub fn load_manifest_records_from_path(
+    manifest_path: impl AsRef<Path>,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    parse_canonical_manifest_tsv_path(manifest_path.as_ref())
+}
+
+pub fn load_manifest_records_from_reader<R: BufRead>(
+    reader: R,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    parse_canonical_manifest_tsv_reader(reader)
+}
+
+pub fn load_manifest_records_from_read<R: std::io::Read>(
+    reader: R,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    parse_canonical_manifest_tsv_reader(BufReader::new(reader))
+}
+
+/// Adapter for transport-layer chunk streams.
+///
+/// This keeps async/network chunking concerns outside the parser contract:
+/// callers provide an iterator of chunk payloads, and runtime parses via `Read`/`BufRead`.
+pub fn load_manifest_records_from_chunk_iter<I>(
+    chunks: I,
+) -> Result<Vec<mx8_core::types::ManifestRecord>>
+where
+    I: IntoIterator<Item = Vec<u8>>,
+{
+    let reader = ChunkedRead::new(chunks.into_iter());
+    parse_canonical_manifest_tsv_reader(BufReader::new(reader))
+}
+
+pub fn load_manifest_records_range_from_read<R: std::io::Read>(
+    reader: R,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    parse_canonical_manifest_tsv_reader_range(BufReader::new(reader), start_id, end_id)
+}
+
+/// Adapter for transport-layer chunk streams with direct range selection.
+pub fn load_manifest_records_range_from_chunk_iter<I>(
+    chunks: I,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>>
+where
+    I: IntoIterator<Item = Vec<u8>>,
+{
+    let reader = ChunkedRead::new(chunks.into_iter());
+    parse_canonical_manifest_tsv_reader_range(BufReader::new(reader), start_id, end_id)
+}
+
+#[derive(Debug)]
+pub struct ManifestRangeStreamParser {
+    start_id: u64,
+    end_id: u64,
+    max_carry_bytes: usize,
+    line_no: usize,
+    header_seen: bool,
+    expected_sample_id: u64,
+    carry: Vec<u8>,
+    selected: Vec<mx8_core::types::ManifestRecord>,
+}
+
+impl ManifestRangeStreamParser {
+    pub fn new(start_id: u64, end_id: u64, max_carry_bytes: usize) -> Result<Self> {
+        anyhow::ensure!(start_id <= end_id, "invalid range (start_id > end_id)");
+        anyhow::ensure!(max_carry_bytes > 0, "max_carry_bytes must be > 0");
+        let cap = usize::try_from(end_id.saturating_sub(start_id)).unwrap_or(usize::MAX);
+        Ok(Self {
+            start_id,
+            end_id,
+            max_carry_bytes,
+            line_no: 0,
+            header_seen: false,
+            expected_sample_id: 0,
+            carry: Vec::new(),
+            selected: Vec::with_capacity(cap.min(4096)),
+        })
+    }
+
+    pub fn push_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        self.carry.extend_from_slice(bytes);
+        anyhow::ensure!(
+            self.carry.len() <= self.max_carry_bytes,
+            "manifest line exceeds max bytes (max_carry_bytes={})",
+            self.max_carry_bytes
+        );
+        while let Some(pos) = self.carry.iter().position(|b| *b == b'\n') {
+            let line = self.carry[..pos].to_vec();
+            self.carry.drain(..=pos);
+            self.process_line_bytes(&line)?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+        if !self.carry.is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            self.process_line_bytes(&line)?;
+        }
+        anyhow::ensure!(self.header_seen, "empty manifest");
+        let total_rows = self.expected_sample_id as usize;
+        let start =
+            usize::try_from(self.start_id).map_err(|_| anyhow::anyhow!("start_id too large"))?;
+        let end = usize::try_from(self.end_id).map_err(|_| anyhow::anyhow!("end_id too large"))?;
+        anyhow::ensure!(start <= total_rows, "start_id out of range");
+        anyhow::ensure!(end <= total_rows, "end_id out of range");
+        Ok(self.selected)
+    }
+
+    fn process_line_bytes(&mut self, raw: &[u8]) -> Result<()> {
+        let line = std::str::from_utf8(raw)
+            .map_err(|e| anyhow::anyhow!("line {}: manifest not utf-8: {e}", self.line_no + 1))?;
+        self.line_no = self.line_no.saturating_add(1);
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(());
+        }
+        if !self.header_seen {
+            self.process_header_line(line)?;
+            self.header_seen = true;
+            return Ok(());
+        }
+        self.process_record_line(line)
+    }
+
+    fn process_header_line(&self, line: &str) -> Result<()> {
+        let Some((k, v)) = line.split_once('=') else {
+            anyhow::bail!("manifest header missing schema_version");
+        };
+        if k.trim() != "schema_version" {
+            anyhow::bail!("manifest header must be schema_version=<n>");
+        }
+        let schema_version: u32 = v
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid schema_version"))?;
+        anyhow::ensure!(
+            schema_version == mx8_core::types::MANIFEST_SCHEMA_VERSION,
+            "unsupported schema_version {}",
+            schema_version
+        );
+        Ok(())
+    }
+
+    fn process_record_line(&mut self, line: &str) -> Result<()> {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            anyhow::bail!("line {}: expected at least 2 columns", self.line_no);
+        }
+        let sample_id: u64 = cols[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {}: bad sample_id", self.line_no))?;
+        let location = cols[1].trim().to_string();
+
+        let mut byte_offset: Option<u64> = None;
+        let mut byte_length: Option<u64> = None;
+        let mut decode_hint: Option<String> = None;
+
+        if cols.len() >= 4 {
+            if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
+                byte_offset = Some(
+                    cols[2]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_offset", self.line_no))?,
+                );
+                byte_length = Some(
+                    cols[3]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_length", self.line_no))?,
+                );
+            }
+        } else if cols.len() == 3 {
+            anyhow::bail!("line {}: partial byte range", self.line_no);
+        }
+
+        if cols.len() >= 5 && !cols[4].trim().is_empty() {
+            decode_hint = Some(cols[4].trim().to_string());
+        }
+
+        let record = mx8_core::types::ManifestRecord {
+            sample_id,
+            location,
+            byte_offset,
+            byte_length,
+            decode_hint,
+        };
+        record
+            .validate()
+            .map_err(|e| anyhow::anyhow!("line {}: {e}", self.line_no))?;
+        anyhow::ensure!(
+            record.sample_id == self.expected_sample_id,
+            "expected sample_id {} but found {}",
+            self.expected_sample_id,
+            record.sample_id
+        );
+        if record.sample_id >= self.start_id && record.sample_id < self.end_id {
+            self.selected.push(record);
+        }
+        self.expected_sample_id = self.expected_sample_id.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchRange {
+    start: usize,
+    end: usize,
+}
+
+fn sample_count_batch_ranges(total_samples: usize, batch_size_samples: usize) -> Vec<BatchRange> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let sample_cap = std::cmp::max(1, batch_size_samples);
+    while start < total_samples {
+        let end = (start + sample_cap).min(total_samples);
+        ranges.push(BatchRange { start, end });
+        start = end;
+    }
+    ranges
+}
+
+fn build_manifest_batch_ranges(
+    records: &[mx8_core::types::ManifestRecord],
+    caps: RuntimeCaps,
+    band_lower_pct: u64,
+    band_upper_pct: u64,
+) -> Result<Vec<BatchRange>> {
+    let sample_cap = std::cmp::max(1, caps.batch_size_samples);
+    let byte_mode_enabled = caps.target_batch_bytes.is_some() || caps.max_batch_bytes.is_some();
+    if !byte_mode_enabled || records.is_empty() {
+        return Ok(sample_count_batch_ranges(records.len(), sample_cap));
+    }
+
+    let max_batch_bytes = caps.max_batch_bytes.unwrap_or(caps.max_inflight_bytes);
+    anyhow::ensure!(max_batch_bytes > 0, "max_batch_bytes must be > 0");
+    anyhow::ensure!(
+        max_batch_bytes <= caps.max_inflight_bytes,
+        "max_batch_bytes {} exceeds max_inflight_bytes {}",
+        max_batch_bytes,
+        caps.max_inflight_bytes
+    );
+
+    let target_batch_bytes = caps
+        .target_batch_bytes
+        .unwrap_or(max_batch_bytes)
+        .min(max_batch_bytes)
+        .max(1);
+    let (band_lower_bytes, band_upper_bytes) = byte_mode_band(
+        target_batch_bytes,
+        max_batch_bytes,
+        band_lower_pct,
+        band_upper_pct,
+    );
+
+    let mut ranges: Vec<BatchRange> = Vec::new();
+    let mut start = 0usize;
+    let mut batch_bytes: u64 = 0;
+    let mut batch_samples: usize = 0;
+
+    for (idx, record) in records.iter().enumerate() {
+        let sample_bytes = record.byte_length.ok_or_else(|| {
+            anyhow::anyhow!(
+                "byte-aware batching requires byte_length for every sample (missing sample_id={})",
+                record.sample_id
+            )
+        })?;
+        anyhow::ensure!(
+            sample_bytes <= max_batch_bytes,
+            "sample {} has byte_length {} > max_batch_bytes {}",
+            record.sample_id,
+            sample_bytes,
+            max_batch_bytes
+        );
+
+        let would_exceed_max = batch_samples > 0
+            && batch_bytes
+                .checked_add(sample_bytes)
+                .map(|v| v > max_batch_bytes)
+                .unwrap_or(true);
+        let would_exceed_band = batch_samples > 0
+            && batch_bytes >= band_lower_bytes
+            && batch_bytes
+                .checked_add(sample_bytes)
+                .map(|v| v > band_upper_bytes)
+                .unwrap_or(true);
+        if batch_samples >= sample_cap
+            || batch_bytes >= target_batch_bytes
+            || would_exceed_max
+            || would_exceed_band
+        {
+            ranges.push(BatchRange { start, end: idx });
+            start = idx;
+            batch_bytes = 0;
+            batch_samples = 0;
+        }
+
+        batch_bytes = batch_bytes
+            .checked_add(sample_bytes)
+            .ok_or_else(|| anyhow::anyhow!("batch byte accounting overflow"))?;
+        batch_samples = batch_samples.saturating_add(1);
+    }
+
+    if start < records.len() {
+        ranges.push(BatchRange {
+            start,
+            end: records.len(),
+        });
+    }
+
+    Ok(ranges)
+}
+
+#[derive(Debug, Clone)]
+struct ReadSpec {
+    sample_id: u64,
+    location: SpecLocation,
+    offset: u64,
+    len: u64,
+    expect_eof: bool,
+}
+
+#[derive(Debug, Clone)]
+enum SpecLocation {
+    Local(PathBuf),
+    #[cfg(feature = "s3")]
+    S3 {
+        bucket: String,
+        key: String,
+    },
+    #[cfg(feature = "gcs")]
+    Gcs {
+        bucket: String,
+        key: String,
+    },
+    #[cfg(feature = "azure")]
+    Azure {
+        container: String,
+        blob: String,
+    },
+    Http {
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct BatchPlan {
+    sample_ids: Vec<u64>,
+    label_ids: Option<Vec<u64>>,
+    specs: Vec<ReadSpec>,
+    total_bytes: u64,
+}
+
+fn parse_imagefolder_label_id(decode_hint: Option<&str>, sample_id: u64) -> Result<Option<u64>> {
+    let Some(h) = decode_hint else {
+        return Ok(None);
+    };
+
+    // v0 convention (produced by mx8-snapshot S3 prefix indexing):
+    //   mx8:vision:imagefolder;label_id=<n>;label=<...>
+    const PREFIX: &str = "mx8:vision:imagefolder;";
+    if !h.starts_with(PREFIX) {
+        return Ok(None);
+    }
+
+    let rest = &h[PREFIX.len()..];
+    for part in rest.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "label_id" {
+            continue;
+        }
+        let v = v.trim();
+        let id: u64 = v.parse().map_err(|_| {
+            anyhow::anyhow!("bad imagefolder label_id (sample_id={sample_id}): {v:?}")
+        })?;
+        return Ok(Some(id));
+    }
+
+    anyhow::bail!(
+        "imagefolder decode_hint missing label_id (sample_id={}): {:?}",
+        sample_id,
+        h
+    );
+}
+
+async fn build_batch_plan(
+    records: &[mx8_core::types::ManifestRecord],
+    s3_client: Option<&S3Client>,
+    gcs_client: Option<&GcsClient>,
+    azure_client: Option<&AzureClient>,
+    http_client: Option<&HttpClient>,
+) -> Result<BatchPlan> {
+    #[cfg(not(feature = "s3"))]
+    let _ = s3_client;
+    #[cfg(not(feature = "gcs"))]
+    let _ = gcs_client;
+    #[cfg(not(feature = "azure"))]
+    let _ = azure_client;
+
+    let mut sample_ids = Vec::with_capacity(records.len());
+    let mut label_ids: Vec<Option<u64>> = Vec::with_capacity(records.len());
+    let mut specs = Vec::with_capacity(records.len());
+    let mut total_bytes: u64 = 0;
+
+    for r in records {
+        let location = parse_location(&r.location)?;
+        let label_id = parse_imagefolder_label_id(r.decode_hint.as_deref(), r.sample_id)?;
+
+        let (offset, len, expect_eof) = match (r.byte_offset, r.byte_length) {
+            (Some(off), Some(len)) => (off, len, false),
+            (None, None) => match &location {
+                SpecLocation::Local(path) => {
+                    let path = path.clone();
+                    let size = tokio::task::spawn_blocking(move || -> Result<u64> {
+                        Ok(std::fs::metadata(&path)?.len())
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)??;
+                    (0u64, size, true)
+                }
+                #[cfg(feature = "s3")]
+                SpecLocation::S3 { bucket, key } => {
+                    let client = s3_client.ok_or_else(|| {
+                        anyhow::anyhow!("s3 client not configured but s3 location present")
+                    })?;
+                    let bucket = bucket.clone();
+                    let key = key.clone();
+                    let out = s3_with_retry(r.sample_id, || {
+                        let bucket = bucket.clone();
+                        let key = key.clone();
+                        async move { client.head_object().bucket(bucket).key(key).send().await }
+                    })
+                    .await?;
+                    let size = out.content_length().unwrap_or(0) as u64;
+                    anyhow::ensure!(
+                        size > 0,
+                        "s3 object has unknown/zero size: s3://{bucket}/{key}"
+                    );
+                    (0u64, size, false)
+                }
+                #[cfg(feature = "gcs")]
+                SpecLocation::Gcs { bucket, key } => {
+                    let client = gcs_client.ok_or_else(|| {
+                        anyhow::anyhow!("gcs client not configured but gs:// location present")
+                    })?;
+                    use google_cloud_storage::http::objects::get::GetObjectRequest as GcsGetReq;
+                    let meta = client
+                        .get_object(&GcsGetReq {
+                            bucket: bucket.clone(),
+                            object: key.clone(),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("gcs head_object failed gs://{bucket}/{key}: {e:?}")
+                        })?;
+                    let size = u64::try_from(meta.size).map_err(|_| {
+                        anyhow::anyhow!("gcs object size out of range: gs://{bucket}/{key}")
+                    })?;
+                    anyhow::ensure!(
+                        size > 0,
+                        "gcs object has unknown/zero size: gs://{bucket}/{key}"
+                    );
+                    (0u64, size, false)
+                }
+                #[cfg(feature = "azure")]
+                SpecLocation::Azure { container, blob } => {
+                    let builder = azure_client.ok_or_else(|| {
+                        anyhow::anyhow!("azure client not configured but az:// location present")
+                    })?;
+                    let blob_client = builder.clone().blob_client(container, blob);
+                    let props = blob_client.get_properties().await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "azure get_properties failed az://{container}/{blob}: {e:?}"
+                        )
+                    })?;
+                    let size = props.blob.properties.content_length;
+                    anyhow::ensure!(
+                        size > 0,
+                        "azure blob has unknown/zero size: az://{container}/{blob}"
+                    );
+                    (0u64, size, false)
+                }
+                SpecLocation::Http { url } => {
+                    let client = http_client.ok_or_else(|| {
+                        anyhow::anyhow!("http client not configured but http location present")
+                    })?;
+                    let size = http_head_len(client, url, r.sample_id).await?;
+                    (0u64, size, false)
+                }
+            },
+            _ => anyhow::bail!("partial byte range for sample_id {}", r.sample_id),
+        };
+
+        sample_ids.push(r.sample_id);
+        label_ids.push(label_id);
+        specs.push(ReadSpec {
+            sample_id: r.sample_id,
+            location,
+            offset,
+            len,
+            expect_eof,
+        });
+
+        total_bytes = total_bytes
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("byte size overflow"))?;
+    }
+
+    let saw_any_label = label_ids.iter().any(|v| v.is_some());
+    let label_ids = if saw_any_label {
+        if label_ids.iter().any(|v| v.is_none()) {
+            anyhow::bail!("mixed labeled/unlabeled records in a batch plan (imagefolder hints must be all-or-none)");
+        }
+        let mut out: Vec<u64> = Vec::with_capacity(label_ids.len());
+        for (i, v) in label_ids.into_iter().enumerate() {
+            let Some(id) = v else {
+                anyhow::bail!(
+                    "internal error: missing label_id after all-or-none check (index={})",
+                    i
+                );
+            };
+            out.push(id);
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    Ok(BatchPlan {
+        sample_ids,
+        label_ids,
+        specs,
+        total_bytes,
+    })
+}
+
+async fn fetch_specs_payload(
+    specs: &[ReadSpec],
+    s3_client: Option<&S3Client>,
+    gcs_client: Option<&GcsClient>,
+    azure_client: Option<&AzureClient>,
+    http_client: Option<&HttpClient>,
+) -> Result<Vec<u8>> {
+    #[cfg(not(feature = "s3"))]
+    let _ = s3_client;
+    #[cfg(not(feature = "gcs"))]
+    let _ = gcs_client;
+    #[cfg(not(feature = "azure"))]
+    let _ = azure_client;
+
+    #[cfg(feature = "azure")]
+    let mut azure_fallback_blob_cache: std::collections::HashMap<
+        (String, String),
+        Arc<Vec<u8>>,
+    > = std::collections::HashMap::new();
+    #[cfg(feature = "azure")]
+    let azure_emulator_compat = azure_endpoint_looks_like_emulator();
+
+    let mut total: u64 = 0;
+    for s in specs {
+        total = total
+            .checked_add(s.len)
+            .ok_or_else(|| anyhow::anyhow!("byte size overflow"))?;
+    }
+
+    let cap = usize::try_from(total).map_err(|_| anyhow::anyhow!("payload too large"))?;
+    let mut payload = Vec::<u8>::with_capacity(cap);
+
+    for s in specs {
+        let len = usize::try_from(s.len).map_err(|_| anyhow::anyhow!("payload too large"))?;
+        match &s.location {
+            SpecLocation::Local(path) => {
+                let path = path.clone();
+                let offset = s.offset;
+                let expect_eof = s.expect_eof;
+                let sample_id = s.sample_id;
+                let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut f = std::fs::File::open(&path)?;
+                    f.seek(SeekFrom::Start(offset))?;
+                    let mut buf = vec![0u8; len];
+                    f.read_exact(&mut buf)?;
+
+                    if expect_eof {
+                        let mut tmp = [0u8; 1];
+                        let extra = f.read(&mut tmp)?;
+                        if extra != 0 {
+                            anyhow::bail!(
+                                "file grew after sizing (expected eof): sample_id={} path={}",
+                                sample_id,
+                                path.display()
+                            );
+                        }
+                    }
+
+                    Ok(buf)
+                })
+                .await
+                .map_err(anyhow::Error::from)??;
+                payload.extend_from_slice(&bytes);
+            }
+            #[cfg(feature = "s3")]
+            SpecLocation::S3 { bucket, key } => {
+                let client = s3_client.ok_or_else(|| {
+                    anyhow::anyhow!("s3 client not configured but s3 location present")
+                })?;
+                let start = s.offset;
+                let end = start
+                    .checked_add(s.len)
+                    .and_then(|v| v.checked_sub(1))
+                    .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+                let range = format!("bytes={start}-{end}");
+
+                let bucket = bucket.clone();
+                let key = key.clone();
+                let out = s3_with_retry(s.sample_id, || {
+                    let bucket = bucket.clone();
+                    let key = key.clone();
+                    let range = range.clone();
+                    async move {
+                        client
+                            .get_object()
+                            .bucket(bucket)
+                            .key(key)
+                            .range(range)
+                            .send()
+                            .await
+                    }
+                })
+                .await?;
+                let b = collect_byte_stream(out.body).await?;
+                anyhow::ensure!(
+                    b.len() == len,
+                    "s3 returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
+                );
+                payload.extend_from_slice(&b);
+            }
+            #[cfg(feature = "gcs")]
+            SpecLocation::Gcs { bucket, key } => {
+                let client = gcs_client.ok_or_else(|| {
+                    anyhow::anyhow!("gcs client not configured but gs:// location present")
+                })?;
+                let start = s.offset;
+                let end = start
+                    .checked_add(s.len)
+                    .and_then(|v| v.checked_sub(1))
+                    .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+
+                use google_cloud_storage::http::objects::download::Range as GcsRange;
+                use google_cloud_storage::http::objects::get::GetObjectRequest as GcsGetReq;
+
+                let b = client
+                    .download_object(
+                        &GcsGetReq {
+                            bucket: bucket.clone(),
+                            object: key.clone(),
+                            ..Default::default()
+                        },
+                        &GcsRange(Some(start), Some(end)),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("gcs range download failed gs://{bucket}/{key}: {e:?}")
+                    })?;
+                anyhow::ensure!(
+                    b.len() == len,
+                    "gcs returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
+                );
+                payload.extend_from_slice(&b);
+            }
+            #[cfg(feature = "azure")]
+            SpecLocation::Azure { container, blob } => {
+                let builder = azure_client.ok_or_else(|| {
+                    anyhow::anyhow!("azure client not configured but az:// location present")
+                })?;
+                let blob_client = builder.clone().blob_client(container, blob);
+                let start = s.offset;
+                let end_exclusive = start
+                    .checked_add(s.len)
+                    .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+
+                let b = if azure_emulator_compat {
+                    // Azurite can fail small ranged reads that request CRC64.
+                    // In emulator mode, read each blob once and slice samples from memory.
+                    let key = (container.clone(), blob.clone());
+                    let full_blob: Arc<Vec<u8>> = if let Some(cached) =
+                        azure_fallback_blob_cache.get(&key)
+                    {
+                        cached.clone()
+                    } else {
+                        let full = blob_client.get_content().await.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "azure emulator full-blob download failed az://{container}/{blob}: {e:?}"
+                                )
+                            })?;
+                        tracing::debug!(
+                            target: "mx8_proof",
+                            container = container.as_str(),
+                            blob = blob.as_str(),
+                            "azure emulator mode enabled; using full-blob reads with in-memory slicing"
+                        );
+                        let full = Arc::new(full);
+                        azure_fallback_blob_cache.insert(key, full.clone());
+                        full
+                    };
+                    let start_idx = usize::try_from(start)
+                        .map_err(|_| anyhow::anyhow!("azure offset too large"))?;
+                    let end_idx = usize::try_from(end_exclusive)
+                        .map_err(|_| anyhow::anyhow!("azure range end too large"))?;
+                    anyhow::ensure!(
+                        end_idx <= full_blob.len(),
+                        "azure emulator range out of bounds: requested [{}..{}) but blob length is {} (sample_id={})",
+                        start_idx,
+                        end_idx,
+                        full_blob.len(),
+                        s.sample_id
+                    );
+                    full_blob[start_idx..end_idx].to_vec()
+                } else {
+                    use futures::StreamExt;
+                    let mut stream = blob_client
+                        .get()
+                        .range(azure_core::request_options::Range::new(
+                            start,
+                            end_exclusive,
+                        ))
+                        .into_stream();
+                    let mut out = Vec::<u8>::with_capacity(len);
+                    while let Some(value) = stream.next().await {
+                        let mut body = value
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "azure range download failed az://{container}/{blob}: {e:?}"
+                                )
+                            })?
+                            .data;
+                        while let Some(chunk) = body.next().await {
+                            let chunk = chunk.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "azure stream read failed az://{container}/{blob}: {e:?}"
+                                )
+                            })?;
+                            out.extend(&chunk);
+                        }
+                    }
+                    out
+                };
+                anyhow::ensure!(
+                    b.len() == len,
+                    "azure returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
+                );
+                payload.extend_from_slice(&b);
+            }
+            SpecLocation::Http { url } => {
+                let client = http_client.ok_or_else(|| {
+                    anyhow::anyhow!("http client not configured but http location present")
+                })?;
+                let b = http_range_get(client, url, s.offset, s.len, s.sample_id).await?;
+                anyhow::ensure!(
+                    b.len() == len,
+                    "http returned {} bytes, expected {} (sample_id={})",
+                    b.len(),
+                    len,
+                    s.sample_id
+                );
+                payload.extend_from_slice(&b);
+            }
+        }
+    }
+
+    Ok(payload)
+}
+
+#[cfg(feature = "s3")]
+async fn collect_byte_stream(stream: ByteStream) -> Result<Vec<u8>> {
+    let collected: AggregatedBytes = stream.collect().await?;
+    Ok(collected.into_bytes().to_vec())
+}
+
+#[cfg(feature = "s3")]
+fn s3_is_transient<E>(err: &S3SdkError<E>) -> bool {
+    match err {
+        S3SdkError::TimeoutError(_) => true,
+        S3SdkError::DispatchFailure(_) => true,
+        S3SdkError::ResponseError(_) => true,
+        S3SdkError::ConstructionFailure(_) => false,
+        S3SdkError::ServiceError(_) => err
+            .raw_response()
+            .map(|raw| {
+                let status_u16: u16 = raw.status().into();
+                status_u16 == 429 || status_u16 >= 500
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "s3")]
+async fn s3_with_retry<T, E, F, Fut>(sample_id: u64, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, S3SdkError<E>>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    const MAX_ATTEMPTS: usize = 3;
+    const BASE_DELAY_MS: u64 = 50;
+    const MAX_DELAY_MS: u64 = 1000;
+
+    let mut attempt: usize = 0;
+    let mut delay_ms: u64 = BASE_DELAY_MS;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                let transient = s3_is_transient(&err);
+                if transient && attempt < MAX_ATTEMPTS {
+                    let jitter = mx8_observe::time::unix_time_ms().wrapping_add(sample_id) % 37;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        delay_ms.saturating_add(jitter),
+                    ))
+                    .await;
+                    delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                    continue;
+                }
+                return Err(anyhow::Error::new(err));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "azure")]
+fn azure_endpoint_looks_like_emulator() -> bool {
+    let anonymous = std::env::var("MX8_AZURE_ANONYMOUS")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "y" | "on")
+        })
+        .unwrap_or(false);
+    if anonymous {
+        return true;
+    }
+
+    std::env::var("MX8_AZURE_ENDPOINT_URL")
+        .ok()
+        .map(|u| {
+            let s = u.to_ascii_lowercase();
+            s.contains("127.0.0.1")
+                || s.contains("localhost")
+                || s.contains("azurite")
+                || s.contains("host.docker.internal")
+        })
+        .unwrap_or(false)
+}
+
+fn parse_location(location: &str) -> Result<SpecLocation> {
+    if let Some(rest) = location.strip_prefix("s3://") {
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = rest;
+            anyhow::bail!("s3 support not enabled (rebuild mx8-runtime with --features s3)");
+        }
+        #[cfg(feature = "s3")]
+        {
+            let (bucket, key) = parse_s3_bucket_key(rest)?;
+            return Ok(SpecLocation::S3 { bucket, key });
+        }
+    }
+    if let Some(rest) = location.strip_prefix("gs://") {
+        #[cfg(not(feature = "gcs"))]
+        {
+            let _ = rest;
+            anyhow::bail!("gcs support not enabled (rebuild mx8-runtime with --features gcs)");
+        }
+        #[cfg(feature = "gcs")]
+        {
+            let (bucket, key) = parse_gcs_bucket_key(rest)?;
+            return Ok(SpecLocation::Gcs { bucket, key });
+        }
+    }
+    if let Some(rest) = location.strip_prefix("az://") {
+        #[cfg(not(feature = "azure"))]
+        {
+            let _ = rest;
+            anyhow::bail!("azure support not enabled (rebuild mx8-runtime with --features azure)");
+        }
+        #[cfg(feature = "azure")]
+        {
+            let (container, blob) = parse_azure_container_blob(rest)?;
+            return Ok(SpecLocation::Azure { container, blob });
+        }
+    }
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(SpecLocation::Http {
+            url: location.to_string(),
+        });
+    }
+    Ok(SpecLocation::Local(PathBuf::from(location)))
+}
+
+#[cfg(feature = "s3")]
+fn parse_s3_bucket_prefix(url: &str) -> Result<(String, Option<String>)> {
+    let mut rest = url.trim();
+    if let Some(stripped) = rest.strip_prefix("s3://") {
+        rest = stripped;
+    }
+    rest = rest.trim_start_matches('/');
+    anyhow::ensure!(!rest.is_empty(), "invalid s3 prefix (empty url)");
+
+    let (bucket, prefix) = match rest.split_once('/') {
+        Some((bucket, prefix)) => (bucket.trim(), Some(prefix.trim())),
+        None => (rest.trim(), None),
+    };
+    anyhow::ensure!(!bucket.is_empty(), "invalid s3 prefix (empty bucket)");
+
+    let list_prefix = prefix.and_then(|p| {
+        let trimmed = p.trim_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!("{trimmed}/"))
+        }
+    });
+    Ok((bucket.to_string(), list_prefix))
+}
+
+#[cfg(feature = "gcs")]
+fn parse_gcs_bucket_prefix(url: &str) -> Result<(String, Option<String>)> {
+    let mut rest = url.trim();
+    if let Some(stripped) = rest.strip_prefix("gs://") {
+        rest = stripped;
+    }
+    rest = rest.trim_start_matches('/');
+    anyhow::ensure!(!rest.is_empty(), "invalid gs prefix (empty url)");
+
+    let (bucket, prefix) = match rest.split_once('/') {
+        Some((bucket, prefix)) => (bucket.trim(), Some(prefix.trim())),
+        None => (rest.trim(), None),
+    };
+    anyhow::ensure!(!bucket.is_empty(), "invalid gs prefix (empty bucket)");
+
+    let list_prefix = prefix.and_then(|p| {
+        let trimmed = p.trim_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!("{trimmed}/"))
+        }
+    });
+    Ok((bucket.to_string(), list_prefix))
+}
+
+#[cfg(feature = "s3")]
+fn s3_precomputed_manifest_key(list_prefix: Option<&str>) -> String {
+    match list_prefix {
+        Some(prefix) => format!("{prefix}_mx8/manifest.tsv"),
+        None => "_mx8/manifest.tsv".to_string(),
+    }
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+#[derive(Debug, Clone)]
+struct ShuffleReservoir {
+    cap: usize,
+    rng: TinyRng,
+    data: Vec<mx8_core::types::ManifestRecord>,
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+impl ShuffleReservoir {
+    fn new(cap: usize, seed: u64) -> Self {
+        Self {
+            cap: std::cmp::max(1, cap),
+            rng: TinyRng::new(seed),
+            data: Vec::with_capacity(std::cmp::max(1, cap)),
+        }
+    }
+
+    fn push_and_maybe_pop(
+        &mut self,
+        record: mx8_core::types::ManifestRecord,
+    ) -> Option<mx8_core::types::ManifestRecord> {
+        self.data.push(record);
+        if self.data.len() <= self.cap {
+            return None;
+        }
+        let idx = self.rng.next_index(self.data.len());
+        Some(self.data.swap_remove(idx))
+    }
+
+    fn pop_random(&mut self) -> Option<mx8_core::types::ManifestRecord> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let idx = self.rng.next_index(self.data.len());
+        Some(self.data.swap_remove(idx))
+    }
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+#[derive(Debug, Clone, Copy)]
+struct TinyRng {
+    state: u64,
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+impl TinyRng {
+    fn new(seed: u64) -> Self {
+        let init = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
+        Self { state: init }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 7;
+        x ^= x >> 9;
+        x ^= x << 8;
+        self.state = x;
+        x
+    }
+
+    fn next_index(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        (self.next_u64() % (upper as u64)) as usize
+    }
+}
+
+#[cfg(feature = "s3")]
+async fn scan_s3_prefix_records_to_channel(
+    cfg: S3ScanConfig,
+    client: S3Client,
+    tx: mpsc::Sender<mx8_core::types::ManifestRecord>,
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let mut sender = tx;
+    let seed = std::env::var("MX8_S3_SCAN_SHUFFLE_SEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(mx8_observe::time::unix_time_ms);
+    let mut reservoir = ShuffleReservoir::new(cfg.reservoir_size, seed);
+    let mut token: Option<String> = None;
+    let mut objects_seen: u64 = 0;
+    let mut emitted: u64 = 0;
+    let mut sent: u64 = 0;
+    let mut label_to_id: HashMap<String, u64> = HashMap::new();
+    let mut next_label_id: u64 = 0;
+
+    loop {
+        let mut req = client.list_objects_v2().bucket(&cfg.bucket);
+        if let Some(prefix) = cfg.list_prefix.as_deref() {
+            req = req.prefix(prefix);
+        }
+        if !cfg.recursive {
+            req = req.delimiter("/");
+        }
+        if let Some(t) = token.as_deref() {
+            req = req.continuation_token(t);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("list_objects_v2 failed: {e:?}"))?;
+        if let Some(contents) = resp.contents {
+            for object in contents {
+                let Some(key) = object.key else { continue };
+                if key.ends_with('/') {
+                    continue;
+                }
+                let Some(size_i64) = object.size else {
+                    continue;
+                };
+                if size_i64 <= 0 {
+                    continue;
+                }
+                let size = u64::try_from(size_i64)
+                    .map_err(|_| anyhow::anyhow!("invalid object size for key {}", key))?;
+                objects_seen = objects_seen.saturating_add(1);
+                let decode_hint = imagefolder_decode_hint_for_key(
+                    cfg.list_prefix.as_deref(),
+                    key.as_str(),
+                    &mut label_to_id,
+                    &mut next_label_id,
+                );
+                let record = mx8_core::types::ManifestRecord {
+                    sample_id: 0,
+                    location: format!("s3://{}/{key}", cfg.bucket),
+                    byte_offset: Some(0),
+                    byte_length: Some(size),
+                    decode_hint,
+                };
+                if let Some(out) = reservoir.push_and_maybe_pop(record) {
+                    scan_emit_record(
+                        &mut sender,
+                        out,
+                        cfg.start_id,
+                        cfg.end_id,
+                        &mut emitted,
+                        &mut sent,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if resp.is_truncated.unwrap_or(false) {
+            token = resp.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    while let Some(out) = reservoir.pop_random() {
+        scan_emit_record(
+            &mut sender,
+            out,
+            cfg.start_id,
+            cfg.end_id,
+            &mut emitted,
+            &mut sent,
+        )
+        .await?;
+    }
+    drop(sender);
+
+    tracing::info!(
+        target: "mx8_proof",
+        event = "s3_scan_completed",
+        bucket = %cfg.bucket,
+        prefix = %cfg.list_prefix.as_deref().unwrap_or(""),
+        recursive = cfg.recursive,
+        objects_seen = objects_seen,
+        records_emitted = emitted,
+        records_sent = sent,
+        reservoir_size = cfg.reservoir_size as u64,
+        "completed zero-manifest s3 scan"
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+fn imagefolder_decode_hint_for_key(
+    list_prefix: Option<&str>,
+    key: &str,
+    label_to_id: &mut std::collections::HashMap<String, u64>,
+    next_label_id: &mut u64,
+) -> Option<String> {
+    let mut rest = key.trim_start_matches('/');
+    if let Some(prefix) = list_prefix {
+        let p = prefix.trim_matches('/');
+        if !p.is_empty() {
+            if let Some(after) = rest.strip_prefix(p) {
+                rest = after.strip_prefix('/').unwrap_or(after);
+            }
+        }
+    }
+    let (label, _) = rest.split_once('/')?;
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+
+    let label_id = match label_to_id.get(label) {
+        Some(existing) => *existing,
+        None => {
+            let assigned = *next_label_id;
+            *next_label_id = next_label_id.saturating_add(1);
+            label_to_id.insert(label.to_string(), assigned);
+            assigned
+        }
+    };
+    Some(format!(
+        "mx8:vision:imagefolder;label_id={label_id};label={label}"
+    ))
+}
+
+#[cfg(feature = "gcs")]
+struct GcsScanConfig {
+    bucket: String,
+    list_prefix: Option<String>,
+    recursive: bool,
+    reservoir_size: usize,
+    start_id: Option<u64>,
+    end_id: Option<u64>,
+}
+
+#[cfg(feature = "gcs")]
+async fn scan_gcs_prefix_records_to_channel(
+    cfg: GcsScanConfig,
+    client: GcsClient,
+    tx: mpsc::Sender<mx8_core::types::ManifestRecord>,
+) -> Result<()> {
+    use google_cloud_storage::http::objects::list::ListObjectsRequest;
+    use std::collections::HashMap;
+
+    let mut sender = tx;
+    let seed = std::env::var("MX8_GCS_SCAN_SHUFFLE_SEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(mx8_observe::time::unix_time_ms);
+    let mut reservoir = ShuffleReservoir::new(cfg.reservoir_size, seed);
+    let mut token: Option<String> = None;
+    let mut objects_seen: u64 = 0;
+    let mut emitted: u64 = 0;
+    let mut sent: u64 = 0;
+    let mut label_to_id: HashMap<String, u64> = HashMap::new();
+    let mut next_label_id: u64 = 0;
+
+    loop {
+        let resp = client
+            .list_objects(&ListObjectsRequest {
+                bucket: cfg.bucket.clone(),
+                prefix: cfg.list_prefix.clone(),
+                max_results: Some(1000),
+                page_token: token.clone(),
+                delimiter: if cfg.recursive {
+                    None
+                } else {
+                    Some("/".to_string())
+                },
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("gcs list_objects failed: {e:?}"))?;
+
+        if let Some(items) = resp.items {
+            for object in items {
+                let key = object.name;
+                if key.ends_with('/') {
+                    continue;
+                }
+                let size = object.size;
+                if size <= 0 {
+                    continue;
+                }
+                let size = size as u64;
+                objects_seen = objects_seen.saturating_add(1);
+                let decode_hint = imagefolder_decode_hint_for_key(
+                    cfg.list_prefix.as_deref(),
+                    key.as_str(),
+                    &mut label_to_id,
+                    &mut next_label_id,
+                );
+                let record = mx8_core::types::ManifestRecord {
+                    sample_id: 0,
+                    location: format!("gs://{}/{key}", cfg.bucket),
+                    byte_offset: Some(0),
+                    byte_length: Some(size),
+                    decode_hint,
+                };
+                if let Some(out) = reservoir.push_and_maybe_pop(record) {
+                    scan_emit_record(
+                        &mut sender,
+                        out,
+                        cfg.start_id,
+                        cfg.end_id,
+                        &mut emitted,
+                        &mut sent,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if let Some(next_token) = resp.next_page_token {
+            token = Some(next_token);
+        } else {
+            break;
+        }
+    }
+
+    while let Some(out) = reservoir.pop_random() {
+        scan_emit_record(
+            &mut sender,
+            out,
+            cfg.start_id,
+            cfg.end_id,
+            &mut emitted,
+            &mut sent,
+        )
+        .await?;
+    }
+    drop(sender);
+
+    tracing::info!(
+        target: "mx8_proof",
+        event = "gcs_scan_completed",
+        bucket = %cfg.bucket,
+        prefix = %cfg.list_prefix.as_deref().unwrap_or(""),
+        recursive = cfg.recursive,
+        objects_seen = objects_seen,
+        records_emitted = emitted,
+        records_sent = sent,
+        reservoir_size = cfg.reservoir_size as u64,
+        "completed zero-manifest gcs scan"
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+struct S3ScanConfig {
+    bucket: String,
+    list_prefix: Option<String>,
+    recursive: bool,
+    reservoir_size: usize,
+    start_id: Option<u64>,
+    end_id: Option<u64>,
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+async fn scan_emit_record(
+    sender: &mut mpsc::Sender<mx8_core::types::ManifestRecord>,
+    mut record: mx8_core::types::ManifestRecord,
+    start_id: Option<u64>,
+    end_id: Option<u64>,
+    emitted: &mut u64,
+    sent: &mut u64,
+) -> Result<()> {
+    let idx = *emitted;
+    *emitted = emitted.saturating_add(1);
+    record.sample_id = idx;
+    let in_range = match (start_id, end_id) {
+        (Some(start), Some(end)) => idx >= start && idx < end,
+        _ => true,
+    };
+    if in_range {
+        sender.send(record).await?;
+        *sent = sent.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn build_http_client() -> Result<HttpClient> {
+    let default_headers = parse_http_default_headers_from_env()?;
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
+        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
+        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST);
+    if !default_headers.is_empty() {
+        builder = builder.default_headers(default_headers);
+    }
+    builder.build().map_err(Into::into)
+}
+
+fn parse_http_default_headers_from_env() -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if let Ok(raw) = std::env::var("MX8_HTTP_AUTH_BEARER") {
+        let token = raw.trim();
+        if !token.is_empty() {
+            let value = format!("Bearer {token}");
+            let auth_value = HeaderValue::from_str(&value)
+                .map_err(|_| anyhow::anyhow!("invalid MX8_HTTP_AUTH_BEARER value"))?;
+            headers.insert(AUTHORIZATION, auth_value);
+        }
+    }
+
+    if let Ok(raw) = std::env::var("MX8_HTTP_HEADERS") {
+        let normalized = raw.replace("\\n", "\n");
+        for line in normalized.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name_raw, value_raw)) = line.split_once(':') else {
+                anyhow::bail!(
+                    "invalid MX8_HTTP_HEADERS line; expected 'Header-Name: value' format"
+                );
+            };
+            let name = name_raw.trim();
+            if name.is_empty() {
+                anyhow::bail!("invalid MX8_HTTP_HEADERS line; header name is empty");
+            }
+            let value = value_raw.trim();
+            if value.is_empty() {
+                anyhow::bail!(
+                    "invalid MX8_HTTP_HEADERS line for header '{name}'; header value is empty"
+                );
+            }
+            let header_name: HeaderName = name
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid MX8_HTTP_HEADERS header name '{name}'"))?;
+            let header_value = HeaderValue::from_str(value).map_err(|_| {
+                let detail = if is_sensitive_header_name(&header_name) {
+                    "sensitive value redacted"
+                } else {
+                    "value rejected by HTTP header parser"
+                };
+                anyhow::anyhow!("invalid MX8_HTTP_HEADERS value for header '{name}' ({detail})")
+            })?;
+            headers.insert(header_name, header_value);
+        }
+    }
+    Ok(headers)
+}
+
+fn is_sensitive_header_name(name: &HeaderName) -> bool {
+    let raw = name.as_str();
+    raw.eq_ignore_ascii_case("authorization")
+        || raw.eq_ignore_ascii_case("proxy-authorization")
+        || raw.eq_ignore_ascii_case("x-api-key")
+        || raw.eq_ignore_ascii_case("api-key")
+        || raw.eq_ignore_ascii_case("x-auth-token")
+        || raw.eq_ignore_ascii_case("x-access-token")
+        || raw.eq_ignore_ascii_case("cookie")
+        || raw.eq_ignore_ascii_case("set-cookie")
+}
+
+async fn http_head_len(client: &HttpClient, url: &str, sample_id: u64) -> Result<u64> {
+    let resp = http_with_retry(sample_id, || async move { client.head(url).send().await }).await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("http HEAD failed: status={} url={}", resp.status(), url);
+    }
+
+    let len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("http HEAD missing/invalid content-length: url={url}"))?;
+    anyhow::ensure!(len > 0, "http HEAD returned zero length: url={url}");
+    Ok(len)
+}
+
+async fn http_range_get(
+    client: &HttpClient,
+    url: &str,
+    offset: u64,
+    len: u64,
+    sample_id: u64,
+) -> Result<Vec<u8>> {
+    let end = offset
+        .checked_add(len)
+        .and_then(|v| v.checked_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("invalid range length"))?;
+    let range = format!("bytes={offset}-{end}");
+
+    let resp = http_with_retry(sample_id, || {
+        let range = range.clone();
+        async move {
+            client
+                .get(url)
+                .header(reqwest::header::RANGE, range)
+                .send()
+                .await
+        }
+    })
+    .await?;
+
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        anyhow::bail!(
+            "http range GET failed: status={} url={} (expected 206)",
+            resp.status(),
+            url
+        );
+    }
+
+    let bytes = resp.bytes().await?;
+    Ok(bytes.to_vec())
+}
+
+async fn http_with_retry<F, Fut>(sample_id: u64, mut f: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    const MAX_ATTEMPTS: usize = 5;
+    const BASE_DELAY_MS: u64 = 50;
+    const MAX_DELAY_MS: u64 = 1000;
+
+    let mut attempt: usize = 0;
+    let mut delay_ms: u64 = BASE_DELAY_MS;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match f().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let transient = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status.is_server_error();
+                if transient && attempt < MAX_ATTEMPTS {
+                    let jitter = mx8_observe::time::unix_time_ms().wrapping_add(sample_id) % 37;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        delay_ms.saturating_add(jitter),
+                    ))
+                    .await;
+                    delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Err(err) => {
+                let transient = err.is_timeout() || err.is_connect();
+                if transient && attempt < MAX_ATTEMPTS {
+                    let jitter = mx8_observe::time::unix_time_ms().wrapping_add(sample_id) % 37;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        delay_ms.saturating_add(jitter),
+                    ))
+                    .await;
+                    delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                    continue;
+                }
+                return Err(anyhow::Error::new(err));
+            }
+        }
+    }
+}
+
+async fn build_manifest_inflight_batch(
+    caps: RuntimeCaps,
+    metrics: Arc<RuntimeMetrics>,
+    inflight_sem: Arc<Semaphore>,
+    rss_check_counter: Arc<AtomicU64>,
+    records: &[mx8_core::types::ManifestRecord],
+    clients: StorageClients<'_>,
+) -> Result<BatchLease> {
+    enforce_process_rss_cap(caps, metrics.as_ref(), &rss_check_counter)?;
+    let plan = build_batch_plan(
+        records,
+        clients.s3,
+        clients.gcs,
+        clients.azure,
+        clients.http,
+    )
+    .await?;
+    let bytes = plan.total_bytes;
+    anyhow::ensure!(
+        bytes <= caps.max_inflight_bytes,
+        "batch payload bytes {} exceeds max_inflight_bytes {}",
+        bytes,
+        caps.max_inflight_bytes
+    );
+    let permit_units = if bytes == 0 {
+        0u64
+    } else {
+        bytes.div_ceil(PERMIT_UNIT_BYTES).max(1)
+    };
+
+    anyhow::ensure!(
+        permit_units <= u32::MAX as u64,
+        "batch too large for permit accounting ({} units)",
+        permit_units
+    );
+
+    let permit = inflight_sem
+        .clone()
+        .acquire_many_owned(permit_units as u32)
+        .await?;
+
+    metrics.on_inflight_add(bytes);
+    metrics.on_batch_payload_bytes(bytes);
+
+    let payload = match fetch_specs_payload(
+        &plan.specs,
+        clients.s3,
+        clients.gcs,
+        clients.azure,
+        clients.http,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(err) => {
+            metrics.on_inflight_sub(bytes);
+            return Err(err);
+        }
+    };
+
+    let mut offsets: Vec<u64> = Vec::with_capacity(plan.specs.len().saturating_add(1));
+    offsets.push(0);
+    let mut running: u64 = 0;
+    for spec in &plan.specs {
+        running = running
+            .checked_add(spec.len)
+            .ok_or_else(|| anyhow::anyhow!("offset overflow"))?;
+        offsets.push(running);
+    }
+    anyhow::ensure!(
+        offsets.len() == plan.sample_ids.len().saturating_add(1),
+        "offsets length mismatch ({} vs ids {})",
+        offsets.len(),
+        plan.sample_ids.len()
+    );
+    anyhow::ensure!(
+        offsets.last().copied().unwrap_or_default() == bytes,
+        "offsets must end at payload length ({}), got {}",
+        bytes,
+        offsets.last().copied().unwrap_or_default()
+    );
+
+    let batch = Batch {
+        sample_ids: Arc::from(plan.sample_ids.as_slice()),
+        label_ids: plan.label_ids.as_ref().map(|v| Arc::from(v.as_slice())),
+        offsets: Arc::from(offsets.as_slice()),
+        payload: Arc::from(payload.as_slice()),
+    };
+
+    Ok(BatchLease {
+        batch,
+        bytes,
+        metrics,
+        _permit: permit,
+    })
+}
+
+const RSS_CHECK_EVERY_BATCHES: u64 = 16;
+
+fn enforce_process_rss_cap(
+    caps: RuntimeCaps,
+    metrics: &RuntimeMetrics,
+    counter: &Arc<AtomicU64>,
+) -> Result<()> {
+    let Some(max_process_rss_bytes) = caps.max_process_rss_bytes else {
+        return Ok(());
+    };
+
+    let checks = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if checks > 1 && !checks.is_multiple_of(RSS_CHECK_EVERY_BATCHES) {
+        return Ok(());
+    }
+
+    let rss_bytes = sample_process_rss_bytes().ok_or_else(|| {
+        anyhow::anyhow!("max_process_rss_bytes is set but process RSS sampling is unavailable")
+    })?;
+    metrics.on_process_rss_sample(rss_bytes);
+    anyhow::ensure!(
+        rss_bytes <= max_process_rss_bytes,
+        "process rss {} exceeds max_process_rss_bytes {}",
+        rss_bytes,
+        max_process_rss_bytes
+    );
+    Ok(())
+}
+
+fn sample_process_rss_bytes() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", pid.as_str()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = String::from_utf8(out.stdout).ok()?;
+    let rss_kib = txt
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())?;
+    rss_kib.checked_mul(1024)
+}
+
+#[cfg(feature = "s3")]
+fn parse_s3_bucket_key(rest: &str) -> Result<(String, String)> {
+    // rest = "<bucket>/<key...>"
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((bucket, key)) = rest.split_once('/') else {
+        anyhow::bail!("invalid s3 url (missing key): s3://{rest}");
+    };
+    let bucket = bucket.trim();
+    let key = key.trim();
+    anyhow::ensure!(!bucket.is_empty(), "invalid s3 url (empty bucket)");
+    anyhow::ensure!(!key.is_empty(), "invalid s3 url (empty key)");
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+#[cfg(feature = "gcs")]
+fn parse_gcs_bucket_key(rest: &str) -> Result<(String, String)> {
+    // rest = "<bucket>/<object...>"
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((bucket, key)) = rest.split_once('/') else {
+        anyhow::bail!("invalid gs url (missing object key): gs://{rest}");
+    };
+    let bucket = bucket.trim();
+    let key = key.trim();
+    anyhow::ensure!(!bucket.is_empty(), "invalid gs url (empty bucket)");
+    anyhow::ensure!(!key.is_empty(), "invalid gs url (empty object key)");
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+#[cfg(feature = "azure")]
+fn parse_azure_container_blob(rest: &str) -> Result<(String, String)> {
+    // rest = "<container>/<blob...>"
+    let rest = rest.trim().trim_start_matches('/');
+    let Some((container, blob)) = rest.split_once('/') else {
+        anyhow::bail!("invalid az url (missing blob name): az://{rest}");
+    };
+    let container = container.trim();
+    let blob = blob.trim();
+    anyhow::ensure!(!container.is_empty(), "invalid az url (empty container)");
+    anyhow::ensure!(!blob.is_empty(), "invalid az url (empty blob name)");
+    Ok((container.to_string(), blob.to_string()))
+}
+
+fn parse_canonical_manifest_tsv(bytes: &[u8]) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    let reader = std::io::Cursor::new(bytes);
+    parse_canonical_manifest_tsv_reader(BufReader::new(reader))
+}
+
+fn parse_canonical_manifest_tsv_path(path: &Path) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    let file = std::fs::File::open(path)?;
+    parse_canonical_manifest_tsv_reader(BufReader::new(file))
+}
+
+fn parse_canonical_manifest_tsv_path_range(
+    path: &Path,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    let file = std::fs::File::open(path)?;
+    parse_canonical_manifest_tsv_reader_range(BufReader::new(file), start_id, end_id)
+}
+
+fn parse_canonical_manifest_tsv_reader<R: BufRead>(
+    mut reader: R,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    let mut buf = String::new();
+    let mut line_no: usize = 0;
+    let mut header: Option<String> = None;
+
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        header = Some(line.to_string());
+        break;
+    }
+
+    let first = header.ok_or_else(|| anyhow::anyhow!("empty manifest"))?;
+    let Some((k, v)) = first.split_once('=') else {
+        anyhow::bail!("manifest header missing schema_version");
+    };
+    if k.trim() != "schema_version" {
+        anyhow::bail!("manifest header must be schema_version=<n>");
+    }
+    let schema_version: u32 = v
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid schema_version"))?;
+    anyhow::ensure!(
+        schema_version == mx8_core::types::MANIFEST_SCHEMA_VERSION,
+        "unsupported schema_version {}",
+        schema_version
+    );
+
+    let mut records: Vec<mx8_core::types::ManifestRecord> = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            anyhow::bail!("line {}: expected at least 2 columns", line_no);
+        }
+        let sample_id: u64 = cols[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {}: bad sample_id", line_no))?;
+        let location = cols[1].trim().to_string();
+
+        let mut byte_offset: Option<u64> = None;
+        let mut byte_length: Option<u64> = None;
+        let mut decode_hint: Option<String> = None;
+
+        if cols.len() >= 4 {
+            if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
+                byte_offset = Some(
+                    cols[2]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_offset", line_no))?,
+                );
+                byte_length = Some(
+                    cols[3]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_length", line_no))?,
+                );
+            }
+        } else if cols.len() == 3 {
+            anyhow::bail!("line {}: partial byte range", line_no);
+        }
+
+        if cols.len() >= 5 && !cols[4].trim().is_empty() {
+            decode_hint = Some(cols[4].trim().to_string());
+        }
+
+        let record = mx8_core::types::ManifestRecord {
+            sample_id,
+            location,
+            byte_offset,
+            byte_length,
+            decode_hint,
+        };
+        record
+            .validate()
+            .map_err(|e| anyhow::anyhow!("line {}: {e}", line_no))?;
+        records.push(record);
+    }
+
+    for (idx, r) in records.iter().enumerate() {
+        let expected = idx as u64;
+        anyhow::ensure!(
+            r.sample_id == expected,
+            "expected sample_id {} but found {}",
+            expected,
+            r.sample_id
+        );
+    }
+
+    Ok(records)
+}
+
+fn parse_canonical_manifest_tsv_reader_range<R: BufRead>(
+    mut reader: R,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    anyhow::ensure!(start_id <= end_id, "invalid range (start_id > end_id)");
+
+    let mut buf = String::new();
+    let mut line_no: usize = 0;
+    let mut header: Option<String> = None;
+
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        header = Some(line.to_string());
+        break;
+    }
+
+    let first = header.ok_or_else(|| anyhow::anyhow!("empty manifest"))?;
+    let Some((k, v)) = first.split_once('=') else {
+        anyhow::bail!("manifest header missing schema_version");
+    };
+    if k.trim() != "schema_version" {
+        anyhow::bail!("manifest header must be schema_version=<n>");
+    }
+    let schema_version: u32 = v
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid schema_version"))?;
+    anyhow::ensure!(
+        schema_version == mx8_core::types::MANIFEST_SCHEMA_VERSION,
+        "unsupported schema_version {}",
+        schema_version
+    );
+
+    let cap = usize::try_from(end_id.saturating_sub(start_id)).unwrap_or(usize::MAX);
+    let mut selected: Vec<mx8_core::types::ManifestRecord> = Vec::with_capacity(cap.min(4096));
+    let mut expected_sample_id: u64 = 0;
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line_no = line_no.saturating_add(1);
+        let line = buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 2 {
+            anyhow::bail!("line {}: expected at least 2 columns", line_no);
+        }
+        let sample_id: u64 = cols[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {}: bad sample_id", line_no))?;
+        let location = cols[1].trim().to_string();
+
+        let mut byte_offset: Option<u64> = None;
+        let mut byte_length: Option<u64> = None;
+        let mut decode_hint: Option<String> = None;
+
+        if cols.len() >= 4 {
+            if !cols[2].trim().is_empty() || !cols[3].trim().is_empty() {
+                byte_offset = Some(
+                    cols[2]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_offset", line_no))?,
+                );
+                byte_length = Some(
+                    cols[3]
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("line {}: bad byte_length", line_no))?,
+                );
+            }
+        } else if cols.len() == 3 {
+            anyhow::bail!("line {}: partial byte range", line_no);
+        }
+
+        if cols.len() >= 5 && !cols[4].trim().is_empty() {
+            decode_hint = Some(cols[4].trim().to_string());
+        }
+
+        let record = mx8_core::types::ManifestRecord {
+            sample_id,
+            location,
+            byte_offset,
+            byte_length,
+            decode_hint,
+        };
+        record
+            .validate()
+            .map_err(|e| anyhow::anyhow!("line {}: {e}", line_no))?;
+
+        anyhow::ensure!(
+            record.sample_id == expected_sample_id,
+            "expected sample_id {} but found {}",
+            expected_sample_id,
+            record.sample_id
+        );
+
+        if record.sample_id >= start_id && record.sample_id < end_id {
+            selected.push(record);
+        }
+        expected_sample_id = expected_sample_id.saturating_add(1);
+    }
+
+    let len = expected_sample_id as usize;
+    let start = usize::try_from(start_id).map_err(|_| anyhow::anyhow!("start_id too large"))?;
+    let end = usize::try_from(end_id).map_err(|_| anyhow::anyhow!("end_id too large"))?;
+    anyhow::ensure!(start <= len, "start_id out of range");
+    anyhow::ensure!(end <= len, "end_id out of range");
+    Ok(selected)
+}
+
+struct ChunkedRead<I>
+where
+    I: Iterator<Item = Vec<u8>>,
+{
+    iter: I,
+    cur: std::io::Cursor<Vec<u8>>,
+    exhausted: bool,
+}
+
+impl<I> ChunkedRead<I>
+where
+    I: Iterator<Item = Vec<u8>>,
+{
+    fn new(iter: I) -> Self {
+        Self {
+            iter,
+            cur: std::io::Cursor::new(Vec::new()),
+            exhausted: false,
+        }
+    }
+}
+
+impl<I> std::io::Read for ChunkedRead<I>
+where
+    I: Iterator<Item = Vec<u8>>,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let n = std::io::Read::read(&mut self.cur, buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            if self.exhausted {
+                return Ok(0);
+            }
+            match self.iter.next() {
+                Some(chunk) => {
+                    self.cur = std::io::Cursor::new(chunk);
+                }
+                None => {
+                    self.exhausted = true;
+                }
+            }
+        }
+    }
+}
+
+fn select_record_range(
+    records: Vec<mx8_core::types::ManifestRecord>,
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    anyhow::ensure!(start_id <= end_id, "invalid range (start_id > end_id)");
+    let len = records.len();
+    let start = usize::try_from(start_id).map_err(|_| anyhow::anyhow!("start_id too large"))?;
+    let end = usize::try_from(end_id).map_err(|_| anyhow::anyhow!("end_id too large"))?;
+    anyhow::ensure!(start <= len, "start_id out of range");
+    anyhow::ensure!(end <= len, "end_id out of range");
+    Ok(records[start..end].to_vec())
+}
+
+fn select_record_range_slice(
+    records: &[mx8_core::types::ManifestRecord],
+    start_id: u64,
+    end_id: u64,
+) -> Result<Vec<mx8_core::types::ManifestRecord>> {
+    anyhow::ensure!(start_id <= end_id, "invalid range (start_id > end_id)");
+    let len = records.len();
+    let start = usize::try_from(start_id).map_err(|_| anyhow::anyhow!("start_id too large"))?;
+    let end = usize::try_from(end_id).map_err(|_| anyhow::anyhow!("end_id too large"))?;
+    anyhow::ensure!(start <= len, "start_id out of range");
+    anyhow::ensure!(end <= len, "end_id out of range");
+    Ok(records[start..end].to_vec())
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod s3_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_s3_bucket_key_ok() -> Result<()> {
+        let (b, k) = parse_s3_bucket_key("mybucket/path/to.obj")?;
+        assert_eq!(b, "mybucket");
+        assert_eq!(k, "path/to.obj");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_s3_bucket_key_rejects_missing_key() {
+        let err = parse_s3_bucket_key("mybucket").unwrap_err();
+        assert!(err.to_string().contains("missing key"));
+    }
+
+    #[test]
+    fn parse_s3_bucket_prefix_accepts_bucket_root() -> Result<()> {
+        let (bucket, prefix) = parse_s3_bucket_prefix("s3://mybucket")?;
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(prefix, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_s3_bucket_prefix_normalizes_prefix() -> Result<()> {
+        let (bucket, prefix) = parse_s3_bucket_prefix("s3://mybucket/path/to/data/")?;
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(prefix.as_deref(), Some("path/to/data/"));
+        Ok(())
+    }
+
+    #[test]
+    fn reservoir_emits_all_records_once() {
+        let mut reservoir = ShuffleReservoir::new(4, 123);
+        let mut out = Vec::new();
+        for i in 0..25u64 {
+            let record = mx8_core::types::ManifestRecord {
+                sample_id: i,
+                location: format!("s3://b/k{i}"),
+                byte_offset: Some(0),
+                byte_length: Some(1),
+                decode_hint: None,
+            };
+            if let Some(r) = reservoir.push_and_maybe_pop(record) {
+                out.push(r.sample_id);
+            }
+        }
+        while let Some(r) = reservoir.pop_random() {
+            out.push(r.sample_id);
+        }
+        out.sort_unstable();
+        assert_eq!(out.len(), 25);
+        for (idx, sid) in out.iter().enumerate() {
+            assert_eq!(*sid as usize, idx);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "azure"))]
+mod azure_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_azure_container_blob_ok() -> Result<()> {
+        let (c, b) = parse_azure_container_blob("mycontainer/path/to/blob.bin")?;
+        assert_eq!(c, "mycontainer");
+        assert_eq!(b, "path/to/blob.bin");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_azure_container_blob_rejects_missing_blob() {
+        let err = parse_azure_container_blob("mycontainer").unwrap_err();
+        assert!(err.to_string().contains("missing blob name"));
+    }
+
+    #[test]
+    fn parse_location_azure_scheme() -> Result<()> {
+        let loc = parse_location("az://container/blob.bin")?;
+        match loc {
+            SpecLocation::Azure { container, blob } => {
+                assert_eq!(container, "container");
+                assert_eq!(blob, "blob.bin");
+                Ok(())
+            }
+            other => anyhow::bail!("expected azure location, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod http_config_tests {
+    use super::*;
+
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
+
+    #[test]
+    fn parse_http_headers_supports_bearer_and_custom_lines() -> Result<()> {
+        let _guard = env_guard();
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::remove_var("MX8_HTTP_HEADERS");
+
+        std::env::set_var("MX8_HTTP_AUTH_BEARER", "hf_secret");
+        std::env::set_var("MX8_HTTP_HEADERS", "X-Test-Header: value\\nX-Api-Key: k123");
+
+        let headers = parse_http_default_headers_from_env()?;
+        let auth = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer hf_secret");
+        assert_eq!(
+            headers
+                .get("x-test-header")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "value"
+        );
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "k123"
+        );
+
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::remove_var("MX8_HTTP_HEADERS");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_headers_rejects_invalid_line_format() {
+        let _guard = env_guard();
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::set_var("MX8_HTTP_HEADERS", "Authorization Bearer missing_colon");
+        let err =
+            parse_http_default_headers_from_env().expect_err("invalid header format should fail");
+        let text = err.to_string();
+        assert!(text.contains("expected 'Header-Name: value' format"));
+        std::env::remove_var("MX8_HTTP_HEADERS");
+    }
+
+    #[test]
+    fn parse_http_headers_custom_authorization_overrides_bearer_env() -> Result<()> {
+        let _guard = env_guard();
+        std::env::set_var("MX8_HTTP_AUTH_BEARER", "hf_secret");
+        std::env::set_var("MX8_HTTP_HEADERS", "Authorization: Bearer from_custom");
+
+        let headers = parse_http_default_headers_from_env()?;
+        let auth = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer from_custom");
+
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::remove_var("MX8_HTTP_HEADERS");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_headers_redacts_sensitive_value_errors() {
+        let _guard = env_guard();
+        std::env::remove_var("MX8_HTTP_AUTH_BEARER");
+        std::env::set_var("MX8_HTTP_HEADERS", "Authorization: bad\rvalue");
+        let err = parse_http_default_headers_from_env()
+            .expect_err("invalid sensitive header value should fail");
+        let text = err.to_string();
+        assert!(text.contains("sensitive value redacted"));
+        assert!(!text.contains("bad"));
+        std::env::remove_var("MX8_HTTP_HEADERS");
+    }
+}
+
+#[cfg(test)]
+mod manifest_reader_tests {
+    use super::*;
+
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::sink::Sink;
+    use crate::types::Batch;
+
+    fn manifest_with_n_rows(n: usize) -> Vec<u8> {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "schema_version={}\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        ));
+        for i in 0..n {
+            out.push_str(&format!("{i}\tfile:///tmp/{i}.bin\t\t\t\n"));
+        }
+        out.into_bytes()
+    }
+
+    #[test]
+    fn manifest_reader_accepts_valid_canonical_tsv() -> Result<()> {
+        let bytes = manifest_with_n_rows(3);
+        let records = load_manifest_records_from_read(std::io::Cursor::new(bytes))?;
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].sample_id, 0);
+        assert_eq!(records[2].sample_id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_reader_rejects_missing_schema_header() {
+        let bytes = b"0\tfile:///tmp/0.bin\t\t\t\n".to_vec();
+        let err = load_manifest_records_from_read(std::io::Cursor::new(bytes)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("manifest header missing schema_version"));
+    }
+
+    #[test]
+    fn manifest_reader_rejects_non_sequential_sample_ids() {
+        let bytes = format!(
+            "schema_version={}\n0\tfile:///tmp/0.bin\t\t\t\n2\tfile:///tmp/2.bin\t\t\t\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        )
+        .into_bytes();
+        let err = load_manifest_records_from_read(std::io::Cursor::new(bytes)).unwrap_err();
+        assert!(err.to_string().contains("expected sample_id 1 but found 2"));
+    }
+
+    #[test]
+    fn manifest_reader_matches_bytes_parser_semantics() {
+        let good = manifest_with_n_rows(4);
+        let from_bytes = parse_canonical_manifest_tsv(&good).unwrap();
+        let from_reader = load_manifest_records_from_read(std::io::Cursor::new(good)).unwrap();
+        assert_eq!(from_bytes, from_reader);
+
+        let bad = format!(
+            "schema_version={}\n0\tfile:///tmp/0.bin\t\t\t\n0\tfile:///tmp/0b.bin\t\t\t\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        )
+        .into_bytes();
+        let bad_bytes_err = parse_canonical_manifest_tsv(&bad).unwrap_err().to_string();
+        let bad_reader_err = load_manifest_records_from_read(std::io::Cursor::new(bad))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(bad_bytes_err, bad_reader_err);
+    }
+
+    #[test]
+    fn manifest_reader_handles_large_input_without_full_buffer_requirement() -> Result<()> {
+        let bytes = manifest_with_n_rows(25_000);
+        let chunks: Vec<Vec<u8>> = bytes.chunks(257).map(|c| c.to_vec()).collect();
+        let records = load_manifest_records_from_chunk_iter(chunks)?;
+        assert_eq!(records.len(), 25_000);
+        assert_eq!(records.first().map(|r| r.sample_id), Some(0));
+        assert_eq!(records.last().map(|r| r.sample_id), Some(24_999));
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_reader_range_matches_full_select_semantics() -> Result<()> {
+        let bytes = manifest_with_n_rows(64);
+        let full = parse_canonical_manifest_tsv(&bytes)?;
+        let expected = select_record_range_slice(&full, 7, 23)?;
+        let actual = parse_canonical_manifest_tsv_reader_range(std::io::Cursor::new(bytes), 7, 23)?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_reader_range_rejects_out_of_range() {
+        let bytes = manifest_with_n_rows(10);
+        let err = parse_canonical_manifest_tsv_reader_range(std::io::Cursor::new(bytes), 0, 11)
+            .unwrap_err();
+        assert!(err.to_string().contains("end_id out of range"));
+    }
+
+    #[derive(Default)]
+    struct CaptureSink {
+        sample_ids: Mutex<Vec<u64>>,
+    }
+
+    impl CaptureSink {
+        fn snapshot(&self) -> Vec<u64> {
+            self.sample_ids
+                .lock()
+                .expect("capture sink lock poisoned")
+                .clone()
+        }
+    }
+
+    impl Sink for CaptureSink {
+        fn deliver(&self, batch: Batch) -> Result<()> {
+            let mut out = self
+                .sample_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("capture sink lock poisoned"))?;
+            out.extend(batch.sample_ids.iter().copied());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_stream_reader_path_parity_with_bytes_path() -> Result<()> {
+        let caps = RuntimeCaps {
+            max_inflight_bytes: 8 * 1024 * 1024,
+            max_queue_batches: 8,
+            batch_size_samples: 5,
+            prefetch_batches: 1,
+            target_batch_bytes: None,
+            max_batch_bytes: None,
+            max_process_rss_bytes: None,
+        };
+        let pipeline = Pipeline::new(caps);
+
+        let mut root = std::env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        root.push(format!(
+            "mx8-runtime-reader-parity-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let _cleanup = TempDirCleanup { path: root.clone() };
+
+        let mut manifest = String::new();
+        manifest.push_str(&format!(
+            "schema_version={}\n",
+            mx8_core::types::MANIFEST_SCHEMA_VERSION
+        ));
+        for i in 0..23u64 {
+            let p = root.join(format!("sample-{i}.bin"));
+            std::fs::write(&p, [i as u8, (i.wrapping_mul(3)) as u8])?;
+            manifest.push_str(&format!("{}\t{}\t\t\t\n", i, p.display()));
+        }
+        let manifest = manifest.into_bytes();
+
+        let sink_bytes = Arc::new(CaptureSink::default());
+        pipeline
+            .run_manifest_bytes(sink_bytes.clone(), &manifest)
+            .await?;
+
+        let sink_reader = Arc::new(CaptureSink::default());
+        pipeline
+            .run_manifest_reader(sink_reader.clone(), std::io::Cursor::new(manifest.clone()))
+            .await?;
+
+        assert_eq!(sink_bytes.snapshot(), sink_reader.snapshot());
+        Ok(())
+    }
+
+    #[test]
+    fn jitter_guardrail_emits_breach_and_tightens_band() {
+        let caps = RuntimeCaps {
+            max_inflight_bytes: 8 * 1024 * 1024,
+            max_queue_batches: 8,
+            batch_size_samples: 64,
+            prefetch_batches: 1,
+            target_batch_bytes: Some(512 * 1024),
+            max_batch_bytes: Some(1024 * 1024),
+            max_process_rss_bytes: None,
+        };
+        let pipeline = Pipeline::new(caps);
+
+        for i in 0..BATCH_JITTER_WINDOW {
+            let payload = if i % 2 == 0 { 128 * 1024 } else { 512 * 1024 };
+            pipeline.metrics.on_batch_payload_bytes(payload);
+        }
+
+        let before_lower = pipeline.batch_band_lower_pct.load(Ordering::Relaxed);
+        let before_upper = pipeline.batch_band_upper_pct.load(Ordering::Relaxed);
+        pipeline.maybe_adjust_jitter_guardrail();
+        let after_lower = pipeline.batch_band_lower_pct.load(Ordering::Relaxed);
+        let after_upper = pipeline.batch_band_upper_pct.load(Ordering::Relaxed);
+
+        assert!(pipeline.metrics.batch_jitter_slo_breaches_total.get() >= 1);
+        assert!(pipeline.metrics.batch_jitter_band_adjustments_total.get() >= 1);
+        assert!(after_lower >= before_lower);
+        assert!(after_upper <= before_upper);
+    }
+
+    #[test]
+    fn jitter_guardrail_ranges_hold_p95_over_p50_for_full_batches() -> Result<()> {
+        let mut records = Vec::new();
+        let sizes = [
+            64_u64 * 1024,
+            96_u64 * 1024,
+            128_u64 * 1024,
+            160_u64 * 1024,
+            192_u64 * 1024,
+            224_u64 * 1024,
+        ];
+        for i in 0..512_u64 {
+            records.push(mx8_core::types::ManifestRecord {
+                sample_id: i,
+                location: format!("file:///tmp/{i}.bin"),
+                byte_offset: Some(0),
+                byte_length: Some(sizes[(i as usize) % sizes.len()]),
+                decode_hint: None,
+            });
+        }
+
+        let caps = RuntimeCaps {
+            max_inflight_bytes: 16 * 1024 * 1024,
+            max_queue_batches: 8,
+            batch_size_samples: 256,
+            prefetch_batches: 1,
+            target_batch_bytes: Some(512 * 1024),
+            max_batch_bytes: Some(640 * 1024),
+            max_process_rss_bytes: None,
+        };
+        let (band_lower_bytes, _) = byte_mode_band(
+            512 * 1024,
+            640 * 1024,
+            BYTE_BAND_LOWER_PCT,
+            BYTE_BAND_UPPER_PCT,
+        );
+        let ranges =
+            build_manifest_batch_ranges(&records, caps, BYTE_BAND_LOWER_PCT, BYTE_BAND_UPPER_PCT)?;
+
+        let mut payloads = Vec::new();
+        for r in ranges {
+            let mut total = 0_u64;
+            for rec in &records[r.start..r.end] {
+                total = total.saturating_add(rec.byte_length.unwrap_or(0));
+            }
+            if total >= band_lower_bytes {
+                payloads.push(total);
+            }
+        }
+        payloads.sort_unstable();
+        assert!(!payloads.is_empty());
+        let len = payloads.len();
+        let p50 = payloads[(len - 1) / 2];
+        let p95 = payloads[((len - 1) * 95) / 100];
+        let ratio = p95 as f64 / p50 as f64;
+        assert!(
+            ratio <= 1.25,
+            "expected p95/p50 <= 1.25 for full batches, got {ratio:.3}"
+        );
+        Ok(())
+    }
+
+    struct TempDirCleanup {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempDirCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}

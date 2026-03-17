@@ -1,8 +1,10 @@
 # MX8 Media API Shape
 
-This doc locks the user-facing API shape for `mx8-media` v0.
+This doc is a quick API-shape reference for `mx8-media` v0.
 
-We are only locking the call shape here. Transform variables and per-transform options come later.
+The authoritative source of truth is `docs/ARCHITECTURE.md`.
+
+If this file conflicts with `docs/ARCHITECTURE.md`, `ARCHITECTURE.md` wins.
 
 ## Locked Shape
 
@@ -14,7 +16,7 @@ mx8.run(
 )
 ```
 
-## Rules
+## Reference Rules
 
 - Top-level entrypoint is `mx8.run(...)`.
 - The source is the first positional argument.
@@ -50,9 +52,7 @@ mx8.run(
 )
 ```
 
-## Not Locked Yet
+## Notes
 
-- Per-transform variables and defaults
-- Shared top-level options beyond `transform` and `sink`
-- Exact transform catalog
-- Output naming and overwrite behavior
+- This file is intentionally narrow.
+- Broader product, control-plane, and v0 scope decisions live in `docs/ARCHITECTURE.md`.
