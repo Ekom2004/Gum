@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+import math
 from typing import Any
 from uuid import uuid4
 
@@ -122,6 +123,25 @@ class TransformSpec(BaseModel):
                 raise ValueError("video.extract_frames only accepts fps and format")
             self.params["fps"] = float(fps)
             self.params["format"] = normalized
+        elif self.type == "audio.resample":
+            allowed = {"rate", "channels"}
+            rate = self.params.get("rate")
+            channels = self.params.get("channels", 1)
+            if not isinstance(rate, int) or rate <= 0:
+                raise ValueError("audio.resample requires rate > 0")
+            if not isinstance(channels, int) or channels <= 0:
+                raise ValueError("audio.resample requires channels > 0")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("audio.resample only accepts rate and channels")
+            self.params["channels"] = channels
+        elif self.type == "audio.normalize":
+            allowed = {"loudness"}
+            loudness = self.params.get("loudness", -14.0)
+            if not isinstance(loudness, (int, float)) or not math.isfinite(loudness):
+                raise ValueError("audio.normalize loudness must be finite")
+            if not set(self.params).issubset(allowed):
+                raise ValueError("audio.normalize only accepts loudness")
+            self.params["loudness"] = float(loudness)
         return self
 
 

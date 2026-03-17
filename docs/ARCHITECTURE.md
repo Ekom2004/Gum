@@ -135,15 +135,32 @@ Responsibilities:
 - Try instance types in priority order: `g4dn.xlarge` → `g4dn.2xlarge` → `g5.xlarge`
 - When Postgres shows zero `RUNNING` or `QUEUED` jobs → terminate idle instances
 
-### 3D. The Transform Stage (inside `mx8-core`)
-The current `mx8-core` pipeline ends at `Deliver` (yielding samples to a Python consumer).
+### 3D. The Transform Stage (inside `mx8d-agent`)
 
-In mx8-media, `Deliver` is replaced by two new stages:
+The agent runs a fixed-concurrency pool of transform tasks. Each task applies the user-specified operation to the raw file bytes delivered by the pipeline.
 
-1. **`Transform`** — applies the user-specified operation to the decoded bytes:
-   - `ffmpeg-next` for all video and audio ops (NVENC/NVDEC on GPU, software on CPU)
-   - `image` crate for image resize/convert
-2. **`Sink`** — uploads the transformed bytes directly to the destination S3 URI using a multipart upload stream. Uses the `aws-sdk-s3` crate already in workspace dependencies.
+**Image transforms** (`image.resize`, `image.crop`, `image.convert`): handled entirely in-process using the `image` crate. No subprocess, no disk I/O.
+
+**Video and audio transforms** (`video.*`, `audio.*`): uses subprocess `ffmpeg` in **pipe mode** — zero disk I/O:
+
+```
+payload bytes
+  → stdin  (pipe:0)
+    → ffmpeg
+  → stdout (pipe:1)
+    → output bytes → S3 sink
+```
+
+For `video.extract_frames`, ffmpeg writes a raw `image2pipe` JPEG or PNG stream to stdout. The agent then parses JPEG/PNG byte boundaries to split the stream into individual frame payloads, each uploaded separately to the destination bucket.
+
+**The clean compute model:**
+1. `mx8d-agent` stays long-lived (one process per Spot instance)
+2. Each agent has a fixed small transform concurrency (capped by `NodeCaps`)
+3. Each transform task may spawn one `ffmpeg` subprocess
+4. `ffmpeg` runs pipe-to-pipe (stdin → stdout), never touching disk
+5. Coordinator lease sizing and `max_inflight_bytes` keeps file fanout bounded
+
+**`Sink`** — uploads transformed bytes to the destination S3 URI using `aws-sdk-s3` put_object. Frame extraction produces multiple S3 objects per input file (one per frame).
 
 ---
 
@@ -241,16 +258,23 @@ AWS (ephemeral, spun up per job):
 
 ---
 
-## 7. What to Build First (Sequence)
+## 7. Build Status
 
 ```
-Week 1:  Add Transform stage to mx8-core (ffmpeg-next for video.extract_frames)
-Week 2:  Add S3 Sink stage to mx8-core (replaces Deliver, uses aws-sdk-s3)
-Week 3:  Add JobSpec to mx8-wire, wire into coordinator + agent
-Week 4:  Build FastAPI server (job CRUD, auth, Postgres)
-Week 5:  Build Python SDK (mx8.run(), Job.wait())
-Week 6:  Build Scaler (boto3 Spot launch/terminate)
-Week 7:  End-to-end integration test on real S3 data
-Week 8:  Stripe billing webhook
-Week 9:  Internal demo. Find first design partner.
+✅ DONE   Python SDK       mx8.run(), Job.wait(), all 8 transforms + image.crop
+✅ DONE   FastAPI server   POST/GET /v1/jobs, /internal/job-complete, /internal/job-status
+✅ DONE   Models           JobStatus, TransformSpec, CreateJobRequest, JobRecord (Pydantic)
+✅ DONE   Storage          JobStore protocol + InMemoryJobStore (Postgres-ready)
+✅ DONE   Rust types       JobSpec + all 9 TransformSpec variants in mx8-core
+✅ DONE   Wire protocol    ToWire/TryToCore for all transforms + JobSpec, roundtrip tested
+✅ DONE   Image pipeline   image.resize, image.crop, image.convert — fully in-process
+✅ DONE   Video pipeline   all 4 video transforms via pipe-based ffmpeg (zero disk I/O)
+✅ DONE   S3 sink          aws-sdk-s3 put_object from agent
+
+🔨 NEXT   PostgresJobStore   Swap InMemoryJobStore → Postgres (Supabase)
+🔨 NEXT   Scaler             boto3 Spot launch/terminate loop
+🔨 NEXT   Coordinator wire   Pass JobSpec from API → coordinator → agent
+🔨 NEXT   End-to-end test    Real S3 bucket → transform → real output
+🔨 NEXT   Stripe billing     Charge on /internal/job-complete
+🔨 NEXT   Design partner     First paying customer
 ```

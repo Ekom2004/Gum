@@ -94,6 +94,12 @@ impl Drop for TransformProcessPermit<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AudioStreamMetadata {
+    sample_rate: u32,
+    channels: u32,
+}
+
 #[derive(Debug, Parser, Clone)]
 #[command(name = "mx8d-agent")]
 struct Args {
@@ -542,6 +548,15 @@ fn transform_payload_for_sink_with_slots(
         );
     }
 
+    if job_spec.transforms.iter().all(is_audio_transform) {
+        return transform_audio_payload_for_sink(
+            job_spec,
+            source_location,
+            payload,
+            transform_slots,
+        );
+    }
+
     anyhow::bail!(
         "mixed-media or unsupported transforms are not implemented in the worker right now"
     );
@@ -598,6 +613,13 @@ fn is_video_transform(transform: &TransformSpec) -> bool {
             | TransformSpec::VideoTranscode { .. }
             | TransformSpec::VideoExtractFrames { .. }
             | TransformSpec::VideoExtractAudio { .. }
+    )
+}
+
+fn is_audio_transform(transform: &TransformSpec) -> bool {
+    matches!(
+        transform,
+        TransformSpec::AudioResample { .. } | TransformSpec::AudioNormalize { .. }
     )
 }
 
@@ -696,6 +718,54 @@ fn transform_video_payload_for_sink(
         payload,
         source_location,
         "video transform",
+        transform_slots,
+    )
+}
+
+fn transform_audio_payload_for_sink(
+    job_spec: &CoreJobSpec,
+    source_location: &str,
+    payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<Vec<u8>> {
+    let output_format = audio_output_format(source_location)?;
+    let input_metadata = probe_audio_stream_metadata(payload, source_location)?;
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-vn")
+        .arg("-sn")
+        .arg("-dn");
+
+    if let Some(filter_chain) = audio_filter_chain(&job_spec.transforms) {
+        command.arg("-af").arg(filter_chain);
+    }
+
+    let rate = audio_output_rate(&job_spec.transforms).unwrap_or(input_metadata.sample_rate);
+    command.arg("-ar").arg(rate.to_string());
+
+    let channels = audio_output_channels(&job_spec.transforms).unwrap_or(input_metadata.channels);
+    command.arg("-ac").arg(channels.to_string());
+
+    let codec = ffmpeg_audio_codec(output_format)?;
+    command.arg("-c:a").arg(codec);
+    if output_format == "mp3" {
+        command.arg("-b:a").arg("192k");
+    }
+    command
+        .arg("-f")
+        .arg(audio_output_muxer(output_format))
+        .arg("pipe:1");
+
+    run_ffmpeg_stdout(
+        command,
+        payload,
+        source_location,
+        "audio transform",
         transform_slots,
     )
 }
@@ -844,6 +914,38 @@ fn video_output_crf(transforms: &[TransformSpec]) -> Option<u32> {
         })
 }
 
+fn audio_filter_chain(transforms: &[TransformSpec]) -> Option<String> {
+    let filters = transforms
+        .iter()
+        .filter_map(|transform| match transform {
+            TransformSpec::AudioNormalize { loudness_lufs } => {
+                Some(format!("loudnorm=I={loudness_lufs}:LRA=11:TP=-1.5"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if filters.is_empty() {
+        None
+    } else {
+        Some(filters.join(","))
+    }
+}
+
+fn audio_output_rate(transforms: &[TransformSpec]) -> Option<u32> {
+    transforms.iter().rev().find_map(|transform| match transform {
+        TransformSpec::AudioResample { rate, .. } => Some(*rate),
+        _ => None,
+    })
+}
+
+fn audio_output_channels(transforms: &[TransformSpec]) -> Option<u32> {
+    transforms.iter().rev().find_map(|transform| match transform {
+        TransformSpec::AudioResample { channels, .. } => Some(*channels),
+        _ => None,
+    })
+}
+
 fn video_extract_audio_spec(transforms: &[TransformSpec]) -> Option<&TransformSpec> {
     transforms
         .iter()
@@ -873,6 +975,82 @@ fn ffmpeg_audio_codec(format: &str) -> Result<&'static str> {
         Some(other) => anyhow::bail!("unsupported audio format: {other}"),
         None => anyhow::bail!("unsupported audio format: {format}"),
     }
+}
+
+fn audio_output_format(source_location: &str) -> Result<&'static str> {
+    let extension = source_extension(source_location)
+        .ok_or_else(|| anyhow::anyhow!("audio source has no file extension: {source_location}"))?;
+    normalize_audio_format(&extension).ok_or_else(|| {
+        anyhow::anyhow!(
+            "audio transforms currently support mp3, wav, or flac sources: {source_location}"
+        )
+    })
+}
+
+fn probe_audio_stream_metadata(input: &[u8], source_location: &str) -> Result<AudioStreamMetadata> {
+    let mut child = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("a:0")
+        .arg("-show_entries")
+        .arg("stream=sample_rate,channels")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg("pipe:0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::anyhow!("ffprobe is required for audio transforms but was not found in PATH")
+            }
+            _ => anyhow::anyhow!("ffprobe invocation failed for {source_location}: {err}"),
+        })?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open ffprobe stdin for {source_location}"))?;
+    let input_owned = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input_owned));
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| anyhow::anyhow!("ffprobe wait failed for {source_location}: {err}"))?;
+    let write_result = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffprobe stdin writer panicked for {source_location}"))?;
+    write_result
+        .map_err(|err| anyhow::anyhow!("ffprobe stdin write failed for {source_location}: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffprobe audio metadata failed for {source_location}: {}",
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| anyhow::anyhow!("ffprobe output was not valid utf8 for {source_location}: {err}"))?;
+    let mut lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty());
+    let sample_rate = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("ffprobe sample_rate missing for {source_location}"))?
+        .parse::<u32>()
+        .map_err(|err| anyhow::anyhow!("ffprobe sample_rate parse failed for {source_location}: {err}"))?;
+    let channels = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("ffprobe channels missing for {source_location}"))?
+        .parse::<u32>()
+        .map_err(|err| anyhow::anyhow!("ffprobe channels parse failed for {source_location}: {err}"))?;
+
+    Ok(AudioStreamMetadata {
+        sample_rate,
+        channels,
+    })
 }
 
 fn audio_output_muxer(format: &str) -> &'static str {
@@ -2067,6 +2245,28 @@ mod tests {
         assert!(status.success(), "ffmpeg audio fixture generation failed");
     }
 
+    fn write_ffmpeg_test_audio(path: &Path, sample_rate: u32, channels: u32) {
+        let status = Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg(format!("sine=frequency=1000:sample_rate={sample_rate}"))
+            .arg("-t")
+            .arg("1")
+            .arg("-ac")
+            .arg(channels.to_string())
+            .arg("-c:a")
+            .arg("pcm_s16le")
+            .arg(path)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success(), "ffmpeg audio fixture generation failed");
+    }
+
     fn ffprobe_video_stream(path: &Path) -> (u32, u32, String) {
         let output = Command::new("ffprobe")
             .arg("-v")
@@ -2121,6 +2321,39 @@ mod tests {
             .find(|line| !line.is_empty())
             .expect("audio codec")
             .to_string()
+    }
+
+    fn ffprobe_audio_details(path: &Path) -> (String, u32, u32) {
+        let output = Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-select_streams")
+            .arg("a:0")
+            .arg("-show_entries")
+            .arg("stream=codec_name,sample_rate,channels")
+            .arg("-of")
+            .arg("default=noprint_wrappers=1:nokey=1")
+            .arg(path)
+            .output()
+            .expect("run ffprobe");
+        assert!(output.status.success(), "ffprobe failed");
+        let stdout = String::from_utf8(output.stdout).expect("ffprobe output utf8");
+        let mut lines = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let codec = lines.next().expect("audio codec").to_string();
+        let sample_rate = lines
+            .next()
+            .expect("sample rate")
+            .parse::<u32>()
+            .expect("sample rate parse");
+        let channels = lines
+            .next()
+            .expect("channels")
+            .parse::<u32>()
+            .expect("channels parse");
+        (codec, sample_rate, channels)
     }
 
     #[test]
@@ -2523,6 +2756,113 @@ mod tests {
         let err = render_outputs_for_sink(&spec, "s3://in/sample.mp4", 9, payload.as_slice(), None)
             .expect_err("expected extract_frames chaining to fail");
         assert!(err.to_string().contains("standalone transform"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audio_resample_rewrites_rate_and_channels() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("audio-resample");
+        let input_path = root.join("input.wav");
+        let output_path = root.join("output.wav");
+        write_ffmpeg_test_audio(&input_path, 48_000, 2);
+        let payload = std::fs::read(&input_path).expect("read input audio");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::AudioResample {
+                rate: 16_000,
+                channels: 1,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.wav", payload.as_slice())
+                .expect("transform");
+        std::fs::write(&output_path, transformed).expect("write output audio");
+        let (codec, sample_rate, channels) = ffprobe_audio_details(&output_path);
+        assert_eq!(codec, "pcm_s16le");
+        assert_eq!(sample_rate, 16_000);
+        assert_eq!(channels, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audio_normalize_preserves_audio_container() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("audio-normalize");
+        let input_path = root.join("input.wav");
+        let output_path = root.join("output.wav");
+        write_ffmpeg_test_audio(&input_path, 44_100, 2);
+        let payload = std::fs::read(&input_path).expect("read input audio");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::AudioNormalize {
+                loudness_lufs: -18.0,
+            }],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.wav", payload.as_slice())
+                .expect("transform");
+        assert_ne!(transformed, payload);
+        std::fs::write(&output_path, transformed).expect("write output audio");
+        let (codec, sample_rate, channels) = ffprobe_audio_details(&output_path);
+        assert_eq!(codec, "pcm_s16le");
+        assert_eq!(sample_rate, 44_100);
+        assert_eq!(channels, 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audio_resample_then_normalize_rewrites_rate_and_channels() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("audio-resample-normalize");
+        let input_path = root.join("input.wav");
+        let output_path = root.join("output.wav");
+        write_ffmpeg_test_audio(&input_path, 48_000, 2);
+        let payload = std::fs::read(&input_path).expect("read input audio");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::AudioResample {
+                    rate: 22_050,
+                    channels: 1,
+                },
+                TransformSpec::AudioNormalize {
+                    loudness_lufs: -16.0,
+                },
+            ],
+        };
+
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.wav", payload.as_slice())
+                .expect("transform");
+        std::fs::write(&output_path, transformed).expect("write output audio");
+        let (codec, sample_rate, channels) = ffprobe_audio_details(&output_path);
+        assert_eq!(codec, "pcm_s16le");
+        assert_eq!(sample_rate, 22_050);
+        assert_eq!(channels, 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
