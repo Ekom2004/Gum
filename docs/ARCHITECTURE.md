@@ -151,7 +151,9 @@ payload bytes
     → output bytes → S3 sink
 ```
 
-For `video.extract_frames`, ffmpeg writes a raw `image2pipe` JPEG or PNG stream to stdout. The agent then parses JPEG/PNG byte boundaries to split the stream into individual frame payloads, each uploaded separately to the destination bucket.
+For `video.extract_frames`, ffmpeg writes a raw `image2pipe` JPEG or PNG stream to stdout. The agent then parses JPEG/PNG byte boundaries to split the stream into individual frame payloads. Those frame payloads can either be uploaded directly or passed through a follow-on `image.*` chain before upload.
+
+For `video.extract_audio`, ffmpeg emits a standalone audio payload. That extracted payload can either be uploaded directly or passed through a follow-on `audio.*` chain before upload.
 
 **The clean compute model:**
 1. `mx8d-agent` stays long-lived (one process per Spot instance)

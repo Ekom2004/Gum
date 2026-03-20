@@ -46,6 +46,15 @@ mx8.run(
 )
 
 mx8.run(
+    "s3://bucket/videos/",
+    transform=[
+        video.extract_frames(fps=1, format="jpg"),
+        image.resize(width=512, height=512),
+    ],
+    sink="s3://bucket/output/",
+)
+
+mx8.run(
     "s3://bucket/audio/",
     transform=audio.resample(rate=16000),
     sink="s3://bucket/output/",

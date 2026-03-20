@@ -114,9 +114,13 @@ class LocalWorkerBackend:
         raw = os.getenv("MX8_AGENT_CMD", "").strip()
         if raw:
             return shlex.split(raw)
+        features = _cargo_features(record)
+        binary = _local_binary_command(self._repo_root, "mx8d-agent", features)
+        if binary is not None:
+            return binary
         command = ["cargo", "run", "-p", "mx8d-agent"]
-        if _needs_s3(record):
-            command.extend(["--features", "s3"])
+        if features:
+            command.extend(["--features", ",".join(features)])
         command.append("--")
         return command
 
@@ -316,9 +320,13 @@ class CoordinatorLauncher:
         raw = os.getenv("MX8_COORDINATOR_CMD", "").strip()
         if raw:
             return shlex.split(raw)
+        features = _cargo_features(record)
+        binary = _local_binary_command(self._repo_root, "mx8-coordinator", features)
+        if binary is not None:
+            return binary
         command = ["cargo", "run", "-p", "mx8-coordinator"]
-        if _needs_s3(record):
-            command.extend(["--features", "s3"])
+        if features:
+            command.extend(["--features", ",".join(features)])
         command.append("--")
         return command
 
@@ -416,8 +424,21 @@ def _run_command(
         raise RuntimeError(f"{label} failed with status {completed.returncode}; see {log_path}")
 
 
-def _needs_s3(record: JobRecord) -> bool:
-    return record.source.startswith("s3://") or record.sink.startswith("s3://")
+def _cargo_features(record: JobRecord) -> list[str]:
+    features: list[str] = []
+    for scheme in ("s3", "gcs", "azure"):
+        if _record_uses_scheme(record, scheme):
+            features.append(scheme)
+    return features
+
+
+def _record_uses_scheme(record: JobRecord, scheme: str) -> bool:
+    prefixes = {
+        "s3": ("s3://",),
+        "gcs": ("gs://",),
+        "azure": ("az://", "azure://"),
+    }[scheme]
+    return record.source.startswith(prefixes) or record.sink.startswith(prefixes)
 
 
 def _default_region(source: str) -> str:
@@ -436,6 +457,15 @@ def _default_instance_type(record: JobRecord) -> str:
     if media_types == {"audio"}:
         return os.getenv("MX8_AUDIO_INSTANCE_TYPE", "c7i.xlarge")
     return os.getenv("MX8_IMAGE_INSTANCE_TYPE", "c7i.xlarge")
+
+
+def _local_binary_command(repo_root: Path, binary_name: str, features: list[str]) -> list[str] | None:
+    if features:
+        return None
+    binary_path = repo_root / "target" / "debug" / binary_name
+    if binary_path.is_file() and os.access(binary_path, os.X_OK):
+        return [str(binary_path)]
+    return None
 
 
 def _rust_transform_json(transform: TransformSpec) -> dict[str, object]:

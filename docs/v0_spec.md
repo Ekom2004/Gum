@@ -65,12 +65,12 @@ Resize video frames to target resolution. Maintains aspect ratio by default (let
 ```python
 video.extract_frames(fps=1, format="jpg" | "png")
 ```
-Extract one frame per N seconds. Outputs individual image files. Each frame named `{source}_{timestamp_ms}.{format}`.
+Extract one frame per N seconds. Outputs individual image files and can be followed by `image.*` transforms in the same chain.
 
 ```python
 video.extract_audio(format="mp3" | "wav" | "flac", bitrate="128k")
 ```
-Strip the audio track from a video file. Outputs a standalone audio file.
+Strip the audio track from a video file. Outputs a standalone audio file and can be followed by `audio.*` transforms in the same chain.
 
 ---
 
@@ -123,8 +123,37 @@ mx8.run(
 ```
 
 Constraints:
-- All transforms in a chain must operate on the same media type (video → video → video).
-- Cross-type pipelines (e.g., video → audio) are not supported in v0. Use separate `mx8.run()` calls.
+- Same-type pipelines are supported (`video -> video`, `image -> image`, `audio -> audio`).
+- Two cross-type chains are also supported:
+  - `video.extract_frames -> image.*`
+  - `video.extract_audio -> audio.*`
+- `video.extract_frames` must be the first transform in the chain.
+- `video.extract_audio` must be the first transform in the chain.
+- Other cross-type pipelines are not supported in v0.
+
+Examples:
+
+```python
+mx8.run(
+    "s3://bucket/videos/",
+    transform=[
+        video.extract_frames(fps=1, format="jpg"),
+        image.resize(width=512, height=512),
+        image.convert(format="webp"),
+    ],
+    sink="s3://bucket/output/",
+)
+
+mx8.run(
+    "s3://bucket/videos/",
+    transform=[
+        video.extract_audio(format="wav"),
+        audio.resample(rate=16000, channels=1),
+        audio.normalize(loudness=-14),
+    ],
+    sink="s3://bucket/output/",
+)
+```
 
 ---
 

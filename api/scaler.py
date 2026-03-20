@@ -103,6 +103,9 @@ class JobScaler:
                 continue
             if record.status not in ACTIVE_JOB_STATUSES:
                 continue
+            record = self._ensure_launch(record, api_base_url)
+            if record is None:
+                continue
             plan = self._plan(record)
             if (
                 record.desired_workers != plan.worker_count
@@ -126,6 +129,27 @@ class JobScaler:
                 plan.region,
                 plan.instance_type,
             )
+
+    def _ensure_launch(self, record: JobRecord, api_base_url: str) -> JobRecord | None:
+        if record.status == JobStatus.PENDING:
+            queued = self._store.update_job_status(record.id, JobStatus.QUEUED)
+            if queued is None:
+                return None
+            record = queued
+        try:
+            self._launcher.launch(record, api_base_url)
+        except Exception:
+            self._store.update_job_progress(
+                JobProgressUpdate(
+                    job_id=record.id,
+                    status=JobStatus.FAILED,
+                    current_workers=0,
+                    desired_workers=0,
+                )
+            )
+            self._launcher.terminate_job(record.id)
+            return None
+        return record
 
     def _plan(self, record: JobRecord) -> FleetPlan:
         media_family = self._media_family(record)

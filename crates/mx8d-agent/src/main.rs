@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::Cursor;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,11 +44,22 @@ use webp_rust::{encode_lossless as encode_lossless_webp, encode_lossy as encode_
 
 #[cfg(feature = "s3")]
 use aws_sdk_s3::primitives::ByteStream;
+#[cfg(feature = "azure")]
+use azure_storage_blobs::prelude::ClientBuilder as AzureClientBuilder;
+#[cfg(feature = "gcs")]
+use google_cloud_storage::client::Client as GcsClient;
+#[cfg(feature = "gcs")]
+use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
 
 const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+static SEEKABLE_INPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "s3")]
 type S3Client = aws_sdk_s3::Client;
+#[cfg(feature = "gcs")]
+type GcsStorageClient = GcsClient;
+#[cfg(feature = "azure")]
+type AzureStorageClientBuilder = AzureClientBuilder;
 
 #[derive(Debug)]
 struct TransformProcessLimiter {
@@ -294,7 +306,6 @@ impl Sink for LeaseProgressSink {
     }
 }
 
-#[derive(Debug)]
 struct JobSpecSink {
     progress: Arc<LeaseProgress>,
     sleep: Duration,
@@ -304,6 +315,10 @@ struct JobSpecSink {
     transform_slots: Arc<TransformProcessLimiter>,
     #[cfg(feature = "s3")]
     s3_client: Arc<S3Client>,
+    #[cfg(feature = "gcs")]
+    gcs_client: Arc<GcsStorageClient>,
+    #[cfg(feature = "azure")]
+    azure_client_builder: Arc<AzureStorageClientBuilder>,
 }
 
 #[derive(Debug)]
@@ -386,37 +401,100 @@ impl JobSpecSink {
             return Ok(());
         }
 
-        #[cfg(feature = "s3")]
-        {
-            let (bucket, key) = parse_s3_uri(output_uri)?;
-            let body = ByteStream::from(payload.to_vec());
-            let client = self.s3_client.clone();
-            tokio::runtime::Handle::current().block_on(async move {
-                client
-                    .put_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .body(body)
-                    .send()
-                    .await
-                    .map_err(|err| anyhow::anyhow!("s3 put_object failed: {err}"))?;
-                Ok(())
-            })
+        if output_uri.starts_with("s3://") {
+            #[cfg(feature = "s3")]
+            {
+                let (bucket, key) = parse_s3_uri(output_uri)?;
+                let body = ByteStream::from(payload.to_vec());
+                let client = self.s3_client.clone();
+                return tokio::runtime::Handle::current().block_on(async move {
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .body(body)
+                        .send()
+                        .await
+                        .map_err(|err| anyhow::anyhow!("s3 put_object failed: {err}"))?;
+                    Ok(())
+                });
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = (output_uri, payload);
+                anyhow::bail!("s3 sink requested but mx8d-agent was built without feature 's3'")
+            }
         }
 
-        #[cfg(not(feature = "s3"))]
-        {
-            let _ = (output_uri, payload);
-            anyhow::bail!("s3 sink requested but mx8d-agent was built without feature 's3'")
+        if output_uri.starts_with("gs://") {
+            #[cfg(feature = "gcs")]
+            {
+                let (bucket, key) = parse_gcs_uri(output_uri)?;
+                let client = self.gcs_client.clone();
+                let upload_type = UploadType::Simple(Media::new(key.clone()));
+                let request = UploadObjectRequest {
+                    bucket,
+                    ..Default::default()
+                };
+                return tokio::runtime::Handle::current().block_on(async move {
+                    client
+                        .upload_object(&request, payload.to_vec(), &upload_type)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("gcs upload_object failed: {err:?}"))?;
+                    Ok(())
+                });
+            }
+
+            #[cfg(not(feature = "gcs"))]
+            {
+                let _ = (output_uri, payload);
+                anyhow::bail!("gs sink requested but mx8d-agent was built without feature 'gcs'")
+            }
         }
+
+        if output_uri.starts_with("az://") || output_uri.starts_with("azure://") {
+            #[cfg(feature = "azure")]
+            {
+                let (container, blob) = parse_azure_uri(output_uri)?;
+                let builder = self.azure_client_builder.clone();
+                return tokio::runtime::Handle::current().block_on(async move {
+                    builder
+                        .as_ref()
+                        .clone()
+                        .blob_client(container, blob)
+                        .put_block_blob(payload.to_vec())
+                        .await
+                        .map_err(|err| anyhow::anyhow!("azure put_block_blob failed: {err:?}"))?;
+                    Ok(())
+                });
+            }
+
+            #[cfg(not(feature = "azure"))]
+            {
+                let _ = (output_uri, payload);
+                anyhow::bail!(
+                    "azure sink requested but mx8d-agent was built without feature 'azure'"
+                )
+            }
+        }
+
+        anyhow::bail!("unsupported output uri scheme: {output_uri}")
     }
 }
 
 fn validate_sink_uri(sink_uri: &str) -> Result<()> {
-    if sink_uri.starts_with("s3://") || sink_uri.starts_with("file://") {
+    if sink_uri.starts_with("s3://")
+        || sink_uri.starts_with("gs://")
+        || sink_uri.starts_with("az://")
+        || sink_uri.starts_with("azure://")
+        || sink_uri.starts_with("file://")
+    {
         return Ok(());
     }
-    anyhow::bail!("unsupported sink_uri scheme (expected s3:// or file://): {sink_uri}");
+    anyhow::bail!(
+        "unsupported sink_uri scheme (expected s3://, gs://, az://, azure://, or file://): {sink_uri}"
+    );
 }
 
 #[cfg(feature = "s3")]
@@ -443,6 +521,35 @@ fn parse_file_uri(uri: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(raw))
 }
 
+#[cfg(feature = "gcs")]
+fn parse_gcs_uri(uri: &str) -> Result<(String, String)> {
+    let raw = uri
+        .strip_prefix("gs://")
+        .ok_or_else(|| anyhow::anyhow!("expected gs:// uri, got {uri}"))?;
+    let (bucket, key) = raw
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("gs uri missing object key: {uri}"))?;
+    if bucket.trim().is_empty() || key.trim().is_empty() {
+        anyhow::bail!("invalid gs uri: {uri}");
+    }
+    Ok((bucket.trim().to_string(), key.trim().to_string()))
+}
+
+#[cfg(feature = "azure")]
+fn parse_azure_uri(uri: &str) -> Result<(&str, &str)> {
+    let raw = uri
+        .strip_prefix("az://")
+        .or_else(|| uri.strip_prefix("azure://"))
+        .ok_or_else(|| anyhow::anyhow!("expected az:// or azure:// uri, got {uri}"))?;
+    let (container, blob) = raw
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("azure uri missing blob path: {uri}"))?;
+    if container.trim().is_empty() || blob.trim().is_empty() {
+        anyhow::bail!("invalid azure uri: {uri}");
+    }
+    Ok((container.trim(), blob.trim()))
+}
+
 fn write_file_output(path: &Path, payload: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
@@ -457,9 +564,12 @@ fn write_file_output(path: &Path, payload: &[u8]) -> Result<()> {
 }
 
 fn source_matches_job(source_uri: &str, record: &ManifestRecord) -> bool {
-    if let Some(source_path) = local_source_path(source_uri) {
+    let normalized_source_uri = normalize_storage_scheme(source_uri);
+    let normalized_record_location = normalize_storage_scheme(&record.location);
+
+    if let Some(source_path) = local_source_path(normalized_source_uri.as_str()) {
         if let Some(record_path) = local_source_path(&record.location) {
-            let source_is_dir = source_uri.ends_with('/');
+            let source_is_dir = normalized_source_uri.ends_with('/');
             return if source_is_dir {
                 record_path.starts_with(&source_path)
             } else {
@@ -468,15 +578,23 @@ fn source_matches_job(source_uri: &str, record: &ManifestRecord) -> bool {
         }
     }
 
-    let normalized = source_uri.trim_end_matches('/');
+    let normalized = normalized_source_uri.trim_end_matches('/');
     if normalized.is_empty() {
         return true;
     }
-    if source_uri.ends_with('/') {
-        record.location.starts_with(source_uri) || record.location == normalized
+    if normalized_source_uri.ends_with('/') {
+        normalized_record_location.starts_with(normalized_source_uri.as_str())
+            || normalized_record_location == normalized
     } else {
-        record.location == normalized
+        normalized_record_location == normalized
     }
+}
+
+fn normalize_storage_scheme(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("azure://") {
+        return format!("az://{rest}");
+    }
+    uri.to_string()
 }
 
 fn local_source_path(location: &str) -> Option<PathBuf> {
@@ -587,6 +705,15 @@ fn transform_payload_for_sink_with_slots(
         return Ok(payload.to_vec());
     }
 
+    if video_extract_audio_spec(&job_spec.transforms).is_some() {
+        return transform_video_extract_audio_chain_payload_for_sink(
+            job_spec,
+            source_location,
+            payload,
+            transform_slots,
+        );
+    }
+
     if job_spec.transforms.iter().all(is_image_transform) {
         return transform_image_payload_for_sink(job_spec, source_location, payload);
     }
@@ -624,14 +751,7 @@ fn render_outputs_for_sink(
     job_spec.validate()?;
 
     if video_extract_frames_spec(&job_spec.transforms).is_some() {
-        if !job_spec
-            .transforms
-            .iter()
-            .all(|transform| matches!(transform, TransformSpec::VideoExtractFrames { .. }))
-        {
-            anyhow::bail!("video.extract_frames must run as a standalone transform");
-        }
-        return extract_frame_outputs_for_sink(
+        return render_video_extract_frame_chain_outputs_for_sink(
             job_spec,
             source_location,
             sample_id,
@@ -731,19 +851,16 @@ fn transform_video_payload_for_sink(
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
 ) -> Result<Vec<u8>> {
     if video_extract_audio_spec(&job_spec.transforms).is_some() {
-        if job_spec.transforms.len() != 1 {
-            anyhow::bail!("video.extract_audio must run as a standalone transform");
-        }
-        return extract_audio_payload_for_sink(job_spec, source_location, payload, transform_slots);
+        return transform_video_extract_audio_chain_payload_for_sink(
+            job_spec,
+            source_location,
+            payload,
+            transform_slots,
+        );
     }
 
     let mut command = Command::new("ffmpeg");
-    command
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg("pipe:0");
+    command.arg("-hide_banner").arg("-loglevel").arg("error");
 
     if let Some(filter_chain) = video_filter_chain(&job_spec.transforms) {
         command.arg("-vf").arg(filter_chain);
@@ -771,6 +888,7 @@ fn transform_video_payload_for_sink(
         source_location,
         "video transform",
         transform_slots,
+        FfmpegInputMode::SeekableFile,
     )
 }
 
@@ -787,8 +905,6 @@ fn transform_audio_payload_for_sink(
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
-        .arg("-i")
-        .arg("pipe:0")
         .arg("-vn")
         .arg("-sn")
         .arg("-dn");
@@ -819,7 +935,31 @@ fn transform_audio_payload_for_sink(
         source_location,
         "audio transform",
         transform_slots,
+        FfmpegInputMode::PipeStdin,
     )
+}
+
+fn transform_video_extract_audio_chain_payload_for_sink(
+    job_spec: &CoreJobSpec,
+    source_location: &str,
+    payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<Vec<u8>> {
+    let (extract_index, extracted_format) = video_extract_audio_stage(&job_spec.transforms)?;
+    if extract_index != 0 {
+        anyhow::bail!("video.extract_audio must be the first transform in the chain");
+    }
+
+    let extracted =
+        extract_audio_payload_for_sink(job_spec, source_location, payload, transform_slots)?;
+    let audio_tail = &job_spec.transforms[extract_index + 1..];
+    if audio_tail.is_empty() {
+        return Ok(extracted);
+    }
+
+    let chained_spec = job_spec_with_transforms(job_spec, audio_tail.to_vec());
+    let chained_source = synthesized_media_location(source_location, extracted_format);
+    transform_audio_payload_for_sink(&chained_spec, &chained_source, &extracted, transform_slots)
 }
 
 fn extract_audio_payload_for_sink(
@@ -840,8 +980,6 @@ fn extract_audio_payload_for_sink(
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
-        .arg("-i")
-        .arg("pipe:0")
         .arg("-vn");
 
     let codec = ffmpeg_audio_codec(format)?;
@@ -860,6 +998,7 @@ fn extract_audio_payload_for_sink(
         source_location,
         "audio extract",
         transform_slots,
+        FfmpegInputMode::SeekableFile,
     )
 }
 
@@ -874,15 +1013,15 @@ fn extract_frame_outputs_for_sink(
         Some(TransformSpec::VideoExtractFrames { fps, format }) => (*fps, format.as_str()),
         _ => anyhow::bail!("missing video.extract_frames transform"),
     };
-    let frame_extension = output_extension(&job_spec.transforms, source_location);
+    let frame_extension = normalize_frame_format(format)
+        .ok_or_else(|| anyhow::anyhow!("unsupported frame format: {format}"))?
+        .to_string();
 
     let mut command = Command::new("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
-        .arg("-i")
-        .arg("pipe:0")
         .arg("-vf")
         .arg(format!("fps={fps}"));
     if normalize_frame_format(format) == Some("jpg") {
@@ -901,6 +1040,7 @@ fn extract_frame_outputs_for_sink(
         source_location,
         "frame extract",
         transform_slots,
+        FfmpegInputMode::SeekableFile,
     )?;
     let frames = split_frame_stream(&output, &frame_extension)?;
     if frames.is_empty() {
@@ -914,6 +1054,48 @@ fn extract_frame_outputs_for_sink(
             let output_uri = plan_frame_output_uri(job_spec, source_location, sample_id, index)?;
             Ok(SinkArtifact {
                 output_uri,
+                payload,
+            })
+        })
+        .collect()
+}
+
+fn render_video_extract_frame_chain_outputs_for_sink(
+    job_spec: &CoreJobSpec,
+    source_location: &str,
+    sample_id: u64,
+    payload: &[u8],
+    transform_slots: Option<&Arc<TransformProcessLimiter>>,
+) -> Result<Vec<SinkArtifact>> {
+    let (extract_index, extracted_format) = video_extract_frames_stage(&job_spec.transforms)?;
+    if extract_index != 0 {
+        anyhow::bail!("video.extract_frames must be the first transform in the chain");
+    }
+
+    let extracted_frames = extract_frame_outputs_for_sink(
+        job_spec,
+        source_location,
+        sample_id,
+        payload,
+        transform_slots,
+    )?;
+    let image_tail = &job_spec.transforms[extract_index + 1..];
+    if image_tail.is_empty() {
+        return Ok(extracted_frames);
+    }
+
+    let chained_spec = job_spec_with_transforms(job_spec, image_tail.to_vec());
+    extracted_frames
+        .into_iter()
+        .map(|artifact| {
+            let chained_source = synthesized_media_location(&artifact.output_uri, extracted_format);
+            let payload = transform_image_payload_for_sink(
+                &chained_spec,
+                &chained_source,
+                &artifact.payload,
+            )?;
+            Ok(SinkArtifact {
+                output_uri: artifact.output_uri,
                 payload,
             })
         })
@@ -985,17 +1167,23 @@ fn audio_filter_chain(transforms: &[TransformSpec]) -> Option<String> {
 }
 
 fn audio_output_rate(transforms: &[TransformSpec]) -> Option<u32> {
-    transforms.iter().rev().find_map(|transform| match transform {
-        TransformSpec::AudioResample { rate, .. } => Some(*rate),
-        _ => None,
-    })
+    transforms
+        .iter()
+        .rev()
+        .find_map(|transform| match transform {
+            TransformSpec::AudioResample { rate, .. } => Some(*rate),
+            _ => None,
+        })
 }
 
 fn audio_output_channels(transforms: &[TransformSpec]) -> Option<u32> {
-    transforms.iter().rev().find_map(|transform| match transform {
-        TransformSpec::AudioResample { channels, .. } => Some(*channels),
-        _ => None,
-    })
+    transforms
+        .iter()
+        .rev()
+        .find_map(|transform| match transform {
+            TransformSpec::AudioResample { channels, .. } => Some(*channels),
+            _ => None,
+        })
 }
 
 fn video_extract_audio_spec(transforms: &[TransformSpec]) -> Option<&TransformSpec> {
@@ -1008,6 +1196,40 @@ fn video_extract_frames_spec(transforms: &[TransformSpec]) -> Option<&TransformS
     transforms
         .iter()
         .find(|transform| matches!(transform, TransformSpec::VideoExtractFrames { .. }))
+}
+
+fn video_extract_audio_stage(transforms: &[TransformSpec]) -> Result<(usize, &str)> {
+    let Some(index) = transforms
+        .iter()
+        .position(|transform| matches!(transform, TransformSpec::VideoExtractAudio { .. }))
+    else {
+        anyhow::bail!("missing video.extract_audio transform");
+    };
+
+    let TransformSpec::VideoExtractAudio { format, .. } = &transforms[index] else {
+        unreachable!("position matched video.extract_audio");
+    };
+    if !transforms[index + 1..].iter().all(is_audio_transform) {
+        anyhow::bail!("video.extract_audio can only be followed by audio transforms");
+    }
+    Ok((index, format.as_str()))
+}
+
+fn video_extract_frames_stage(transforms: &[TransformSpec]) -> Result<(usize, &str)> {
+    let Some(index) = transforms
+        .iter()
+        .position(|transform| matches!(transform, TransformSpec::VideoExtractFrames { .. }))
+    else {
+        anyhow::bail!("missing video.extract_frames transform");
+    };
+
+    let TransformSpec::VideoExtractFrames { format, .. } = &transforms[index] else {
+        unreachable!("position matched video.extract_frames");
+    };
+    if !transforms[index + 1..].iter().all(is_image_transform) {
+        anyhow::bail!("video.extract_frames can only be followed by image transforms");
+    }
+    Ok((index, format.as_str()))
 }
 
 fn ffmpeg_video_codec(codec: &str) -> Result<&'static str> {
@@ -1056,7 +1278,9 @@ fn probe_audio_stream_metadata(input: &[u8], source_location: &str) -> Result<Au
         .spawn()
         .map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => {
-                anyhow::anyhow!("ffprobe is required for audio transforms but was not found in PATH")
+                anyhow::anyhow!(
+                    "ffprobe is required for audio transforms but was not found in PATH"
+                )
             }
             _ => anyhow::anyhow!("ffprobe invocation failed for {source_location}: {err}"),
         })?;
@@ -1074,8 +1298,9 @@ fn probe_audio_stream_metadata(input: &[u8], source_location: &str) -> Result<Au
     let write_result = writer
         .join()
         .map_err(|_| anyhow::anyhow!("ffprobe stdin writer panicked for {source_location}"))?;
-    write_result
-        .map_err(|err| anyhow::anyhow!("ffprobe stdin write failed for {source_location}: {err}"))?;
+    write_result.map_err(|err| {
+        anyhow::anyhow!("ffprobe stdin write failed for {source_location}: {err}")
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1085,19 +1310,27 @@ fn probe_audio_stream_metadata(input: &[u8], source_location: &str) -> Result<Au
         );
     }
 
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|err| anyhow::anyhow!("ffprobe output was not valid utf8 for {source_location}: {err}"))?;
-    let mut lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty());
+    let stdout = String::from_utf8(output.stdout).map_err(|err| {
+        anyhow::anyhow!("ffprobe output was not valid utf8 for {source_location}: {err}")
+    })?;
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
     let sample_rate = lines
         .next()
         .ok_or_else(|| anyhow::anyhow!("ffprobe sample_rate missing for {source_location}"))?
         .parse::<u32>()
-        .map_err(|err| anyhow::anyhow!("ffprobe sample_rate parse failed for {source_location}: {err}"))?;
+        .map_err(|err| {
+            anyhow::anyhow!("ffprobe sample_rate parse failed for {source_location}: {err}")
+        })?;
     let channels = lines
         .next()
         .ok_or_else(|| anyhow::anyhow!("ffprobe channels missing for {source_location}"))?
         .parse::<u32>()
-        .map_err(|err| anyhow::anyhow!("ffprobe channels parse failed for {source_location}: {err}"))?;
+        .map_err(|err| {
+            anyhow::anyhow!("ffprobe channels parse failed for {source_location}: {err}")
+        })?;
 
     Ok(AudioStreamMetadata {
         sample_rate,
@@ -1123,19 +1356,93 @@ fn frame_pipe_codec(format: &str) -> Result<&'static str> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FfmpegInputMode {
+    PipeStdin,
+    SeekableFile,
+}
+
+#[derive(Debug)]
+struct SeekableInputFile {
+    path: PathBuf,
+}
+
+impl SeekableInputFile {
+    fn create(source_location: &str, input: &[u8]) -> Result<Self> {
+        let dir = preferred_seekable_input_dir();
+        let ext = source_extension(source_location).unwrap_or_else(|| "bin".to_string());
+        for _ in 0..32 {
+            let suffix = SEEKABLE_INPUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                "mx8-media-{}-{}-{suffix}.{ext}",
+                std::process::id(),
+                mx8_observe::time::unix_time_ms()
+            );
+            let path = dir.join(name);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(input).map_err(|err| {
+                        anyhow::anyhow!(
+                            "failed to stage seekable input for {source_location}: {err}"
+                        )
+                    })?;
+                    drop(file);
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to create seekable input staging file for {source_location}: {err}"
+                    ));
+                }
+            }
+        }
+
+        anyhow::bail!("failed to allocate unique seekable input staging path for {source_location}")
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+}
+
+impl Drop for SeekableInputFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn preferred_seekable_input_dir() -> PathBuf {
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir() {
+        shm.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 fn run_ffmpeg_stdout(
     mut command: Command,
     input: &[u8],
     source_location: &str,
     op_name: &str,
     transform_slots: Option<&Arc<TransformProcessLimiter>>,
+    input_mode: FfmpegInputMode,
 ) -> Result<Vec<u8>> {
     let _permit = transform_slots.map(|slots| slots.acquire()).transpose()?;
 
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let staged_input = match input_mode {
+        FfmpegInputMode::PipeStdin => {
+            command.arg("-i").arg("pipe:0").stdin(Stdio::piped());
+            None
+        }
+        FfmpegInputMode::SeekableFile => {
+            let staged = SeekableInputFile::create(source_location, input)?;
+            command.arg("-i").arg(staged.path()).stdin(Stdio::null());
+            Some(staged)
+        }
+    };
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => {
             anyhow::anyhow!("ffmpeg is required for {op_name} but was not found in PATH")
@@ -1143,21 +1450,29 @@ fn run_ffmpeg_stdout(
         _ => anyhow::anyhow!("ffmpeg invocation failed for {source_location}: {err}"),
     })?;
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open ffmpeg stdin for {source_location}"))?;
-    let input_owned = input.to_vec();
-    let writer = std::thread::spawn(move || stdin.write_all(&input_owned));
+    let writer = match input_mode {
+        FfmpegInputMode::PipeStdin => {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                anyhow::anyhow!("failed to open ffmpeg stdin for {source_location}")
+            })?;
+            let input_owned = input.to_vec();
+            Some(std::thread::spawn(move || stdin.write_all(&input_owned)))
+        }
+        FfmpegInputMode::SeekableFile => None,
+    };
 
     let output = child
         .wait_with_output()
         .map_err(|err| anyhow::anyhow!("ffmpeg wait failed for {source_location}: {err}"))?;
-    let write_result = writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("ffmpeg stdin writer panicked for {source_location}"))?;
-    write_result
-        .map_err(|err| anyhow::anyhow!("ffmpeg stdin write failed for {source_location}: {err}"))?;
+    if let Some(writer) = writer {
+        let write_result = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("ffmpeg stdin writer panicked for {source_location}"))?;
+        write_result.map_err(|err| {
+            anyhow::anyhow!("ffmpeg stdin write failed for {source_location}: {err}")
+        })?;
+    }
+    drop(staged_input);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1345,6 +1660,29 @@ fn normalized_image_extension(ext: &str) -> String {
 }
 
 fn output_extension(transforms: &[TransformSpec], source_location: &str) -> String {
+    if let Ok((_, format)) = video_extract_frames_stage(transforms) {
+        if let Some(converted) = transforms
+            .iter()
+            .rev()
+            .find_map(|transform| match transform {
+                TransformSpec::ImageConvert { format, .. } => {
+                    match normalize_image_format(format) {
+                        Some(normalized) => Some(normalized.to_string()),
+                        None => Some(normalized_image_extension(format)),
+                    }
+                }
+                _ => None,
+            })
+        {
+            return converted;
+        }
+        return format.to_string();
+    }
+
+    if let Ok((_, format)) = video_extract_audio_stage(transforms) {
+        return format.to_string();
+    }
+
     match transforms.last() {
         Some(TransformSpec::VideoExtractFrames { format, .. }) => format.clone(),
         Some(TransformSpec::VideoExtractAudio { format, .. }) => format.clone(),
@@ -1356,6 +1694,22 @@ fn output_extension(transforms: &[TransformSpec], source_location: &str) -> Stri
             "mp4".to_string()
         }
         _ => source_extension(source_location).unwrap_or_else(|| "bin".to_string()),
+    }
+}
+
+fn synthesized_media_location(source_location: &str, extension: &str) -> String {
+    let base_name = source_basename_without_extension(source_location)
+        .unwrap_or_else(|| "artifact".to_string());
+    format!("{base_name}.{extension}")
+}
+
+fn job_spec_with_transforms(job_spec: &CoreJobSpec, transforms: Vec<TransformSpec>) -> CoreJobSpec {
+    CoreJobSpec {
+        job_id: job_spec.job_id.clone(),
+        source_uri: job_spec.source_uri.clone(),
+        sink_uri: job_spec.sink_uri.clone(),
+        aws_region: job_spec.aws_region.clone(),
+        transforms,
     }
 }
 
@@ -1626,6 +1980,10 @@ async fn run_lease(
     let run_res = if let Some(job_spec) = job_spec {
         #[cfg(feature = "s3")]
         let s3_client = Arc::new(mx8_runtime::s3::client_from_env().await?);
+        #[cfg(feature = "gcs")]
+        let gcs_client = Arc::new(mx8_runtime::gcs::client_from_env().await?);
+        #[cfg(feature = "azure")]
+        let azure_client_builder = Arc::new(mx8_runtime::azure::client_builder_from_env()?);
         let sink = Arc::new(JobSpecSink {
             progress: progress.clone(),
             sleep: Duration::from_millis(args.sink_sleep_ms),
@@ -1635,6 +1993,10 @@ async fn run_lease(
             transform_slots,
             #[cfg(feature = "s3")]
             s3_client,
+            #[cfg(feature = "gcs")]
+            gcs_client,
+            #[cfg(feature = "azure")]
+            azure_client_builder,
         });
         pipeline.run_manifest_records(sink, records).await
     } else {
@@ -2707,13 +3069,14 @@ mod tests {
     }
 
     #[test]
-    fn video_extract_audio_rejects_chaining() {
+    fn video_extract_audio_then_audio_resample_rewrites_rate_and_channels() {
         if !video_tools_available() {
             return;
         }
 
         let root = temp_test_dir("video-extract-audio-chain");
         let input_path = root.join("input.mp4");
+        let output_path = root.join("output.wav");
         write_ffmpeg_test_video_with_audio(&input_path, 64, 64);
         let payload = std::fs::read(&input_path).expect("read input video");
         let spec = CoreJobSpec {
@@ -2722,21 +3085,25 @@ mod tests {
             sink_uri: "s3://out/".to_string(),
             aws_region: "us-east-1".to_string(),
             transforms: vec![
-                TransformSpec::VideoResize {
-                    width: 32,
-                    height: 32,
-                    maintain_aspect: true,
-                },
                 TransformSpec::VideoExtractAudio {
                     format: "wav".to_string(),
                     bitrate: "128k".to_string(),
                 },
+                TransformSpec::AudioResample {
+                    rate: 16_000,
+                    channels: 1,
+                },
             ],
         };
 
-        let err = transform_payload_for_sink(&spec, "s3://in/sample.mp4", payload.as_slice())
-            .expect_err("expected extract_audio chaining to fail");
-        assert!(err.to_string().contains("standalone transform"));
+        let transformed =
+            transform_payload_for_sink(&spec, "s3://in/sample.mp4", payload.as_slice())
+                .expect("transform");
+        std::fs::write(&output_path, transformed).expect("write output audio");
+        let (codec, sample_rate, channels) = ffprobe_audio_details(&output_path);
+        assert_eq!(codec, "pcm_s16le");
+        assert_eq!(sample_rate, 16_000);
+        assert_eq!(channels, 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2778,12 +3145,127 @@ mod tests {
     }
 
     #[test]
-    fn video_extract_frames_rejects_chaining() {
+    fn video_extract_frames_handles_long_mp4_inputs() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-extract-frames-long");
+        let input_path = root.join("input.mp4");
+        write_ffmpeg_test_video_custom(&input_path, 1280, 720, 30, "30");
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![TransformSpec::VideoExtractFrames {
+                fps: 1.0,
+                format: "jpg".to_string(),
+            }],
+        };
+
+        let artifacts =
+            render_outputs_for_sink(&spec, "s3://in/sample.mp4", 11, payload.as_slice(), None)
+                .expect("render outputs");
+        assert_eq!(artifacts.len(), 30);
+        assert_eq!(artifacts[0].output_uri, "s3://out/sample_frames_000000.jpg");
+        assert!(artifacts
+            .iter()
+            .all(|artifact| artifact.output_uri.ends_with(".jpg")));
+        assert!(artifacts
+            .iter()
+            .all(|artifact| artifact.payload.starts_with(&[0xFF, 0xD8, 0xFF])));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_extract_frames_then_image_resize_emits_resized_outputs() {
         if !video_tools_available() {
             return;
         }
 
         let root = temp_test_dir("video-extract-frames-chain");
+        let input_path = root.join("input.mp4");
+        write_ffmpeg_test_video_custom(&input_path, 64, 64, 2, "2");
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::VideoExtractFrames {
+                    fps: 1.0,
+                    format: "jpg".to_string(),
+                },
+                TransformSpec::ImageResize {
+                    width: 16,
+                    height: 16,
+                    maintain_aspect: false,
+                },
+            ],
+        };
+
+        let artifacts =
+            render_outputs_for_sink(&spec, "s3://in/sample.mp4", 9, payload.as_slice(), None)
+                .expect("render outputs");
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].output_uri, "s3://out/sample_frames_000000.jpg");
+        for artifact in artifacts {
+            assert!(artifact.payload.starts_with(&[0xFF, 0xD8, 0xFF]));
+            let decoded = image::load_from_memory(&artifact.payload).expect("decode resized frame");
+            assert_eq!(decoded.dimensions(), (16, 16));
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_extract_audio_rejects_non_audio_followups() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-extract-audio-invalid-chain");
+        let input_path = root.join("input.mp4");
+        write_ffmpeg_test_video_with_audio(&input_path, 64, 64);
+        let payload = std::fs::read(&input_path).expect("read input video");
+        let spec = CoreJobSpec {
+            job_id: "job".to_string(),
+            source_uri: "s3://in/".to_string(),
+            sink_uri: "s3://out/".to_string(),
+            aws_region: "us-east-1".to_string(),
+            transforms: vec![
+                TransformSpec::VideoExtractAudio {
+                    format: "wav".to_string(),
+                    bitrate: "128k".to_string(),
+                },
+                TransformSpec::ImageResize {
+                    width: 16,
+                    height: 16,
+                    maintain_aspect: false,
+                },
+            ],
+        };
+
+        let err = transform_payload_for_sink(&spec, "s3://in/sample.mp4", payload.as_slice())
+            .expect_err("expected invalid extract_audio followup to fail");
+        assert!(err
+            .to_string()
+            .contains("video.extract_audio can only be followed by audio transforms"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn video_extract_frames_rejects_non_image_followups() {
+        if !video_tools_available() {
+            return;
+        }
+
+        let root = temp_test_dir("video-extract-frames-invalid-chain");
         let input_path = root.join("input.mp4");
         write_ffmpeg_test_video(&input_path, 64, 64);
         let payload = std::fs::read(&input_path).expect("read input video");
@@ -2793,21 +3275,21 @@ mod tests {
             sink_uri: "s3://out/".to_string(),
             aws_region: "us-east-1".to_string(),
             transforms: vec![
-                TransformSpec::VideoResize {
-                    width: 32,
-                    height: 32,
-                    maintain_aspect: true,
-                },
                 TransformSpec::VideoExtractFrames {
                     fps: 1.0,
                     format: "jpg".to_string(),
+                },
+                TransformSpec::AudioNormalize {
+                    loudness_lufs: -14.0,
                 },
             ],
         };
 
         let err = render_outputs_for_sink(&spec, "s3://in/sample.mp4", 9, payload.as_slice(), None)
-            .expect_err("expected extract_frames chaining to fail");
-        assert!(err.to_string().contains("standalone transform"));
+            .expect_err("expected invalid extract_frames followup to fail");
+        assert!(err
+            .to_string()
+            .contains("video.extract_frames can only be followed by image transforms"));
 
         let _ = std::fs::remove_dir_all(root);
     }
