@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from . import transforms as transforms
 from .client import MX8Client, default_client
 from .job import Job
 from .transforms import Transform, audio, image, video
@@ -26,4 +27,5 @@ __all__ = [
     "image",
     "run",
     "video",
+    "transforms",
 ]
