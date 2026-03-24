@@ -5,29 +5,39 @@ import subprocess
 import tempfile
 import threading
 from collections import OrderedDict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from email.message import Message
 from pathlib import Path
 from time import monotonic
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 try:
     import modal
 except ImportError:  # pragma: no cover - local unit tests may run without Modal installed
     modal = None
 
-from api.find_contracts import (
-    FindShard,
-    FindShardResult,
-    FindShardStats,
-    MatchSegment,
-    find_shard_from_payload,
-    find_shard_result_to_payload,
-)
-
 _APP_NAME = "mx8-find-worker"
 _MODEL_CACHE_DIR = Path("/models/hf")
 _MODEL_CACHE_VOLUME_NAME = os.getenv("MX8_FIND_MODAL_HF_CACHE_VOLUME", "mx8-find-hf-cache")
+_REMOTE_MEDIA_EXTENSIONS = {
+    ".3gp",
+    ".asf",
+    ".avi",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".mts",
+    ".ts",
+    ".webm",
+    ".wmv",
+}
 
 if modal is not None:
     _model_cache_volume = modal.Volume.from_name(_MODEL_CACHE_VOLUME_NAME, create_if_missing=True)
@@ -46,6 +56,181 @@ else:  # pragma: no cover - local unit tests may run without Modal installed
     _model_cache_volume = None
     app = None
     image = None
+
+
+@dataclass(frozen=True)
+class MatchSegment:
+    sample_id: int
+    start_ms: int
+    end_ms: int
+
+    def validate(self) -> None:
+        if self.sample_id < 0:
+            raise ValueError("sample_id must be >= 0")
+        if self.start_ms < 0:
+            raise ValueError("start_ms must be >= 0")
+        if self.end_ms <= self.start_ms:
+            raise ValueError("end_ms must be > start_ms")
+
+
+@dataclass(frozen=True)
+class FindShard:
+    shard_id: str
+    job_id: str
+    customer_id: str
+    lane: str
+    priority: int
+    attempt: int
+    query_id: str
+    query_text: str
+    source_uri: str
+    asset_id: str
+    decode_hint: str | None
+    sample_id: int
+    scan_start_ms: int
+    scan_end_ms: int
+    overlap_ms: int
+    sample_fps: float
+    model: str
+    created_at_ms: int
+    source_access_url: str | None = None
+
+    def validate(self) -> None:
+        if not self.shard_id.strip():
+            raise ValueError("shard_id must be non-empty")
+        if not self.job_id.strip():
+            raise ValueError("job_id must be non-empty")
+        if not self.customer_id.strip():
+            raise ValueError("customer_id must be non-empty")
+        if not self.lane.strip():
+            raise ValueError("lane must be non-empty")
+        if self.priority < 0:
+            raise ValueError("priority must be >= 0")
+        if self.attempt < 0:
+            raise ValueError("attempt must be >= 0")
+        if not self.query_id.strip():
+            raise ValueError("query_id must be non-empty")
+        if not self.query_text.strip():
+            raise ValueError("query_text must be non-empty")
+        if not self.source_uri.strip():
+            raise ValueError("source_uri must be non-empty")
+        if not self.asset_id.strip():
+            raise ValueError("asset_id must be non-empty")
+        if self.source_access_url is not None and not self.source_access_url.strip():
+            raise ValueError("source_access_url must be non-empty when set")
+        if self.sample_id < 0:
+            raise ValueError("sample_id must be >= 0")
+        if self.scan_start_ms < 0:
+            raise ValueError("scan_start_ms must be >= 0")
+        if self.scan_end_ms <= self.scan_start_ms:
+            raise ValueError("scan_end_ms must be > scan_start_ms")
+        if self.overlap_ms < 0:
+            raise ValueError("overlap_ms must be >= 0")
+        if self.sample_fps <= 0:
+            raise ValueError("sample_fps must be > 0")
+        if not self.model.strip():
+            raise ValueError("model must be non-empty")
+
+
+@dataclass(frozen=True)
+class FindShardStats:
+    sampled_frames: int
+    decode_ms: int
+    inference_ms: int
+    wall_ms: int
+
+    def validate(self) -> None:
+        if self.sampled_frames < 0:
+            raise ValueError("sampled_frames must be >= 0")
+        if self.decode_ms < 0:
+            raise ValueError("decode_ms must be >= 0")
+        if self.inference_ms < 0:
+            raise ValueError("inference_ms must be >= 0")
+        if self.wall_ms < 0:
+            raise ValueError("wall_ms must be >= 0")
+
+
+@dataclass(frozen=True)
+class FindShardResult:
+    shard_id: str
+    job_id: str
+    customer_id: str
+    asset_id: str
+    status: str
+    hits: tuple[MatchSegment, ...]
+    stats: FindShardStats
+    error: str | None = None
+
+    def validate(self) -> None:
+        if not self.shard_id.strip():
+            raise ValueError("shard_id must be non-empty")
+        if not self.job_id.strip():
+            raise ValueError("job_id must be non-empty")
+        if not self.customer_id.strip():
+            raise ValueError("customer_id must be non-empty")
+        if not self.asset_id.strip():
+            raise ValueError("asset_id must be non-empty")
+        if self.status not in {"ok", "error"}:
+            raise ValueError(f"unsupported shard result status: {self.status!r}")
+        if self.status == "ok" and self.error is not None:
+            raise ValueError("successful shard result must not include error")
+        if self.status == "error" and not (self.error or "").strip():
+            raise ValueError("error shard result must include error")
+        self.stats.validate()
+        for hit in self.hits:
+            hit.validate()
+
+
+def find_shard_from_payload(payload: Mapping[str, object]) -> FindShard:
+    shard = FindShard(
+        shard_id=str(payload["shard_id"]),
+        job_id=str(payload["job_id"]),
+        customer_id=str(payload["customer_id"]),
+        lane=str(payload["lane"]),
+        priority=int(payload["priority"]),
+        attempt=int(payload["attempt"]),
+        query_id=str(payload["query_id"]),
+        query_text=str(payload["query_text"]),
+        source_uri=str(payload["source_uri"]),
+        asset_id=str(payload["asset_id"]),
+        decode_hint=_optional_str(payload.get("decode_hint")),
+        sample_id=int(payload["sample_id"]),
+        scan_start_ms=int(payload["scan_start_ms"]),
+        scan_end_ms=int(payload["scan_end_ms"]),
+        overlap_ms=int(payload["overlap_ms"]),
+        sample_fps=float(payload["sample_fps"]),
+        model=str(payload["model"]),
+        created_at_ms=int(payload["created_at_ms"]),
+        source_access_url=_optional_str(payload.get("source_access_url")),
+    )
+    shard.validate()
+    return shard
+
+
+def find_shard_result_to_payload(result: FindShardResult) -> dict[str, object]:
+    result.validate()
+    return {
+        "shard_id": result.shard_id,
+        "job_id": result.job_id,
+        "customer_id": result.customer_id,
+        "asset_id": result.asset_id,
+        "status": result.status,
+        "hits": [
+            {
+                "sample_id": hit.sample_id,
+                "start_ms": hit.start_ms,
+                "end_ms": hit.end_ms,
+            }
+            for hit in result.hits
+        ],
+        "stats": {
+            "sampled_frames": result.stats.sampled_frames,
+            "decode_ms": result.stats.decode_ms,
+            "inference_ms": result.stats.inference_ms,
+            "wall_ms": result.stats.wall_ms,
+        },
+        "error": result.error,
+    }
 
 
 @dataclass
@@ -89,8 +274,12 @@ def _process_shard(shard: FindShard) -> FindShardResult:
     try:
         with tempfile.TemporaryDirectory(prefix="mx8-find-frames-") as tempdir:
             frame_dir = Path(tempdir)
-            frame_times_ms, frame_paths, decode_ms = _extract_frames(
+            decode_source_ref = _prepare_source_for_decode(
                 source_ref=source_ref,
+                shard=shard,
+            )
+            frame_times_ms, frame_paths, decode_ms = _extract_frames(
+                source_ref=decode_source_ref,
                 shard=shard,
                 output_dir=frame_dir,
             )
@@ -191,6 +380,74 @@ def _extract_frames(*, source_ref: str, shard: FindShard, output_dir: Path) -> t
         for index in range(len(frame_paths))
     ]
     return frame_times_ms, frame_paths, max(0, int((monotonic() - started) * 1000))
+
+
+def _prepare_source_for_decode(*, source_ref: str, shard: FindShard) -> str:
+    parsed = urlsplit(source_ref)
+    if parsed.scheme not in {"http", "https"}:
+        return source_ref
+    request = Request(
+        source_ref,
+        headers={
+            "Range": "bytes=0-0",
+            "User-Agent": "mx8-find-worker/1",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=_remote_probe_timeout_secs()) as response:
+            _validate_remote_source_response(
+                status=getattr(response, "status", response.getcode()),
+                headers=response.headers,
+                source_ref=source_ref,
+                shard=shard,
+            )
+    except Exception as exc:
+        raise RuntimeError(f"remote source preflight failed for {shard.asset_id}: {exc}") from exc
+    return source_ref
+
+
+def _validate_remote_source_response(
+    *,
+    status: int,
+    headers: Message,
+    source_ref: str,
+    shard: FindShard,
+) -> None:
+    accept_ranges = headers.get("Accept-Ranges", "")
+    content_range = headers.get("Content-Range", "")
+    content_type = headers.get_content_type()
+    if not _supports_byte_ranges(status=status, accept_ranges=accept_ranges, content_range=content_range):
+        raise RuntimeError(
+            "http/https source must support byte-range reads "
+            f"(status={status}, accept_ranges={accept_ranges or '<empty>'}, "
+            f"content_range={content_range or '<empty>'})"
+        )
+    if not _is_supported_media_type(content_type=content_type, source_ref=source_ref, asset_id=shard.asset_id):
+        raise RuntimeError(
+            "http/https source must be a direct media object "
+            f"(content_type={content_type or '<empty>'})"
+        )
+
+
+def _supports_byte_ranges(*, status: int, accept_ranges: str, content_range: str) -> bool:
+    if status == 206:
+        return True
+    if accept_ranges.strip().lower() == "bytes":
+        return True
+    return content_range.strip().lower().startswith("bytes ")
+
+
+def _is_supported_media_type(*, content_type: str, source_ref: str, asset_id: str) -> bool:
+    normalized = (content_type or "").strip().lower()
+    if normalized.startswith("video/") or normalized.startswith("audio/"):
+        return True
+    if normalized in {"application/octet-stream", "binary/octet-stream"}:
+        return True
+    suffix = Path(urlsplit(source_ref).path or asset_id).suffix.lower()
+    if not normalized and suffix in _REMOTE_MEDIA_EXTENSIONS:
+        return True
+    return False
 
 
 def _score_frames(*, shard: FindShard, frame_paths: Sequence[Path], source_ref: str) -> tuple[list[float], int]:
@@ -375,6 +632,19 @@ def _merge_gap_ms() -> int:
     return max(0, int(os.getenv("MX8_FIND_MERGE_GAP_MS", "1500")))
 
 
+def _remote_probe_timeout_secs() -> float:
+    return max(1.0, float(os.getenv("MX8_FIND_REMOTE_PROBE_TIMEOUT_SECS", "10")))
+
+
 def _batched(values: Sequence[Path], batch_size: int) -> Iterable[Sequence[Path]]:
     for index in range(0, len(values), batch_size):
         yield values[index : index + batch_size]
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return str(value)

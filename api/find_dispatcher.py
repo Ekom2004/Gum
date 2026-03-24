@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import threading
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from email.message import Message
 from pathlib import Path
 from time import monotonic, time
 from typing import Protocol
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from .find_access import SourceAccessResolver, build_source_access_resolver
@@ -27,6 +31,16 @@ from .find_contracts import (
 
 class FindTransport(Protocol):
     def process_shard(self, shard: FindShard) -> FindShardResult: ...
+
+
+class VideoDurationResolver(Protocol):
+    def resolve_duration_ms(
+        self,
+        *,
+        location: str,
+        source_access_url: str | None,
+        decode_hint: str | None,
+    ) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -354,15 +368,45 @@ class ModalFindTransport:
             return self._function
 
 
+class FfprobeVideoDurationResolver:
+    def __init__(self, *, timeout_secs: float) -> None:
+        self._timeout_secs = timeout_secs
+        self._cache: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def resolve_duration_ms(
+        self,
+        *,
+        location: str,
+        source_access_url: str | None,
+        decode_hint: str | None,
+    ) -> int:
+        cache_key = location.strip()
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+        source_ref = (source_access_url or location).strip()
+        ensure_remote_probe_source_supported(location=location, source_ref=source_ref)
+        duration_ms = probe_video_duration_ms(source_ref, timeout_secs=self._timeout_secs)
+        if duration_ms is None:
+            raise RuntimeError(f"failed to determine video duration for {location}")
+        with self._lock:
+            self._cache[cache_key] = duration_ms
+        return duration_ms
+
+
 class FindDispatcher:
     def __init__(
         self,
         transport: FindTransport | None = None,
         *,
         access_resolver: SourceAccessResolver | None = None,
+        duration_resolver: VideoDurationResolver | None = None,
     ) -> None:
         self._transport = transport
         self._access_resolver = access_resolver
+        self._duration_resolver = duration_resolver
         self._queue = FindShardQueue(
             worker_slots=dispatcher_worker_count(),
             base_active_shards_per_job=base_active_shards_per_job(),
@@ -428,6 +472,7 @@ class FindDispatcher:
             query_text=query_text,
             records=video_records,
             access_resolver=self._access_resolver_instance(),
+            duration_resolver=self._duration_resolver_instance(),
         )
         job = _PendingFindJob(
             source_manifest_hash=source_manifest_hash,
@@ -509,6 +554,13 @@ class FindDispatcher:
             self._access_resolver = resolver
         return resolver
 
+    def _duration_resolver_instance(self) -> VideoDurationResolver:
+        resolver = self._duration_resolver
+        if resolver is None:
+            resolver = build_video_duration_resolver()
+            self._duration_resolver = resolver
+        return resolver
+
 
 def build_find_transport() -> FindTransport:
     provider = os.getenv("MX8_FIND_PROVIDER", "modal").strip().lower()
@@ -526,6 +578,10 @@ def build_find_transport() -> FindTransport:
         function_name=function_name,
         environment_name=environment_name,
     )
+
+
+def build_video_duration_resolver() -> VideoDurationResolver:
+    return FfprobeVideoDurationResolver(timeout_secs=find_duration_probe_timeout_secs())
 
 
 def dispatcher_worker_count() -> int:
@@ -564,6 +620,14 @@ def find_query_cache_max_entries() -> int:
     return max(1, int(os.getenv("MX8_FIND_QUERY_CACHE_MAX_ENTRIES", "10000")))
 
 
+def find_duration_probe_timeout_secs() -> float:
+    return max(1.0, float(os.getenv("MX8_FIND_DURATION_PROBE_TIMEOUT_SECS", "15")))
+
+
+def find_remote_probe_timeout_secs() -> float:
+    return max(1.0, float(os.getenv("MX8_FIND_REMOTE_PROBE_TIMEOUT_SECS", "10")))
+
+
 def build_find_shards(
     *,
     job_id: str,
@@ -574,6 +638,7 @@ def build_find_shards(
     query_text: str,
     records: list[ManifestRecord],
     access_resolver: SourceAccessResolver | None = None,
+    duration_resolver: VideoDurationResolver | None = None,
 ) -> list[FindShard]:
     shards: list[FindShard] = []
     window_ms = find_shard_window_ms()
@@ -581,37 +646,226 @@ def build_find_shards(
     sample_fps = find_sample_fps()
     model = find_model_name()
     created_at_ms = int(time() * 1000)
-    for index, record in enumerate(records):
-        if record.segment_start_ms is not None and record.segment_end_ms is not None:
-            scan_start_ms = record.segment_start_ms
-            scan_end_ms = record.segment_end_ms
-        else:
-            scan_start_ms = 0
-            scan_end_ms = window_ms
-        shard = FindShard(
-            shard_id=f"shd_{job_id}_{index:06d}",
-            job_id=job_id,
-            customer_id=customer_id,
-            lane=lane,
-            priority=priority,
-            attempt=0,
-            query_id=query_id,
-            query_text=query_text,
-            source_uri=record.location,
-            asset_id=asset_id_from_location(record.location),
-            decode_hint=record.decode_hint,
-            sample_id=record.sample_id,
-            scan_start_ms=scan_start_ms,
-            scan_end_ms=scan_end_ms,
+    shard_index = 0
+    for record in records:
+        source_access_url = access_resolver.resolve(record.location) if access_resolver is not None else None
+        for scan_start_ms, scan_end_ms in find_scan_ranges_for_record(
+            record=record,
+            source_access_url=source_access_url,
+            window_ms=window_ms,
             overlap_ms=overlap_ms,
-            sample_fps=sample_fps,
-            model=model,
-            created_at_ms=created_at_ms,
-            source_access_url=access_resolver.resolve(record.location) if access_resolver is not None else None,
-        )
-        shard.validate()
-        shards.append(shard)
+            duration_resolver=duration_resolver,
+        ):
+            shard = FindShard(
+                shard_id=f"shd_{job_id}_{shard_index:06d}",
+                job_id=job_id,
+                customer_id=customer_id,
+                lane=lane,
+                priority=priority,
+                attempt=0,
+                query_id=query_id,
+                query_text=query_text,
+                source_uri=record.location,
+                asset_id=asset_id_from_location(record.location),
+                decode_hint=record.decode_hint,
+                sample_id=record.sample_id,
+                scan_start_ms=scan_start_ms,
+                scan_end_ms=scan_end_ms,
+                overlap_ms=overlap_ms,
+                sample_fps=sample_fps,
+                model=model,
+                created_at_ms=created_at_ms,
+                source_access_url=source_access_url,
+            )
+            shard.validate()
+            shards.append(shard)
+            shard_index += 1
     return shards
+
+
+def find_scan_ranges_for_record(
+    *,
+    record: ManifestRecord,
+    source_access_url: str | None,
+    window_ms: int,
+    overlap_ms: int,
+    duration_resolver: VideoDurationResolver | None,
+) -> list[tuple[int, int]]:
+    if record.segment_start_ms is not None and record.segment_end_ms is not None:
+        return slice_scan_ranges(
+            start_ms=record.segment_start_ms,
+            end_ms=record.segment_end_ms,
+            window_ms=window_ms,
+            overlap_ms=overlap_ms,
+        )
+    if duration_resolver is None:
+        raise RuntimeError(
+            f"duration resolver required to shard unbounded video record {record.location}"
+        )
+    duration_ms = duration_resolver.resolve_duration_ms(
+        location=record.location,
+        source_access_url=source_access_url,
+        decode_hint=record.decode_hint,
+    )
+    return slice_scan_ranges(
+        start_ms=0,
+        end_ms=duration_ms,
+        window_ms=window_ms,
+        overlap_ms=overlap_ms,
+    )
+
+
+def slice_scan_ranges(
+    *,
+    start_ms: int,
+    end_ms: int,
+    window_ms: int,
+    overlap_ms: int,
+) -> list[tuple[int, int]]:
+    if end_ms <= start_ms:
+        raise RuntimeError(f"invalid scan range: start_ms={start_ms} end_ms={end_ms}")
+    step_ms = max(1, window_ms - overlap_ms)
+    ranges: list[tuple[int, int]] = []
+    cursor = start_ms
+    while cursor < end_ms:
+        scan_end_ms = min(end_ms, cursor + window_ms)
+        ranges.append((cursor, scan_end_ms))
+        if scan_end_ms >= end_ms:
+            break
+        cursor += step_ms
+    return ranges
+
+
+def probe_video_duration_ms(source_ref: str, *, timeout_secs: float) -> int | None:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=duration:format=duration",
+        "-of",
+        "json",
+        source_ref,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_secs,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffprobe is required for find duration probing but was not found in PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffprobe timed out while probing {source_ref}") from exc
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"ffprobe duration probe failed for {source_ref}: {stderr}")
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ffprobe duration output was not valid JSON for {source_ref}: {exc}") from exc
+    durations: list[float] = []
+    for stream in payload.get("streams", []):
+        duration = _parse_duration_secs(stream.get("duration"))
+        if duration is not None:
+            durations.append(duration)
+    format_duration = _parse_duration_secs((payload.get("format") or {}).get("duration"))
+    if format_duration is not None:
+        durations.append(format_duration)
+    if not durations:
+        return None
+    return max(1, int(max(durations) * 1000.0))
+
+
+def ensure_remote_probe_source_supported(*, location: str, source_ref: str) -> None:
+    parsed = urlsplit(source_ref)
+    if parsed.scheme not in {"http", "https"}:
+        return
+    request = Request(
+        source_ref,
+        headers={
+            "Range": "bytes=0-0",
+            "User-Agent": "mx8-find-planner/1",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=find_remote_probe_timeout_secs()) as response:
+            validate_remote_probe_response(
+                status=getattr(response, "status", response.getcode()),
+                headers=response.headers,
+                source_ref=source_ref,
+            )
+    except Exception as exc:
+        raise RuntimeError(f"remote source preflight failed for {location}: {exc}") from exc
+
+
+def validate_remote_probe_response(*, status: int, headers: Message, source_ref: str) -> None:
+    accept_ranges = headers.get("Accept-Ranges", "")
+    content_range = headers.get("Content-Range", "")
+    content_type = headers.get_content_type()
+    if not remote_probe_supports_byte_ranges(
+        status=status,
+        accept_ranges=accept_ranges,
+        content_range=content_range,
+    ):
+        raise RuntimeError(
+            "http/https source must support byte-range reads "
+            f"(status={status}, accept_ranges={accept_ranges or '<empty>'}, "
+            f"content_range={content_range or '<empty>'})"
+        )
+    if not remote_probe_is_media(content_type=content_type, source_ref=source_ref):
+        raise RuntimeError(
+            "http/https source must be a direct media object "
+            f"(content_type={content_type or '<empty>'})"
+        )
+
+
+def remote_probe_supports_byte_ranges(*, status: int, accept_ranges: str, content_range: str) -> bool:
+    if status == 206:
+        return True
+    if accept_ranges.strip().lower() == "bytes":
+        return True
+    return content_range.strip().lower().startswith("bytes ")
+
+
+def remote_probe_is_media(*, content_type: str, source_ref: str) -> bool:
+    normalized = (content_type or "").strip().lower()
+    if normalized.startswith("video/") or normalized.startswith("audio/"):
+        return True
+    if normalized in {"application/octet-stream", "binary/octet-stream"}:
+        return True
+    suffix = Path(urlsplit(source_ref).path).suffix.lower()
+    return suffix in {
+        ".3gp",
+        ".asf",
+        ".avi",
+        ".m2ts",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".mts",
+        ".ts",
+        ".webm",
+        ".wmv",
+    }
+
+
+def _parse_duration_secs(value: object) -> float | None:
+    if value in (None, "", "N/A"):
+        return None
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed <= 0:
+        return None
+    return parsed
 
 
 def estimate_sampled_frames(*, scan_start_ms: int, scan_end_ms: int, sample_fps: float) -> int:

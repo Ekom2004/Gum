@@ -44,6 +44,22 @@ class StaticTransport:
         )
 
 
+class FakeDurationResolver:
+    def __init__(self, durations_ms: dict[str, int]) -> None:
+        self._durations_ms = durations_ms
+
+    def resolve_duration_ms(
+        self,
+        *,
+        location: str,
+        source_access_url: str | None,
+        decode_hint: str | None,
+    ) -> int:
+        del source_access_url
+        del decode_hint
+        return self._durations_ms[location]
+
+
 class FinderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -82,7 +98,13 @@ class FinderTests(unittest.TestCase):
                         MatchSegment(sample_id=1, start_ms=20_000, end_ms=20_500),
                     ]
                 }
-            )
+            ),
+            duration_resolver=FakeDurationResolver(
+                {
+                    "s3://bucket/input-0.mp4": 60_000,
+                    "s3://bucket/input-1.mp4": 60_000,
+                }
+            ),
         )
         dispatcher.start()
         try:
@@ -147,6 +169,7 @@ class FinderTests(unittest.TestCase):
         dispatcher = FindDispatcher(
             transport=StaticTransport({}),
             access_resolver=PassthroughSourceAccessResolver(),
+            duration_resolver=FakeDurationResolver({"s3://bucket/input-0.mp4": 60_000}),
         )
         dispatcher.start()
         try:
@@ -255,6 +278,7 @@ class FinderTests(unittest.TestCase):
         dispatcher = FindDispatcher(
             transport=StaticTransport({0: [MatchSegment(sample_id=0, start_ms=500, end_ms=1_500)]}),
             access_resolver=PassthroughSourceAccessResolver(),
+            duration_resolver=FakeDurationResolver({"s3://bucket/input-0.mp4": 60_000}),
         )
         dispatcher.start()
         try:
