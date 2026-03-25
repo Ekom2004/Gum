@@ -24,6 +24,7 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=avformat");
     println!("cargo:rustc-link-lib=avcodec");
+    println!("cargo:rustc-link-lib=avfilter");
     println!("cargo:rustc-link-lib=avutil");
     println!("cargo:rustc-link-lib=swscale");
 

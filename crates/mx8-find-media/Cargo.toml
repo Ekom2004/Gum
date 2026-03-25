@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 build = "build.rs"
 
+[[bin]]
+name = "mx8-find-media-bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 libc = "0.2"
 

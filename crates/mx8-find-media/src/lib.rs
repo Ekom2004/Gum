@@ -3,6 +3,7 @@ use std::fmt;
 use std::os::raw::c_int;
 use std::ptr;
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
 mod ffi {
     #![allow(non_camel_case_types)]
@@ -19,6 +20,8 @@ static NETWORK_INIT: Once = Once::new();
 const AVERROR_EOF_CODE: c_int = fferrtag(b'E', b'O', b'F', b' ');
 const AV_NOPTS_VALUE_I64: i64 = i64::MIN;
 const SWS_BILINEAR_FLAG: c_int = 1 << 1;
+const FF_THREAD_FRAME_FLAG: c_int = 1;
+const FF_THREAD_SLICE_FLAG: c_int = 1 << 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractFramesRequest {
@@ -69,6 +72,92 @@ pub struct ExtractFramesResponse {
     pub frames: Vec<ExtractedRgbFrame>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractWindow {
+    pub scan_start_ms: u64,
+    pub scan_end_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractWindowedFramesRequest {
+    pub source_uri: String,
+    pub windows: Vec<ExtractWindow>,
+    pub sample_fps: f32,
+    pub frame_width: u32,
+    pub frame_height: u32,
+}
+
+impl ExtractWindowedFramesRequest {
+    pub fn validate(&self) -> Result<(), ExtractFramesError> {
+        if self.source_uri.trim().is_empty() {
+            return Err(ExtractFramesError::InvalidRequest(
+                "source_uri must be non-empty".to_string(),
+            ));
+        }
+        if self.windows.is_empty() {
+            return Err(ExtractFramesError::InvalidRequest(
+                "windows must be non-empty".to_string(),
+            ));
+        }
+        if !self.sample_fps.is_finite() || self.sample_fps <= 0.0 {
+            return Err(ExtractFramesError::InvalidRequest(
+                "sample_fps must be finite and greater than zero".to_string(),
+            ));
+        }
+        if self.frame_width == 0 || self.frame_height == 0 {
+            return Err(ExtractFramesError::InvalidRequest(
+                "frame dimensions must be greater than zero".to_string(),
+            ));
+        }
+        let mut prev_end = 0_u64;
+        for (index, window) in self.windows.iter().enumerate() {
+            if window.scan_end_ms <= window.scan_start_ms {
+                return Err(ExtractFramesError::InvalidRequest(format!(
+                    "window {index} has scan_end_ms <= scan_start_ms"
+                )));
+            }
+            if index > 0 && window.scan_start_ms < prev_end {
+                return Err(ExtractFramesError::InvalidRequest(format!(
+                    "window {index} overlaps or is not sorted"
+                )));
+            }
+            prev_end = window.scan_end_ms;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractWindowedFramesResponse {
+    pub windows: Vec<ExtractFramesResponse>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractFramesStats {
+    pub open_input: Duration,
+    pub stream_info: Duration,
+    pub codec_setup: Duration,
+    pub seek: Duration,
+    pub read_packets: Duration,
+    pub send_packets: Duration,
+    pub receive_frames: Duration,
+    pub filter_graph: Duration,
+    pub scale_and_pad: Duration,
+    pub packets_read: u64,
+    pub packets_sent: u64,
+    pub decoded_frames: u64,
+    pub filtered_frames: u64,
+    pub kept_frames: u64,
+    pub skipped_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeDiscardMode {
+    None,
+    NonRef,
+    NonKey,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FfmpegVersionTriplet {
     pub major: u32,
@@ -114,8 +203,21 @@ impl std::error::Error for ExtractFramesError {}
 pub fn extract_sampled_rgb_frames(
     request: &ExtractFramesRequest,
 ) -> Result<ExtractFramesResponse, ExtractFramesError> {
+    Ok(extract_sampled_rgb_frames_profiled(request)?.0)
+}
+
+pub fn extract_sampled_rgb_frames_profiled(
+    request: &ExtractFramesRequest,
+) -> Result<(ExtractFramesResponse, ExtractFramesStats), ExtractFramesError> {
+    extract_sampled_rgb_frames_filter_graph_profiled_with_discard(request, DecodeDiscardMode::NonRef)
+}
+
+pub fn extract_sampled_rgb_frames_manual_profiled(
+    request: &ExtractFramesRequest,
+) -> Result<(ExtractFramesResponse, ExtractFramesStats), ExtractFramesError> {
     request.validate()?;
     init_network();
+    let mut stats = ExtractFramesStats::default();
 
     let source = CString::new(request.source_uri.as_str()).map_err(|_| {
         ExtractFramesError::InvalidRequest("source_uri contains embedded NUL byte".to_string())
@@ -123,6 +225,7 @@ pub fn extract_sampled_rgb_frames(
 
     unsafe {
         let mut fmt_ptr: *mut ffi::AVFormatContext = ptr::null_mut();
+        let stage_started = Instant::now();
         ffmpeg_call(
             ffi::avformat_open_input(
                 &mut fmt_ptr,
@@ -132,12 +235,15 @@ pub fn extract_sampled_rgb_frames(
             ),
             "avformat_open_input",
         )?;
+        stats.open_input += stage_started.elapsed();
         let fmt = FormatContext(fmt_ptr);
 
+        let stage_started = Instant::now();
         ffmpeg_call(
             ffi::avformat_find_stream_info(fmt.0, ptr::null_mut()),
             "avformat_find_stream_info",
         )?;
+        stats.stream_info += stage_started.elapsed();
 
         let stream_index = ffmpeg_call(
             ffi::av_find_best_stream(
@@ -174,20 +280,16 @@ pub fn extract_sampled_rgb_frames(
         }
         let codec_ctx = CodecContext(codec_ptr);
 
-        ffmpeg_call(
-            ffi::avcodec_parameters_to_context(codec_ctx.0, codecpar),
-            "avcodec_parameters_to_context",
-        )?;
-        ffmpeg_call(
-            ffi::avcodec_open2(codec_ctx.0, codec, ptr::null_mut()),
-            "avcodec_open2",
-        )?;
+        let stage_started = Instant::now();
+        configure_decoder(codec_ctx.0, codecpar, codec, DecodeDiscardMode::None)?;
+        stats.codec_setup += stage_started.elapsed();
 
         let seek_ts = ffi::av_rescale_q(
             request.scan_start_ms as i64,
             ms_time_base(),
             (*stream).time_base,
         );
+        let stage_started = Instant::now();
         ffmpeg_call(
             ffi::av_seek_frame(
                 fmt.0,
@@ -198,30 +300,38 @@ pub fn extract_sampled_rgb_frames(
             "av_seek_frame",
         )?;
         ffi::avcodec_flush_buffers(codec_ctx.0);
+        stats.seek += stage_started.elapsed();
 
         let packet = Packet::new()?;
         let frame = Frame::new()?;
-        let mut scaler = Scaler(ptr::null_mut());
+        let mut scaler = Scaler::new();
         let mut next_keep_ms = request.scan_start_ms as i64;
         let step_ms = frame_step_ms(request.sample_fps);
         let mut frames = Vec::new();
 
         loop {
+            let stage_started = Instant::now();
             let read_ret = ffi::av_read_frame(fmt.0, packet.0);
+            stats.read_packets += stage_started.elapsed();
             if read_ret < 0 {
                 break;
             }
+            stats.packets_read += 1;
             if (*packet.0).stream_index != stream_index {
                 ffi::av_packet_unref(packet.0);
                 continue;
             }
 
+            let stage_started = Instant::now();
             let send_ret = ffi::avcodec_send_packet(codec_ctx.0, packet.0);
+            stats.send_packets += stage_started.elapsed();
+            stats.packets_sent += 1;
             ffi::av_packet_unref(packet.0);
             if send_ret < 0 && send_ret != again_error_code() {
                 return Err(ffmpeg_error(send_ret, "avcodec_send_packet"));
             }
 
+            let stage_started = Instant::now();
             let reached_end = receive_available_frames(
                 codec_ctx.0,
                 stream,
@@ -231,16 +341,21 @@ pub fn extract_sampled_rgb_frames(
                 &mut next_keep_ms,
                 step_ms,
                 &mut frames,
+                &mut stats,
             )?;
+            stats.receive_frames += stage_started.elapsed();
             if reached_end {
                 break;
             }
         }
 
+        let stage_started = Instant::now();
         let drain_ret = ffi::avcodec_send_packet(codec_ctx.0, ptr::null());
+        stats.send_packets += stage_started.elapsed();
         if drain_ret < 0 && drain_ret != again_error_code() && drain_ret != AVERROR_EOF_CODE {
             return Err(ffmpeg_error(drain_ret, "avcodec_send_packet(drain)"));
         }
+        let stage_started = Instant::now();
         let _ = receive_available_frames(
             codec_ctx.0,
             stream,
@@ -250,10 +365,220 @@ pub fn extract_sampled_rgb_frames(
             &mut next_keep_ms,
             step_ms,
             &mut frames,
+            &mut stats,
+        )?;
+        stats.receive_frames += stage_started.elapsed();
+
+        Ok((ExtractFramesResponse { frames }, stats))
+    }
+}
+
+pub fn extract_sampled_rgb_frames_filter_graph_profiled(
+    request: &ExtractFramesRequest,
+) -> Result<(ExtractFramesResponse, ExtractFramesStats), ExtractFramesError> {
+    extract_sampled_rgb_frames_filter_graph_profiled_with_discard(request, DecodeDiscardMode::None)
+}
+
+pub fn extract_sampled_rgb_frames_filter_graph_profiled_with_discard(
+    request: &ExtractFramesRequest,
+    discard_mode: DecodeDiscardMode,
+) -> Result<(ExtractFramesResponse, ExtractFramesStats), ExtractFramesError> {
+    request.validate()?;
+    init_network();
+    let mut stats = ExtractFramesStats::default();
+
+    let source = CString::new(request.source_uri.as_str()).map_err(|_| {
+        ExtractFramesError::InvalidRequest("source_uri contains embedded NUL byte".to_string())
+    })?;
+
+    unsafe {
+        let mut fmt_ptr: *mut ffi::AVFormatContext = ptr::null_mut();
+        let stage_started = Instant::now();
+        ffmpeg_call(
+            ffi::avformat_open_input(
+                &mut fmt_ptr,
+                source.as_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            "avformat_open_input",
+        )?;
+        stats.open_input += stage_started.elapsed();
+        let fmt = FormatContext(fmt_ptr);
+
+        let stage_started = Instant::now();
+        ffmpeg_call(
+            ffi::avformat_find_stream_info(fmt.0, ptr::null_mut()),
+            "avformat_find_stream_info",
+        )?;
+        stats.stream_info += stage_started.elapsed();
+
+        let stream_index = ffmpeg_call(
+            ffi::av_find_best_stream(
+                fmt.0,
+                ffi::AVMediaType_AVMEDIA_TYPE_VIDEO,
+                -1,
+                -1,
+                ptr::null_mut(),
+                0,
+            ),
+            "av_find_best_stream",
         )?;
 
-        Ok(ExtractFramesResponse { frames })
+        let stream = *(*fmt.0).streams.add(stream_index as usize);
+        let codecpar = (*stream).codecpar;
+        if codecpar.is_null() {
+            return Err(ExtractFramesError::Ffmpeg(
+                "video stream codec parameters missing".to_string(),
+            ));
+        }
+
+        let codec = ffi::avcodec_find_decoder((*codecpar).codec_id);
+        if codec.is_null() {
+            return Err(ExtractFramesError::Ffmpeg(
+                "no decoder found for video stream".to_string(),
+            ));
+        }
+
+        let codec_ptr = ffi::avcodec_alloc_context3(codec);
+        if codec_ptr.is_null() {
+            return Err(ExtractFramesError::Ffmpeg(
+                "avcodec_alloc_context3 returned null".to_string(),
+            ));
+        }
+        let codec_ctx = CodecContext(codec_ptr);
+
+        let stage_started = Instant::now();
+        configure_decoder(codec_ctx.0, codecpar, codec, discard_mode)?;
+        stats.codec_setup += stage_started.elapsed();
+
+        let seek_ts = ffi::av_rescale_q(
+            request.scan_start_ms as i64,
+            ms_time_base(),
+            (*stream).time_base,
+        );
+        let stage_started = Instant::now();
+        ffmpeg_call(
+            ffi::av_seek_frame(
+                fmt.0,
+                stream_index,
+                seek_ts,
+                ffi::AVSEEK_FLAG_BACKWARD as c_int,
+            ),
+            "av_seek_frame",
+        )?;
+        ffi::avcodec_flush_buffers(codec_ctx.0);
+        stats.seek += stage_started.elapsed();
+
+        let filter_graph = FilterGraph::new(codec_ctx.0, stream, request)?;
+        let packet = Packet::new()?;
+        let decoded_frame = Frame::new()?;
+        let filtered_frame = Frame::new()?;
+        let mut frames = Vec::new();
+
+        loop {
+            let stage_started = Instant::now();
+            let read_ret = ffi::av_read_frame(fmt.0, packet.0);
+            stats.read_packets += stage_started.elapsed();
+            if read_ret < 0 {
+                break;
+            }
+            stats.packets_read += 1;
+            if (*packet.0).stream_index != stream_index {
+                ffi::av_packet_unref(packet.0);
+                continue;
+            }
+
+            let stage_started = Instant::now();
+            let send_ret = ffi::avcodec_send_packet(codec_ctx.0, packet.0);
+            stats.send_packets += stage_started.elapsed();
+            stats.packets_sent += 1;
+            ffi::av_packet_unref(packet.0);
+            if send_ret < 0 && send_ret != again_error_code() {
+                return Err(ffmpeg_error(send_ret, "avcodec_send_packet"));
+            }
+
+            let stage_started = Instant::now();
+            let reached_end = receive_available_filtered_frames(
+                codec_ctx.0,
+                stream,
+                decoded_frame.0,
+                filtered_frame.0,
+                &filter_graph,
+                request,
+                &mut frames,
+                &mut stats,
+            )?;
+            stats.receive_frames += stage_started.elapsed();
+            if reached_end {
+                break;
+            }
+        }
+
+        let stage_started = Instant::now();
+        let drain_ret = ffi::avcodec_send_packet(codec_ctx.0, ptr::null());
+        stats.send_packets += stage_started.elapsed();
+        if drain_ret < 0 && drain_ret != again_error_code() && drain_ret != AVERROR_EOF_CODE {
+            return Err(ffmpeg_error(drain_ret, "avcodec_send_packet(drain)"));
+        }
+        let stage_started = Instant::now();
+        let _ = receive_available_filtered_frames(
+            codec_ctx.0,
+            stream,
+            decoded_frame.0,
+            filtered_frame.0,
+            &filter_graph,
+            request,
+            &mut frames,
+            &mut stats,
+        )?;
+        stats.receive_frames += stage_started.elapsed();
+
+        Ok((ExtractFramesResponse { frames }, stats))
     }
+}
+
+pub fn extract_windowed_rgb_frames_profiled(
+    request: &ExtractWindowedFramesRequest,
+) -> Result<(ExtractWindowedFramesResponse, ExtractFramesStats), ExtractFramesError> {
+    extract_windowed_rgb_frames_profiled_with_discard(request, DecodeDiscardMode::NonRef)
+}
+
+pub fn extract_windowed_rgb_frames_profiled_with_discard(
+    request: &ExtractWindowedFramesRequest,
+    discard_mode: DecodeDiscardMode,
+) -> Result<(ExtractWindowedFramesResponse, ExtractFramesStats), ExtractFramesError> {
+    request.validate()?;
+    let super_request = ExtractFramesRequest {
+        source_uri: request.source_uri.clone(),
+        scan_start_ms: request.windows.first().expect("validated windows").scan_start_ms,
+        scan_end_ms: request.windows.last().expect("validated windows").scan_end_ms,
+        sample_fps: request.sample_fps,
+        frame_width: request.frame_width,
+        frame_height: request.frame_height,
+    };
+    let (response, stats) =
+        extract_sampled_rgb_frames_filter_graph_profiled_with_discard(&super_request, discard_mode)?;
+    let mut buckets = request
+        .windows
+        .iter()
+        .map(|_| ExtractFramesResponse { frames: Vec::new() })
+        .collect::<Vec<_>>();
+    let mut window_index = 0_usize;
+    for frame in response.frames {
+        while window_index < request.windows.len()
+            && frame.timestamp_ms >= request.windows[window_index].scan_end_ms
+        {
+            window_index += 1;
+        }
+        if window_index >= request.windows.len() {
+            break;
+        }
+        if frame.timestamp_ms >= request.windows[window_index].scan_start_ms {
+            buckets[window_index].frames.push(frame);
+        }
+    }
+    Ok((ExtractWindowedFramesResponse { windows: buckets }, stats))
 }
 
 pub fn linked_ffmpeg_versions() -> LinkedFfmpegVersions {
@@ -276,6 +601,7 @@ unsafe fn receive_available_frames(
     next_keep_ms: &mut i64,
     step_ms: i64,
     frames: &mut Vec<ExtractedRgbFrame>,
+    stats: &mut ExtractFramesStats,
 ) -> Result<bool, ExtractFramesError> {
     loop {
         let recv_ret = ffi::avcodec_receive_frame(codec_ctx, frame);
@@ -285,6 +611,7 @@ unsafe fn receive_available_frames(
         if recv_ret < 0 {
             return Err(ffmpeg_error(recv_ret, "avcodec_receive_frame"));
         }
+        stats.decoded_frames += 1;
 
         let timestamp_ms = frame_timestamp_ms(stream, frame)?;
         if timestamp_ms >= request.scan_end_ms as i64 {
@@ -292,11 +619,15 @@ unsafe fn receive_available_frames(
             return Ok(true);
         }
         if timestamp_ms < request.scan_start_ms as i64 || timestamp_ms < *next_keep_ms {
+            stats.skipped_frames += 1;
             ffi::av_frame_unref(frame);
             continue;
         }
 
+        let stage_started = Instant::now();
         let rgb24 = scale_and_pad_frame(frame, scaler, request)?;
+        stats.scale_and_pad += stage_started.elapsed();
+        stats.kept_frames += 1;
         frames.push(ExtractedRgbFrame {
             timestamp_ms: timestamp_ms as u64,
             width: request.frame_width,
@@ -307,6 +638,74 @@ unsafe fn receive_available_frames(
             *next_keep_ms += step_ms;
         }
         ffi::av_frame_unref(frame);
+    }
+}
+
+unsafe fn receive_available_filtered_frames(
+    codec_ctx: *mut ffi::AVCodecContext,
+    stream: *mut ffi::AVStream,
+    decoded_frame: *mut ffi::AVFrame,
+    filtered_frame: *mut ffi::AVFrame,
+    filter_graph: &FilterGraph,
+    request: &ExtractFramesRequest,
+    frames: &mut Vec<ExtractedRgbFrame>,
+    stats: &mut ExtractFramesStats,
+) -> Result<bool, ExtractFramesError> {
+    loop {
+        let recv_ret = ffi::avcodec_receive_frame(codec_ctx, decoded_frame);
+        if recv_ret == again_error_code() || recv_ret == AVERROR_EOF_CODE {
+            return Ok(false);
+        }
+        if recv_ret < 0 {
+            return Err(ffmpeg_error(recv_ret, "avcodec_receive_frame"));
+        }
+        stats.decoded_frames += 1;
+
+        let stage_started = Instant::now();
+        let add_ret = ffi::av_buffersrc_add_frame_flags(
+            filter_graph.buffersrc_ctx,
+            decoded_frame,
+            ffi::AV_BUFFERSRC_FLAG_KEEP_REF as c_int,
+        );
+        stats.filter_graph += stage_started.elapsed();
+        ffi::av_frame_unref(decoded_frame);
+        if add_ret < 0 {
+            return Err(ffmpeg_error(add_ret, "av_buffersrc_add_frame_flags"));
+        }
+
+        loop {
+            let stage_started = Instant::now();
+            let sink_ret = ffi::av_buffersink_get_frame(filter_graph.buffersink_ctx, filtered_frame);
+            stats.filter_graph += stage_started.elapsed();
+            if sink_ret == again_error_code() || sink_ret == AVERROR_EOF_CODE {
+                break;
+            }
+            if sink_ret < 0 {
+                return Err(ffmpeg_error(sink_ret, "av_buffersink_get_frame"));
+            }
+            stats.filtered_frames += 1;
+
+            let timestamp_ms = frame_timestamp_ms(stream, filtered_frame)?;
+            if timestamp_ms >= request.scan_end_ms as i64 {
+                ffi::av_frame_unref(filtered_frame);
+                return Ok(true);
+            }
+            if timestamp_ms < request.scan_start_ms as i64 {
+                stats.skipped_frames += 1;
+                ffi::av_frame_unref(filtered_frame);
+                continue;
+            }
+
+            let rgb24 = copy_rgb_frame(filtered_frame, request.frame_width, request.frame_height)?;
+            stats.kept_frames += 1;
+            frames.push(ExtractedRgbFrame {
+                timestamp_ms: timestamp_ms as u64,
+                width: request.frame_width,
+                height: request.frame_height,
+                rgb24,
+            });
+            ffi::av_frame_unref(filtered_frame);
+        }
     }
 }
 
@@ -356,7 +755,7 @@ unsafe fn scale_and_pad_frame(
     dst_linesize[0] = (scaled_width * 3) as c_int;
 
     let scale_ret = ffi::sws_scale(
-        scaler.0,
+        scaler.ctx,
         (*frame).data.as_ptr() as *const *const u8,
         (*frame).linesize.as_ptr(),
         0,
@@ -383,6 +782,28 @@ unsafe fn scale_and_pad_frame(
     Ok(final_rgb)
 }
 
+unsafe fn copy_rgb_frame(
+    frame: *mut ffi::AVFrame,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, ExtractFramesError> {
+    let mut rgb24 = vec![0_u8; (width * height * 3) as usize];
+    let src = (*frame).data[0];
+    if src.is_null() {
+        return Err(ExtractFramesError::Ffmpeg(
+            "filtered frame missing rgb plane".to_string(),
+        ));
+    }
+    let src_stride = (*frame).linesize[0] as usize;
+    let row_bytes = (width * 3) as usize;
+    for row in 0..height as usize {
+        let src_row = std::slice::from_raw_parts(src.add(row * src_stride), row_bytes);
+        let dst_offset = row * row_bytes;
+        rgb24[dst_offset..dst_offset + row_bytes].copy_from_slice(src_row);
+    }
+    Ok(rgb24)
+}
+
 fn fit_inside(src_width: u32, src_height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
     let scale = f64::min(
         max_width as f64 / src_width as f64,
@@ -399,6 +820,40 @@ fn frame_step_ms(sample_fps: f32) -> i64 {
 
 fn ms_time_base() -> ffi::AVRational {
     ffi::AVRational { num: 1, den: 1000 }
+}
+
+unsafe fn configure_decoder(
+    codec_ctx: *mut ffi::AVCodecContext,
+    codecpar: *const ffi::AVCodecParameters,
+    codec: *const ffi::AVCodec,
+    discard_mode: DecodeDiscardMode,
+) -> Result<(), ExtractFramesError> {
+    ffmpeg_call(
+        ffi::avcodec_parameters_to_context(codec_ctx, codecpar),
+        "avcodec_parameters_to_context",
+    )?;
+    // Mirror the CLI's default behavior more closely: let libav pick an
+    // appropriate thread count and enable both frame and slice threading
+    // when the decoder supports them.
+    (*codec_ctx).thread_count = 0;
+    (*codec_ctx).thread_type = 0;
+    let codec_caps = (*codec).capabilities as u32;
+    if codec_caps & ffi::AV_CODEC_CAP_FRAME_THREADS != 0 {
+        (*codec_ctx).thread_type |= FF_THREAD_FRAME_FLAG;
+    }
+    if codec_caps & ffi::AV_CODEC_CAP_SLICE_THREADS != 0 {
+        (*codec_ctx).thread_type |= FF_THREAD_SLICE_FLAG;
+    }
+    (*codec_ctx).skip_frame = match discard_mode {
+        DecodeDiscardMode::None => ffi::AVDiscard_AVDISCARD_DEFAULT,
+        DecodeDiscardMode::NonRef => ffi::AVDiscard_AVDISCARD_NONREF,
+        DecodeDiscardMode::NonKey => ffi::AVDiscard_AVDISCARD_NONKEY,
+    };
+    ffmpeg_call(
+        ffi::avcodec_open2(codec_ctx, codec, ptr::null_mut()),
+        "avcodec_open2",
+    )?;
+    Ok(())
 }
 
 fn ffmpeg_call(ret: c_int, op: &str) -> Result<c_int, ExtractFramesError> {
@@ -505,9 +960,27 @@ impl Drop for Frame {
     }
 }
 
-struct Scaler(*mut ffi::SwsContext);
+struct Scaler {
+    ctx: *mut ffi::SwsContext,
+    src_width: c_int,
+    src_height: c_int,
+    src_format: c_int,
+    dst_width: c_int,
+    dst_height: c_int,
+}
 
 impl Scaler {
+    fn new() -> Self {
+        Self {
+            ctx: ptr::null_mut(),
+            src_width: 0,
+            src_height: 0,
+            src_format: 0,
+            dst_width: 0,
+            dst_height: 0,
+        }
+    }
+
     unsafe fn ensure(
         &mut self,
         src_width: c_int,
@@ -516,12 +989,22 @@ impl Scaler {
         dst_width: c_int,
         dst_height: c_int,
     ) -> Result<(), ExtractFramesError> {
-        if !self.0.is_null() {
-            ffi::sws_freeContext(self.0);
-            self.0 = ptr::null_mut();
+        if !self.ctx.is_null()
+            && self.src_width == src_width
+            && self.src_height == src_height
+            && self.src_format == src_format
+            && self.dst_width == dst_width
+            && self.dst_height == dst_height
+        {
+            return Ok(());
         }
 
-        self.0 = ffi::sws_getContext(
+        if !self.ctx.is_null() {
+            ffi::sws_freeContext(self.ctx);
+            self.ctx = ptr::null_mut();
+        }
+
+        self.ctx = ffi::sws_getContext(
             src_width,
             src_height,
             src_format as ffi::AVPixelFormat,
@@ -533,11 +1016,16 @@ impl Scaler {
             ptr::null_mut(),
             ptr::null(),
         );
-        if self.0.is_null() {
+        if self.ctx.is_null() {
             Err(ExtractFramesError::Ffmpeg(
                 "sws_getContext returned null".to_string(),
             ))
         } else {
+            self.src_width = src_width;
+            self.src_height = src_height;
+            self.src_format = src_format;
+            self.dst_width = dst_width;
+            self.dst_height = dst_height;
             Ok(())
         }
     }
@@ -546,8 +1034,153 @@ impl Scaler {
 impl Drop for Scaler {
     fn drop(&mut self) {
         unsafe {
-            if !self.0.is_null() {
-                ffi::sws_freeContext(self.0);
+            if !self.ctx.is_null() {
+                ffi::sws_freeContext(self.ctx);
+            }
+        }
+    }
+}
+
+struct FilterGraph {
+    graph: *mut ffi::AVFilterGraph,
+    buffersrc_ctx: *mut ffi::AVFilterContext,
+    buffersink_ctx: *mut ffi::AVFilterContext,
+}
+
+impl FilterGraph {
+    unsafe fn new(
+        codec_ctx: *mut ffi::AVCodecContext,
+        stream: *mut ffi::AVStream,
+        request: &ExtractFramesRequest,
+    ) -> Result<Self, ExtractFramesError> {
+        let graph = ffi::avfilter_graph_alloc();
+        if graph.is_null() {
+            return Err(ExtractFramesError::Ffmpeg(
+                "avfilter_graph_alloc returned null".to_string(),
+            ));
+        }
+
+        let buffer = ffi::avfilter_get_by_name(c"buffer".as_ptr());
+        let buffersink = ffi::avfilter_get_by_name(c"buffersink".as_ptr());
+        if buffer.is_null() || buffersink.is_null() {
+            ffi::avfilter_graph_free(&mut (graph as *mut _));
+            return Err(ExtractFramesError::Ffmpeg(
+                "required libavfilter nodes are unavailable".to_string(),
+            ));
+        }
+
+        let mut buffersrc_ctx = ptr::null_mut();
+        let mut buffersink_ctx = ptr::null_mut();
+        let time_base = (*stream).time_base;
+        let sample_aspect = if (*codec_ctx).sample_aspect_ratio.num > 0
+            && (*codec_ctx).sample_aspect_ratio.den > 0
+        {
+            (*codec_ctx).sample_aspect_ratio
+        } else {
+            ffi::AVRational { num: 1, den: 1 }
+        };
+        let buffer_args = CString::new(format!(
+            "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
+            (*codec_ctx).width,
+            (*codec_ctx).height,
+            (*codec_ctx).pix_fmt,
+            time_base.num,
+            time_base.den,
+            sample_aspect.num,
+            sample_aspect.den
+        ))
+        .map_err(|_| {
+            ExtractFramesError::Ffmpeg("buffer filter args contain embedded NUL".to_string())
+        })?;
+
+        ffmpeg_call(
+            ffi::avfilter_graph_create_filter(
+                &mut buffersrc_ctx,
+                buffer,
+                c"in".as_ptr(),
+                buffer_args.as_ptr(),
+                ptr::null_mut(),
+                graph,
+            ),
+            "avfilter_graph_create_filter(buffer)",
+        )?;
+        ffmpeg_call(
+            ffi::avfilter_graph_create_filter(
+                &mut buffersink_ctx,
+                buffersink,
+                c"out".as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+                graph,
+            ),
+            "avfilter_graph_create_filter(buffersink)",
+        )?;
+
+        let mut outputs = ffi::avfilter_inout_alloc();
+        let mut inputs = ffi::avfilter_inout_alloc();
+        if outputs.is_null() || inputs.is_null() {
+            if !outputs.is_null() {
+                ffi::avfilter_inout_free(&mut outputs);
+            }
+            if !inputs.is_null() {
+                ffi::avfilter_inout_free(&mut inputs);
+            }
+            ffi::avfilter_graph_free(&mut (graph as *mut _));
+            return Err(ExtractFramesError::Ffmpeg(
+                "avfilter_inout_alloc returned null".to_string(),
+            ));
+        }
+
+        (*outputs).name = ffi::av_strdup(c"in".as_ptr());
+        (*outputs).filter_ctx = buffersrc_ctx;
+        (*outputs).pad_idx = 0;
+        (*outputs).next = ptr::null_mut();
+
+        (*inputs).name = ffi::av_strdup(c"out".as_ptr());
+        (*inputs).filter_ctx = buffersink_ctx;
+        (*inputs).pad_idx = 0;
+        (*inputs).next = ptr::null_mut();
+
+        let filter_spec = CString::new(format!(
+            "fps={},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:black,format=pix_fmts=rgb24",
+            request.sample_fps,
+            request.frame_width,
+            request.frame_height,
+            request.frame_width,
+            request.frame_height
+        ))
+        .map_err(|_| {
+            ExtractFramesError::Ffmpeg("filter spec contains embedded NUL".to_string())
+        })?;
+
+        let parse_ret = ffi::avfilter_graph_parse_ptr(
+            graph,
+            filter_spec.as_ptr(),
+            &mut inputs,
+            &mut outputs,
+            ptr::null_mut(),
+        );
+        ffi::avfilter_inout_free(&mut inputs);
+        ffi::avfilter_inout_free(&mut outputs);
+        ffmpeg_call(parse_ret, "avfilter_graph_parse_ptr")?;
+        ffmpeg_call(
+            ffi::avfilter_graph_config(graph, ptr::null_mut()),
+            "avfilter_graph_config",
+        )?;
+
+        Ok(Self {
+            graph,
+            buffersrc_ctx,
+            buffersink_ctx,
+        })
+    }
+}
+
+impl Drop for FilterGraph {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.graph.is_null() {
+                ffi::avfilter_graph_free(&mut self.graph);
             }
         }
     }
