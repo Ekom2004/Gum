@@ -9,7 +9,7 @@ members = [
   "crates/mx8-snapshot",
   "crates/mx8-runtime",
   "crates/mx8d-agent",
-  "crates/mx8-coordinator",
+  "crates/mx8-coordinator", "crates/mx8-find-media",
 ]
 
 [workspace.package]
