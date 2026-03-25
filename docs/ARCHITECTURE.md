@@ -4,7 +4,7 @@ MX8 is a distributed media transform platform built for teams that need fast, pr
 
 ## High-level components
 
-1. **API & SDK control plane** — accepts authenticated requests from clients and tooling (including Mintlify docs, CLI, or enterprise portals). It stores job templates, quota rules, and billing caps, and it emits webhooks/events when jobs pause, resume, or finish. Importantly, the SDK surface is slim so teams can do `import mx8` and reach for `mx8.transforms` without juggling multiple packages or nested imports.
+1. **API & SDK control plane** — accepts authenticated requests from clients and tooling (including Mintlify docs, CLI, or enterprise portals). It stores job templates, quota rules, and billing caps, and it emits webhooks/events when jobs pause, resume, or finish. Importantly, the SDK surface is slim so teams work from one package (`mx8`) without juggling multiple packages or nested imports.
 
 2. **Coordinator** — lives inside the control plane but runs on the compute pool. Its job is to allocate workers, pull metadata from the customer’s bucket, split the workload, and boot each slice as soon as resources are available. The coordinator links to reserve pools (cold/spot/priority) so extremely large workloads (e.g., tens of petabytes) can start within minutes instead of hours.
 
@@ -30,4 +30,4 @@ MX8 is a distributed media transform platform built for teams that need fast, pr
 - **Async control:** Jobs can be paused, resumed, or canceled via the CLI and SDK so teams can treat MX8 like a Kubernetes cluster and react to supply fluctuations.
 - **Observability hooks:** Every job publishes metrics (throughput, errors, egress, compute seconds) so teams can spot runaway spend before it hits a billing cap.
 
-This architecture document should be referenced by Mintlify to explain the flow from `import mx8` through to finished outputs and search/analytics layers.
+This architecture document should be referenced by Mintlify to explain the flow from the `mx8` SDK through to finished outputs and search/analytics layers.

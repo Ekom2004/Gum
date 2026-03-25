@@ -1,19 +1,19 @@
 # MX8 v0 Specification
 
-MX8 v0 is about shipping fast, reliable media transforms with a single import (`import mx8`) and a declarative, chainable transform language. The first release must balance responsiveness (start time), throughput (PB-scale jobs), and controls (quotas, billing, and pause/resume) so early partners can test with confidence.
+MX8 v0 is about shipping fast, reliable media work from a single package (`mx8`) with a high-level `input/work/output` job shape. The first release must balance responsiveness (start time), throughput (PB-scale jobs), and controls (quotas, billing, and pause/resume) so early partners can test with confidence.
 
 ## Release goals
 
-1. **Single-entry SDK** — teams should only need `import mx8`, not multiple package names. The SDK exposes `Client`, `transforms`, and `jobs` helpers. Example job DSL in `docs/api_shape.md` shows how to chain `extract` → `filter` → `deduplicate` → `export`.
+1. **Single-entry SDK** — teams should only need the `mx8` package, not multiple package names. The SDK exposes `run` plus top-level operations like `find(...)` and `extract_frames(...)` inside an ordered `work=[...]` list. `docs/api_shape.md` is the source of truth for the public job DSL.
 2. **Async job lifecycle** — every job is async from day one. Customers can pause, resume, cancel, and watch progress updates through the SDK, webhooks, or CLI. We should be able to restart jobs mid-run without recomputing successful slices.
 3. **Throughput targets** — large jobs (30–100+ TB) should complete in hours, not days. That means the coordinator must be able to spin up tens of thousands of vCPUs (or a few hundred NVDEC-enabled GPUs) rapidly (target: <8 minutes to get compute warmed). Throughput monitoring (>5 GB/s per job) will be visible in the job API so customers can verify we are beating their homegrown stacks.
 
 ## Transform guarantees
 
 - `extract` enumerates frames, clips, or scenes and emits typed metadata (duration, format, codec, resolution).
-- `filter` accepts simple boolean expressions through the `expr` argument (`duration > 5`, `format == 'mp4'`, `corrupt == false`). Expressions can compare duration, format, codec, width, height, fps, byte_size, checksum/hash, stream_id/media_type, and the built-in `corrupt` flag, so clients can keep only the slices that matter without writing SQL.
-- `deduplicate` uses content hashes/shingles to drop redundant assets.
-- `export` writes to S3 or another configured sink. The platform drops corrupted files by default, but customers can opt into flagged outputs.
+- `filter` accepts simple boolean expressions through the `expr` argument (`duration > 5`, `format == 'mp4'`). Expressions can compare duration, format, codec, width, height, fps, byte_size, checksum/hash, stream_id/media_type, bitrate, sample_rate, and channels, so clients can keep only the slices that matter without writing SQL.
+- `sink` is part of job submission, so output location is declared once rather than repeated as a transform step.
+- corrupted assets are already handled by the ingest/runtime path and do not need a public `corrupt == false` example in the default UX.
 
 ## Quotas & governance
 
@@ -22,7 +22,7 @@ Per-team controls are essential:
 - `max_concurrent_jobs` (default 3) keeps runaway fleets from starving other teams.
 - `spend_cap` (e.g., $2,000/month) triggers soft stops; the client receives `QuotaExceeded` events before a job is admitted.
 - `max_workers_total` limits how many nodes a single team can own (useful when they want to stay under 40 workers).
-- `priority_labels` map to compute pools (spot/cold/priority) so we can honor `priority="priority-pool"` when dispatching jobs.
+- pool selection and worker concurrency stay in the control plane. They matter operationally, but they are not part of the default public SDK surface.
 
 ## Data & cost control
 

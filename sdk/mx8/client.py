@@ -9,6 +9,7 @@ from urllib import error, request
 
 from .job import Job
 from .transforms import Transform, TransformChain
+from .work import FindWork
 
 
 class MX8APIError(RuntimeError):
@@ -24,18 +25,16 @@ class MX8Client:
     def submit_job(
         self,
         *,
-        source: str,
-        transform: Transform | Sequence[Transform] | TransformChain,
-        sink: str,
-        find: str | None = None,
+        input: str,
+        work: Transform | FindWork | Sequence[Transform | FindWork] | TransformChain,
+        output: str,
     ) -> Job:
+        normalized = _normalize_work(work)
         payload = {
-            "source": source,
-            "sink": sink,
-            "transforms": _normalize_transforms(transform),
+            "input": input,
+            "output": output,
+            "work": normalized["work"],
         }
-        if find is not None:
-            payload["find"] = find
         body = self._request("POST", "/v1/jobs", payload)
         return _job_from_payload(self, body)
 
@@ -85,28 +84,43 @@ def default_client() -> MX8Client:
     )
 
 
-def _normalize_transforms(
-    transform: Transform | Sequence[Transform] | TransformChain,
-) -> list[dict[str, Any]]:
-    if isinstance(transform, Transform):
-        return [transform.to_payload()]
-    if isinstance(transform, TransformChain):
-        payloads = transform.to_payloads()
+def _normalize_work(
+    work: Transform | FindWork | Sequence[Transform | FindWork] | TransformChain,
+) -> dict[str, Any]:
+    if isinstance(work, Transform):
+        items = [work.to_payload()]
+    elif isinstance(work, FindWork):
+        items = [work.to_payload()]
+    elif isinstance(work, TransformChain):
+        items = work.to_payloads()
     else:
-        payloads = [item.to_payload() for item in transform]
-    if not payloads:
-        raise ValueError("transform must contain at least one transform")
-    return payloads
+        items = [item.to_payload() for item in work]
+    if not items:
+        raise ValueError("work must contain at least one operation")
+    find_count = sum(1 for item in items if item.get("type") == "find")
+    if find_count > 1:
+        raise ValueError("work currently supports at most one find operation")
+    if find_count == 1 and items[0].get("type") != "find":
+        raise ValueError("find must be the first work item")
+    return {"work": items}
 
 
 def _job_from_payload(client: MX8Client, payload: dict[str, Any]) -> Job:
+    work = tuple(payload.get("work") or ())
+    find_query = payload.get("find")
+    if find_query is None:
+        for item in work:
+            if item.get("type") == "find":
+                find_query = item.get("params", {}).get("query")
+                break
     return Job(
         client=client,
         id=payload["id"],
         status=payload["status"],
-        source=payload["source"],
-        sink=payload["sink"],
-        find=payload.get("find"),
+        input=payload.get("input", payload["source"]),
+        output=payload.get("output", payload["sink"]),
+        work=work,
+        find=find_query,
         matched_assets=payload.get("matched_assets"),
         matched_segments=payload.get("matched_segments"),
     )

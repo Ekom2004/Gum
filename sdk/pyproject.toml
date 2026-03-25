@@ -4,9 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mx8"
-version = "0.1.0"
+version = "2.0.0"
 description = "MX8 media SDK"
+readme = "README.md"
 requires-python = ">=3.10"
+
+[project.urls]
+Homepage = "https://github.com/Ekom2004/mx8-media"
+Repository = "https://github.com/Ekom2004/mx8-media"
 
 [tool.setuptools]
 package-dir = {"" = "."}

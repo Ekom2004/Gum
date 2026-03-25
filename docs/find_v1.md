@@ -2,25 +2,27 @@
 
 ## Public API
 
-MX8 adds a new optional root-level `find` field on `mx8.run(...)`:
+MX8 exposes semantic selection as a `find` work item inside `mx8.run(...)`:
 
 ```python
 mx8.run(
-    source="s3://raw-dashcam-archive/",
-    find="a stop sign covered in heavy snow",
-    transform=mx8.video.extract_frames(fps=10, format="jpg"),
-    sink="s3://training-dataset/",
+    input="s3://raw-dashcam-archive/",
+    work=[
+        mx8.find("a stop sign covered in heavy snow"),
+        mx8.extract_frames(fps=10, format="jpg"),
+    ],
+    output="s3://training-dataset/",
 )
 ```
 
-`find` is a selection stage, not a transform. `filter` stays reserved for structured filtering.
+`find` is a selection stage, not a transform. It stays first in the ordered `work=[...]` list, ahead of the transform work that should run on matches.
 
 ## v1 semantics
 
-- `find` is optional.
-- If `find` is omitted, behavior is unchanged.
+- `mx8.find(...)` is optional.
+- If no `find` work item is present, behavior is unchanged.
 - For video in v1, `find` selects matching temporal segments.
-- `transform` runs only on those matched segments.
+- downstream work runs only on those matched segments.
 - If no matches are found, the job completes successfully with zero outputs.
 
 ## Architecture
@@ -86,3 +88,16 @@ Once the planner exists:
 - zero-match jobs complete successfully with `matched_assets=0` and `matched_segments=0`
 - matched jobs produce a derived manifest and move to `PLANNED`
 - `PLANNED` jobs remain parked until PR4 adds segment-aware worker execution
+
+## PR4 behavior
+
+Once workers honor manifest segment bounds:
+
+- the planner still writes a derived manifest and may briefly use `PLANNED`
+- matched jobs immediately advance into the normal execution path after planning
+- workers process only the selected temporal segments and never receive the semantic query
+- segment-derived outputs include segment identity so multiple matches from the same source do not collide in the sink
+
+## Operations
+
+Operational deployment steps for the Modal-backed inference worker live in `docs/find_modal_deploy.md`.

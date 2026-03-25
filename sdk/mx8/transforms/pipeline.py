@@ -91,6 +91,9 @@ class _VideoTransformsFactory:
     def extract_audio(self, *, format: str, bitrate: str = "128k") -> VideoTransformPipeline:
         return VideoTransformPipeline().extract_audio(format=format, bitrate=bitrate)
 
+    def filter(self, *, expr: str) -> VideoTransformPipeline:
+        return VideoTransformPipeline().filter(expr=expr)
+
     def resize(self, *, width: int, height: int, maintain_aspect: bool = True) -> VideoTransformPipeline:
         return VideoTransformPipeline().resize(width=width, height=height, maintain_aspect=maintain_aspect)
 
@@ -105,6 +108,9 @@ class _AudioTransformsFactory:
     def normalize(self, *, loudness: float = -14.0) -> AudioTransformPipeline:
         return AudioTransformPipeline().normalize(loudness=loudness)
 
+    def filter(self, *, expr: str) -> AudioTransformPipeline:
+        return AudioTransformPipeline().filter(expr=expr)
+
 
 class _ImageTransformsFactory:
     def resize(self, *, width: int, height: int, maintain_aspect: bool = True) -> ImageTransformPipeline:
@@ -115,6 +121,9 @@ class _ImageTransformsFactory:
 
     def convert(self, *, format: str, quality: int = 85) -> ImageTransformPipeline:
         return ImageTransformPipeline().convert(format=format, quality=quality)
+
+    def filter(self, *, expr: str) -> ImageTransformPipeline:
+        return ImageTransformPipeline().filter(expr=expr)
 
 
 video = _VideoTransformsFactory()

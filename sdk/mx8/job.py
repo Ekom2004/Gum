@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from time import sleep
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 
 TERMINAL_STATUSES = {"COMPLETE", "FAILED"}
@@ -13,8 +14,9 @@ class Job:
     client: "MX8Client"
     id: str
     status: str
-    source: str
-    sink: str
+    input: str
+    output: str
+    work: Sequence[dict[str, Any]] = ()
     find: str | None = None
     matched_assets: int | None = None
     matched_segments: int | None = None
@@ -22,8 +24,9 @@ class Job:
     def poll(self) -> "Job":
         latest = self.client.get_job(self.id)
         self.status = latest.status
-        self.source = latest.source
-        self.sink = latest.sink
+        self.input = latest.input
+        self.output = latest.output
+        self.work = latest.work
         self.find = latest.find
         self.matched_assets = latest.matched_assets
         self.matched_segments = latest.matched_segments
@@ -34,6 +37,14 @@ class Job:
             sleep(poll_interval_secs)
             self.poll()
         return self
+
+    @property
+    def source(self) -> str:
+        return self.input
+
+    @property
+    def sink(self) -> str:
+        return self.output
 
 
 if TYPE_CHECKING:
