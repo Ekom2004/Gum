@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+from io import BytesIO
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 try:
     import modal
@@ -314,6 +317,8 @@ def _process_shard(shard: FindShard) -> FindShardResult:
 
 
 def _extract_frames(*, source_ref: str, shard: FindShard) -> tuple[list[int], list[memoryview], int]:
+    if _is_image_shard(shard):
+        return _extract_image_frame(source_ref=source_ref, shard=shard)
     started = monotonic()
     scan_duration_secs = max(0.001, (shard.scan_end_ms - shard.scan_start_ms) / 1000.0)
     frame_width = _frame_size()
@@ -362,6 +367,16 @@ def _extract_frames(*, source_ref: str, shard: FindShard) -> tuple[list[int], li
         for index in range(len(frames))
     ]
     return frame_times_ms, frames, max(0, int((monotonic() - started) * 1000))
+
+
+def _extract_image_frame(*, source_ref: str, shard: FindShard) -> tuple[list[int], list[memoryview], int]:
+    started = monotonic()
+    from PIL import Image
+
+    image_bytes = _read_source_bytes(source_ref)
+    with Image.open(BytesIO(image_bytes)) as image:
+        prepared = _prepare_image(image)
+    return [0], [memoryview(prepared)], max(0, int((monotonic() - started) * 1000))
 
 
 def _score_frames(*, shard: FindShard, frames: Sequence[memoryview], source_ref: str) -> tuple[list[float], int]:
@@ -500,6 +515,49 @@ def _merge_frame_hits(
         current = MatchSegment(sample_id=sample_id, start_ms=start_ms, end_ms=end_ms)
         merged.append(current)
     return tuple(merged)
+
+
+def _is_image_shard(shard: FindShard) -> bool:
+    hint = (shard.decode_hint or "").strip().lower()
+    if hint.startswith("mx8:vision:imagefolder;") or hint.startswith("mx8:image;"):
+        return True
+    path = urlsplit(shard.source_uri).path.lower()
+    return any(path.endswith(extension) for extension in IMAGE_EXTENSIONS)
+
+
+IMAGE_EXTENSIONS = (
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
+)
+
+
+def _read_source_bytes(source_ref: str) -> bytes:
+    parsed = urlsplit(source_ref)
+    if parsed.scheme in {"http", "https", "file"}:
+        with urlopen(source_ref) as response:
+            return response.read()
+    return Path(source_ref).read_bytes()
+
+
+def _prepare_image(image) -> bytes:
+    from PIL import Image
+
+    frame_size = _frame_size()
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    scale = min(frame_size / max(width, 1), frame_size / max(height, 1))
+    scaled_width = max(1, int(round(width * scale)))
+    scaled_height = max(1, int(round(height * scale)))
+    resized = rgb.resize((scaled_width, scaled_height))
+    canvas = Image.new("RGB", (frame_size, frame_size), color=(0, 0, 0))
+    offset_x = (frame_size - scaled_width) // 2
+    offset_y = (frame_size - scaled_height) // 2
+    canvas.paste(resized, (offset_x, offset_y))
+    return canvas.tobytes()
 
 
 def _resolve_model_id(model_alias: str) -> str:

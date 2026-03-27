@@ -263,6 +263,19 @@ class FinderTests(unittest.TestCase):
         self.assertEqual(request.transforms[0].type, "video.extract_frames")
         self.assertEqual(request.transforms[1].type, "image.resize")
 
+    def test_find_allows_image_transforms(self) -> None:
+        request = CreateJobRequest(
+            source="s3://image-dataset/",
+            sink="s3://matches/",
+            find="stop sign",
+            transforms=[
+                TransformSpec(type="image.resize", params={"width": 128, "height": 128}),
+                TransformSpec(type="image.convert", params={"format": "webp", "quality": 80}),
+            ],
+        )
+        self.assertEqual(request.transforms[0].type, "image.resize")
+        self.assertEqual(request.transforms[1].type, "image.convert")
+
     def test_find_allows_video_extract_audio_followed_by_audio_transforms(self) -> None:
         request = CreateJobRequest(
             source="s3://raw-dashcam-archive/",
@@ -279,7 +292,7 @@ class FinderTests(unittest.TestCase):
     def test_find_rejects_pure_audio_transforms(self) -> None:
         with self.assertRaisesRegex(
             ValueError,
-            "find requires a video-compatible transform chain",
+            "find requires a visual-compatible transform chain",
         ):
             CreateJobRequest(
                 source="s3://raw-dashcam-archive/",
@@ -291,7 +304,7 @@ class FinderTests(unittest.TestCase):
     def test_find_rejects_video_extract_frames_followed_by_video_transform(self) -> None:
         with self.assertRaisesRegex(
             ValueError,
-            "find requires a video-compatible transform chain",
+            "find requires a visual-compatible transform chain",
         ):
             CreateJobRequest(
                 source="s3://raw-dashcam-archive/",
@@ -306,7 +319,7 @@ class FinderTests(unittest.TestCase):
     def test_find_rejects_video_extract_audio_followed_by_video_transform(self) -> None:
         with self.assertRaisesRegex(
             ValueError,
-            "find requires a video-compatible transform chain",
+            "find requires a visual-compatible transform chain",
         ):
             CreateJobRequest(
                 source="s3://raw-dashcam-archive/",
@@ -365,6 +378,62 @@ class FinderTests(unittest.TestCase):
         self.assertEqual(updated.matched_assets, 1)
         self.assertEqual(updated.matched_segments, 1)
         self.assertEqual(wake_calls, ["wake"])
+
+    def test_find_job_with_image_matches_enters_planned(self) -> None:
+        store = InMemoryJobStore()
+        record = store.create_job(
+            CreateJobRequest(
+                source="s3://image-dataset/",
+                sink="s3://matches/",
+                find="match",
+                transforms=[TransformSpec(type="image.resize", params={"width": 128, "height": 128})],
+            )
+        )
+        dispatcher = FindDispatcher(
+            access_resolver=PassthroughSourceAccessResolver(),
+            transport=StaticTransport({1: [MatchSegment(sample_id=1, start_ms=0, end_ms=1)]}),
+        )
+        dispatcher.start()
+        try:
+            finder = JobFinder(
+                store,
+                dispatcher=dispatcher,
+                manifest_resolver=FakeResolver(
+                    "basehash",
+                    [
+                        ManifestRecord(
+                            sample_id=0,
+                            location="s3://bucket/input-0.jpg",
+                            byte_offset=None,
+                            byte_length=None,
+                            decode_hint="mx8:vision:imagefolder;label_id=0",
+                        ),
+                        ManifestRecord(
+                            sample_id=1,
+                            location="s3://bucket/input-1.png",
+                            byte_offset=None,
+                            byte_length=None,
+                            decode_hint="mx8:vision:imagefolder;label_id=1",
+                        ),
+                    ],
+                ),
+            )
+
+            self._reconcile_until_terminal(finder, store, record.id)
+        finally:
+            dispatcher.stop()
+
+        updated = store.get_job(record.id)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.status, JobStatus.PLANNED)
+        self.assertEqual(updated.matched_assets, 1)
+        self.assertEqual(updated.matched_segments, 1)
+        manifest_store = LocalFsManifestStore.from_env()
+        manifest_bytes = manifest_store.get_manifest_bytes(updated.manifest_hash or "")
+        derived_records = parse_canonical_manifest_tsv(manifest_bytes)
+        self.assertEqual(len(derived_records), 1)
+        self.assertEqual(derived_records[0].location, "s3://bucket/input-1.png")
 
     def test_find_only_job_completes_without_queueing(self) -> None:
         store = InMemoryJobStore()

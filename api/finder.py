@@ -11,7 +11,7 @@ from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
 from .find_contracts import FIND_INTERACTIVE_LANE, ManifestRecord, MatchSegment
-from .find_dispatcher import FindDispatcher
+from .find_dispatcher import FindDispatcher, record_is_image
 from .models import JobProgressUpdate, JobRecord, JobStatus
 from .storage import JobStore
 
@@ -32,6 +32,14 @@ VIDEO_EXTENSIONS = {
     ".ts",
     ".webm",
     ".wmv",
+}
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
 }
 
 
@@ -198,8 +206,8 @@ class JobFinder:
     def _submit_record(self, record: JobRecord) -> None:
         try:
             source_manifest_hash, source_records = self._resolver().resolve(record.source)
-            video_records = [candidate for candidate in source_records if is_video_record(candidate)]
-            if not video_records:
+            searchable_records = select_find_records(source_records, record.transforms)
+            if not searchable_records:
                 self._store.update_job_progress(
                     JobProgressUpdate(
                         job_id=record.id,
@@ -222,7 +230,7 @@ class JobFinder:
                 query_text=record.find or "",
                 source_manifest_hash=source_manifest_hash,
                 source_records=source_records,
-                video_records=video_records,
+                video_records=searchable_records,
                 max_outputs=record.max_outputs,
             )
         except Exception:
@@ -462,6 +470,29 @@ def is_video_record(record: ManifestRecord) -> bool:
         return True
     path = urlsplit(record.location).path.lower()
     return any(path.endswith(extension) for extension in VIDEO_EXTENSIONS)
+
+
+def is_image_record(record: ManifestRecord) -> bool:
+    if record_is_image(record):
+        return True
+    hint = (record.decode_hint or "").strip().lower()
+    if hint.startswith("mx8:image;"):
+        return True
+    path = urlsplit(record.location).path.lower()
+    return any(path.endswith(extension) for extension in IMAGE_EXTENSIONS)
+
+
+def select_find_records(
+    source_records: list[ManifestRecord],
+    transforms: list[TransformSpec],
+) -> list[ManifestRecord]:
+    if not transforms:
+        return [record for record in source_records if is_video_record(record) or is_image_record(record)]
+
+    transform_types = [transform.type for transform in transforms]
+    if all(transform_type.startswith("image.") for transform_type in transform_types):
+        return [record for record in source_records if is_image_record(record)]
+    return [record for record in source_records if is_video_record(record)]
 
 
 def normalize_text(value: str) -> str:

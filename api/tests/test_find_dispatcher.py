@@ -13,8 +13,15 @@ from api.find_contracts import (
     ManifestRecord,
 )
 from api.find_access import PassthroughSourceAccessResolver
-from api.find_dispatcher import FindDispatcher, FindShardQueue, MockFindTransport, find_shard_window_ms
-from api.find_dispatcher import build_find_shards, shard_windows_for_duration
+from api.find_dispatcher import (
+    FindDispatcher,
+    FindShardQueue,
+    MockFindTransport,
+    build_find_shards,
+    find_shard_window_ms,
+    record_is_image,
+    shard_windows_for_duration,
+)
 
 
 class DispatcherTests(unittest.TestCase):
@@ -224,6 +231,42 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(
             [(shard.scan_start_ms, shard.scan_end_ms) for shard in shards],
             [(0, 120_000), (119_000, 239_000), (238_000, 300_000)],
+        )
+
+    def test_build_find_shards_uses_single_window_for_image(self) -> None:
+        shards = build_find_shards(
+            job_id="job-1",
+            customer_id="cust-1",
+            lane=FIND_INTERACTIVE_LANE,
+            priority=100,
+            query_id="qry-1",
+            query_text="match",
+            records=[
+                ManifestRecord(
+                    sample_id=7,
+                    location="s3://bucket/frame.jpg",
+                    byte_offset=None,
+                    byte_length=None,
+                    decode_hint="mx8:vision:imagefolder;label_id=3",
+                )
+            ],
+            access_resolver=PassthroughSourceAccessResolver(),
+        )
+
+        self.assertEqual(len(shards), 1)
+        self.assertEqual((shards[0].scan_start_ms, shards[0].scan_end_ms), (0, 1))
+
+    def test_record_is_image_detects_image_records(self) -> None:
+        self.assertTrue(
+            record_is_image(
+                ManifestRecord(
+                    sample_id=0,
+                    location="s3://bucket/frame.webp",
+                    byte_offset=None,
+                    byte_length=None,
+                    decode_hint=None,
+                )
+            )
         )
 
     def test_dispatcher_can_restart_after_stop(self) -> None:

@@ -644,7 +644,9 @@ def build_find_shards(
     created_at_ms = int(time() * 1000)
     shard_index = 0
     for record in records:
-        if record.segment_start_ms is not None and record.segment_end_ms is not None:
+        if record_is_image(record):
+            windows = [(0, 1)]
+        elif record.segment_start_ms is not None and record.segment_end_ms is not None:
             windows = [(record.segment_start_ms, record.segment_end_ms)]
         else:
             duration_ms = max(window_ms, parse_duration_ms(record.decode_hint))
@@ -723,6 +725,24 @@ def asset_id_from_location(location: str) -> str:
     path = urlsplit(location).path
     name = Path(path).name
     return name or location.rsplit("/", 1)[-1]
+
+
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
+}
+
+
+def record_is_image(record: ManifestRecord) -> bool:
+    hint = (record.decode_hint or "").strip().lower()
+    if hint.startswith("mx8:vision:imagefolder;"):
+        return True
+    path = urlsplit(record.location).path.lower()
+    return any(path.endswith(extension) for extension in IMAGE_EXTENSIONS)
 
 
 def _normalize_text(value: str) -> str:

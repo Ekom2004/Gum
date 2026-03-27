@@ -303,9 +303,9 @@ class CreateJobRequest(BaseModel):
         if self.find is not None:
             if self.transforms and not _is_find_compatible_transform_chain(self.transforms):
                 raise ValueError(
-                    "find requires a video-compatible transform chain: "
-                    "video transforms, video.extract_frames followed by image transforms, "
-                    "or video.extract_audio followed by audio transforms"
+                    "find requires a visual-compatible transform chain: "
+                    "image transforms, video transforms, video.extract_frames followed by image "
+                    "transforms, or video.extract_audio followed by audio transforms"
                 )
         return self
 
@@ -315,6 +315,8 @@ def _is_find_compatible_transform_chain(transforms: list[TransformSpec]) -> bool
         return False
 
     transform_types = [transform.type for transform in transforms]
+    if all(transform_type.startswith("image.") for transform_type in transform_types):
+        return True
     head = transform_types[0]
     tail = transform_types[1:]
     if head == "video.extract_frames":
