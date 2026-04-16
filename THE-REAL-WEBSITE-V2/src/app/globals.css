@@ -7,15 +7,86 @@
   --color-foreground: var(--color-white);
 }
 
+:root {
+  --gum-paper: #ece8dd;
+  --gum-paper-hover: #e3ded1;
+  --gum-ink: #09090b;
+  --gum-accent: #f1d58a;
+  --gum-accent-strong: #f1d58a;
+  --gum-accent-soft: rgba(241, 213, 138, 0.16);
+}
+
 html,
 body {
   max-width: 100vw;
   overflow-x: hidden;
-  background-color: #09090b;
+  background-color: #000000;
   color: #fff;
+  font-family: var(--font-body);
 }
 
 ::selection {
-  background: #27272a; /* zinc-800 */
+  background: #27272a;
   color: #fff;
+}
+
+.gum-primary {
+  background: var(--gum-paper);
+  color: var(--gum-ink);
+}
+
+.gum-primary:hover {
+  background: var(--gum-paper-hover);
+}
+
+.gum-paper-text {
+  color: var(--gum-paper);
+}
+
+.gum-broken-divider {
+  height: 25px;
+  opacity: 0.8;
+  background-image:
+    linear-gradient(to right, rgba(63, 63, 70, 0.75) 0 10px, transparent 10px 24px),
+    linear-gradient(to bottom, rgba(63, 63, 70, 0.75) 0 10px, transparent 10px 24px),
+    linear-gradient(to bottom, rgba(63, 63, 70, 0.75) 0 10px, transparent 10px 24px);
+  background-size: 24px 1px, 1px 24px, 1px 24px;
+  background-position: left 12px top, left top, right top;
+  background-repeat: repeat-x, no-repeat, no-repeat;
+}
+
+.gum-code-surface {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.gum-code-surface [class*="text-[#c586c0]"] {
+  color: #d2a8ff !important;
+}
+
+.gum-code-surface [class*="text-[#9cdcfe]"] {
+  color: #8ed6ff !important;
+}
+
+.gum-code-surface [class*="text-[#dcdcaa]"] {
+  color: var(--gum-accent) !important;
+}
+
+.gum-code-surface [class*="text-[#ce9178]"] {
+  color: #f4ae84 !important;
+}
+
+.gum-code-surface [class*="text-[#b5cea8]"] {
+  color: #b8df8e !important;
+}
+
+.gum-code-surface [class*="text-[#4ec9b0]"] {
+  color: #64d7c4 !important;
+}
+
+.gum-code-line {
+  min-height: 1.9rem;
+}
+
+.gum-code-gutter {
+  color: #52525b !important;
 }
