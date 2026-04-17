@@ -6,18 +6,7 @@ import { UseCasesPanel } from "../components/use-cases-panel";
 export default function Home() {
   return (
     <div className="relative min-h-screen overflow-hidden bg-black font-sans text-zinc-300 selection:bg-zinc-200 selection:text-zinc-950">
-      <main className="relative z-10 mx-auto flex w-full max-w-[1360px] flex-col px-6 pt-24 pb-24 lg:px-8">
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-6 hidden rounded-sm opacity-80 lg:block"
-          style={{
-            backgroundImage:
-              "linear-gradient(to right, rgba(63,63,70,0.75) 0 10px, transparent 10px 24px), linear-gradient(to right, rgba(63,63,70,0.75) 0 10px, transparent 10px 24px), linear-gradient(to bottom, rgba(63,63,70,0.75) 0 10px, transparent 10px 24px), linear-gradient(to bottom, rgba(63,63,70,0.75) 0 10px, transparent 10px 24px)",
-            backgroundSize: "24px 1px, 24px 1px, 1px 24px, 1px 24px",
-            backgroundPosition: "top left, bottom left, top left, top right",
-            backgroundRepeat: "repeat-x, repeat-x, repeat-y, repeat-y",
-          }}
-        />
+      <main className="relative z-10 mx-auto flex w-full max-w-[1360px] flex-col px-6 pt-28 pb-24 lg:px-8">
         <SiteHeader current="home" />
 
         <section className="relative mt-6">
@@ -29,12 +18,12 @@ export default function Home() {
                   Early access open
                 </div>
                 <h1 className="max-w-[15.5ch] font-[family:var(--font-heading)] text-4xl font-bold leading-[1.01] tracking-[-0.03em] gum-paper-text md:text-6xl xl:text-[4.65rem]">
-                  Write functions that don&apos;t break in production.
+                  Deploy production functions on Gum.
                 </h1>
 
                 <p className="max-w-xl text-base leading-relaxed text-zinc-400 md:text-[1.05rem]">
                   Retries, timeouts, rate limits, concurrency, and scheduling built in. Write the
-                  function. Let Gum manage it.
+                  function. Gum runs it for you.
                 </p>
 
                 <div className="mt-2 flex flex-wrap items-center justify-center gap-3 lg:justify-start">
@@ -45,6 +34,20 @@ export default function Home() {
                     </span>
                   </button>
                 </div>
+                <div className="gum-meta-grid mt-4">
+                  <div className="gum-meta-cell">
+                    <span className="gum-meta-label">Compute</span>
+                    <span className="gum-meta-value">Runs on Gum infrastructure</span>
+                  </div>
+                  <div className="gum-meta-cell">
+                    <span className="gum-meta-label">Scaling</span>
+                    <span className="gum-meta-value">Autoscaled with demand</span>
+                  </div>
+                  <div className="gum-meta-cell">
+                    <span className="gum-meta-label">Execution</span>
+                    <span className="gum-meta-value">Enqueue or schedule</span>
+                  </div>
+                </div>
               </div>
               <div className="flex w-full justify-center lg:justify-end">
                 <HeroCodePanel />
@@ -53,21 +56,21 @@ export default function Home() {
           </div>
         </section>
 
-        <div aria-hidden="true" className="gum-broken-divider mt-16" />
+        <div aria-hidden="true" className="gum-section-divider mt-16" />
 
         <section className="mt-18">
           <div className="mx-auto flex w-full justify-center px-6 py-10 lg:px-8 lg:py-12">
             <div className="grid w-full max-w-[1200px] gap-10 lg:w-fit lg:grid-cols-[540px_620px] lg:gap-10">
-              <div className="w-full max-w-[980px] lg:col-span-2">
+              <div className="gum-module w-full max-w-[980px] px-6 py-6 lg:col-span-2 lg:px-8 lg:py-8">
                 <span className="block text-[11px] font-medium uppercase tracking-[0.22em] text-zinc-500">
                   Use Cases
                 </span>
-                <div className="mt-4 max-w-3xl">
-                  <h2 className="gum-paper-text font-[family:var(--font-heading)] text-3xl font-bold leading-tight tracking-tight md:text-5xl">
-                    One job model for the work every product ends up needing.
+                <div className="mt-4 max-w-[36rem]">
+                  <h2 className="gum-paper-text font-[family:var(--font-heading)] text-3xl font-bold leading-[1.04] tracking-tight md:text-5xl">
+                    Production work Gum handles.
                   </h2>
                 </div>
-                <div className="mt-8 w-full">
+                <div className="mt-8 w-full border-t border-zinc-900/90 pt-7">
                   <UseCasesPanel />
                 </div>
               </div>
@@ -75,12 +78,12 @@ export default function Home() {
           </div>
         </section>
 
-        <div aria-hidden="true" className="gum-broken-divider mt-16" />
+        <div aria-hidden="true" className="gum-section-divider mt-16" />
 
         <section className="mt-18">
           <div className="mx-auto flex w-full justify-center px-6 py-10 lg:px-8 lg:py-12">
             <div className="grid w-full max-w-[1200px] gap-10 lg:w-fit lg:grid-cols-[540px_620px] lg:gap-10">
-              <div className="w-full max-w-[980px] lg:col-span-2">
+              <div className="gum-module w-full max-w-[980px] px-6 py-6 lg:col-span-2 lg:px-8 lg:py-8">
                 <h2 className="gum-paper-text max-w-[14ch] font-[family:var(--font-heading)] text-3xl font-bold leading-[1.02] tracking-tight md:text-[2.75rem]">
                   Stop babysitting job infrastructure.
                 </h2>

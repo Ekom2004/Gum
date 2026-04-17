@@ -1,35 +1,26 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 type UseCase = {
-  id: "webhooks" | "crm" | "emails" | "uploads" | "rate_limited";
+  id: "exports" | "uploads" | "scheduled" | "rate_limited";
+  tabLabel: string;
   label: string;
   description: string;
-  note: string;
-  runtimeLabel: string;
-  runtimeSummary: string;
-  logLine: string;
   lines: ReactNode[];
 };
 
 const useCases: UseCase[] = [
   {
-    id: "webhooks",
-    label: "Retry failed webhooks",
-    description: "Catch flaky downstream calls and let Gum retry failed webhook delivery.",
-    note: "Retries happen on the job, not in a retry table you maintain yourself.",
-    runtimeLabel: "Recovered on retry",
-    runtimeSummary: "Attempt 1 failed with 503, attempt 2 delivered successfully.",
-    logLine: "POST partner.acme.com/webhooks -> 200 OK after retry",
+    id: "exports",
+    tabLabel: "Heavy exports",
+    label: "Run heavy exports without blocking the app",
+    description: "Move CSV and report generation off the request path and let Gum own the runtime.",
     lines: [
       <>
         <span className="text-[#c586c0]">import</span>{" "}
         <span className="text-[#9cdcfe]">gum</span>
-      </>,
-      <>
-        <span className="text-[#c586c0]">import</span>{" "}
-        <span className="text-[#9cdcfe]">httpx</span>
       </>,
       "",
       <>
@@ -37,73 +28,75 @@ const useCases: UseCase[] = [
         <span className="text-zinc-300">(</span>
         <span className="text-[#9cdcfe]">retries</span>
         <span className="text-zinc-500">=</span>
-        <span className="text-[#b5cea8]">5</span>
+        <span className="text-[#b5cea8]">2</span>
         <span className="text-zinc-300">,</span>
         <span className="text-[#9cdcfe]">timeout</span>
         <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;2m&quot;</span>
+        <span className="text-[#ce9178]">&quot;2h&quot;</span>
+        <span className="text-zinc-300">,</span>
+        <span className="text-[#9cdcfe]">concurrency</span>
+        <span className="text-zinc-500">=</span>
+        <span className="text-[#b5cea8]">1</span>
         <span className="text-zinc-300">)</span>
       </>,
       <>
         <span className="text-[#c586c0]">def</span>{" "}
-        <span className="text-[#dcdcaa]">deliver_webhook</span>
+        <span className="text-[#dcdcaa]">export_workspace</span>
         <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">event_id</span>
+        <span className="text-[#9cdcfe]">workspace_id</span>
         <span className="text-zinc-300">: </span>
         <span className="text-[#4ec9b0]">str</span>
         <span className="text-zinc-300">):</span>
       </>,
       <>
         {"    "}
-        <span className="text-[#9cdcfe]">payload</span>
+        <span className="text-[#9cdcfe]">rows</span>
         <span className="text-zinc-500">=</span>
-        <span className="text-[#dcdcaa]">load_event_payload</span>
+        <span className="text-[#dcdcaa]">load_workspace_rows</span>
         <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">event_id</span>
+        <span className="text-[#9cdcfe]">workspace_id</span>
         <span className="text-zinc-300">)</span>
       </>,
       <>
         {"    "}
-        <span className="text-[#9cdcfe]">httpx</span>
-        <span className="text-zinc-300">.</span>
-        <span className="text-[#dcdcaa]">post</span>
+        <span className="text-[#9cdcfe]">file_url</span>
+        <span className="text-zinc-500">=</span>
+        <span className="text-[#dcdcaa]">build_csv_export</span>
         <span className="text-zinc-300">(</span>
-        <span className="text-[#ce9178]">&quot;https://partner.acme.com/webhooks&quot;</span>
+        <span className="text-[#9cdcfe]">rows</span>
+        <span className="text-zinc-300">)</span>
+      </>,
+      <>
+        {"    "}
+        <span className="text-[#dcdcaa]">mark_export_ready</span>
+        <span className="text-zinc-300">(</span>
+        <span className="text-[#9cdcfe]">workspace_id</span>
         <span className="text-zinc-300">, </span>
-        <span className="text-[#9cdcfe]">json</span>
-        <span className="text-zinc-500">=</span>
-        <span className="text-[#9cdcfe]">payload</span>
+        <span className="text-[#9cdcfe]">file_url</span>
         <span className="text-zinc-300">)</span>
       </>,
       "",
       <>
-        <span className="text-[#dcdcaa]">deliver_webhook</span>
+        <span className="text-[#dcdcaa]">export_workspace</span>
         <span className="text-zinc-300">.</span>
         <span className="text-[#dcdcaa]">enqueue</span>
         <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">event_id</span>
+        <span className="text-[#9cdcfe]">workspace_id</span>
         <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;evt_123&quot;</span>
+        <span className="text-[#ce9178]">&quot;ws_123&quot;</span>
         <span className="text-zinc-300">)</span>
       </>,
     ],
   },
   {
-    id: "crm",
-    label: "Sync new signups to a CRM",
-    description: "Push signup events into HubSpot or Salesforce without owning worker glue.",
-    note: "A normal enqueue-on-signup job.",
-    runtimeLabel: "Queued from signup",
-    runtimeSummary: "The app enqueues once, Gum handles the rest in the background.",
-    logLine: "upserted usr_123 -> lifecycle_stage=lead",
+    id: "uploads",
+    tabLabel: "File processing",
+    label: "Process uploads in the background",
+    description: "Run file-heavy work off the request path with bounded concurrency and long timeouts.",
     lines: [
       <>
         <span className="text-[#c586c0]">import</span>{" "}
         <span className="text-[#9cdcfe]">gum</span>
-      </>,
-      <>
-        <span className="text-[#c586c0]">import</span>{" "}
-        <span className="text-[#9cdcfe]">hubspot</span>
       </>,
       "",
       <>
@@ -111,69 +104,65 @@ const useCases: UseCase[] = [
         <span className="text-zinc-300">(</span>
         <span className="text-[#9cdcfe]">retries</span>
         <span className="text-zinc-500">=</span>
-        <span className="text-[#b5cea8]">8</span>
+        <span className="text-[#b5cea8]">3</span>
         <span className="text-zinc-300">,</span>
         <span className="text-[#9cdcfe]">timeout</span>
         <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;15m&quot;</span>
+        <span className="text-[#ce9178]">&quot;30m&quot;</span>
+        <span className="text-zinc-300">,</span>
+        <span className="text-[#9cdcfe]">concurrency</span>
+        <span className="text-zinc-500">=</span>
+        <span className="text-[#b5cea8]">2</span>
         <span className="text-zinc-300">)</span>
       </>,
       <>
         <span className="text-[#c586c0]">def</span>{" "}
-        <span className="text-[#dcdcaa]">sync_signup</span>
+        <span className="text-[#dcdcaa]">process_upload</span>
         <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">user_id</span>
+        <span className="text-[#9cdcfe]">upload_id</span>
         <span className="text-zinc-300">: </span>
         <span className="text-[#4ec9b0]">str</span>
         <span className="text-zinc-300">):</span>
       </>,
       <>
         {"    "}
-        <span className="text-[#9cdcfe]">hubspot</span>
-        <span className="text-zinc-300">.</span>
-        <span className="text-[#dcdcaa]">create_or_update_contact</span>
+        <span className="text-[#dcdcaa]">extract_text</span>
         <span className="text-zinc-300">(</span>
+        <span className="text-[#9cdcfe]">upload_id</span>
+        <span className="text-zinc-300">)</span>
       </>,
       <>
-        {"        "}
-        <span className="text-[#9cdcfe]">user_id</span>
-        <span className="text-zinc-300">,</span>
+        {"    "}
+        <span className="text-[#dcdcaa]">generate_preview</span>
+        <span className="text-zinc-300">(</span>
+        <span className="text-[#9cdcfe]">upload_id</span>
+        <span className="text-zinc-300">)</span>
       </>,
       <>
-        {"        "}
-        <span className="text-[#9cdcfe]">lifecycle_stage</span>
-        <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;lead&quot;</span>
-        <span className="text-zinc-300">,</span>
-      </>,
-      <>
-        {"        "}
-        <span className="text-[#9cdcfe]">source</span>
-        <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;signup&quot;</span>
+        {"    "}
+        <span className="text-[#dcdcaa]">store_search_chunks</span>
+        <span className="text-zinc-300">(</span>
+        <span className="text-[#9cdcfe]">upload_id</span>
         <span className="text-zinc-300">)</span>
       </>,
       "",
       <>
-        <span className="text-[#dcdcaa]">sync_signup</span>
+        <span className="text-[#dcdcaa]">process_upload</span>
         <span className="text-zinc-300">.</span>
         <span className="text-[#dcdcaa]">enqueue</span>
         <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">user_id</span>
+        <span className="text-[#9cdcfe]">upload_id</span>
         <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;usr_123&quot;</span>
+        <span className="text-[#ce9178]">&quot;upl_123&quot;</span>
         <span className="text-zinc-300">)</span>
       </>,
     ],
   },
   {
-    id: "emails",
-    label: "Send emails later or on a schedule",
-    description: "Queue follow-ups now or let Gum run lifecycle emails on a schedule.",
-    note: "Scheduled jobs are built in.",
-    runtimeLabel: "Scheduled automatically",
-    runtimeSummary: "No cron glue, no separate scheduler config in your app.",
-    logLine: "scheduled run fired at 2026-04-15 09:00 UTC",
+    id: "scheduled",
+    tabLabel: "Scheduled jobs",
+    label: "Run scheduled work without cron glue",
+    description: "Put lifecycle jobs on a schedule directly in code and let Gum fire them on time.",
     lines: [
       <>
         <span className="text-[#c586c0]">import</span>{" "}
@@ -240,91 +229,18 @@ const useCases: UseCase[] = [
         <span className="text-[#9cdcfe]">html</span>
         <span className="text-zinc-500">=</span>
         <span className="text-[#ce9178]">&quot;&lt;p&gt;Just checking in on your trial.&lt;/p&gt;&quot;</span>
-        <span className="text-zinc-300">)</span>
-      </>,
-    ],
-  },
-  {
-    id: "uploads",
-    label: "Process uploads in the background",
-    description: "Move file-heavy work off the request path and let Gum own retries and timeouts.",
-    note: "Bounded long-running work is still just a job.",
-    runtimeLabel: "Long-running, still bounded",
-    runtimeSummary: "Heavy file work moves off the request path without running forever.",
-    logLine: "generated preview and stored search chunks for upl_123",
-    lines: [
-      <>
-        <span className="text-[#c586c0]">import</span>{" "}
-        <span className="text-[#9cdcfe]">gum</span>
-      </>,
-      "",
-      <>
-        <span className="text-[#dcdcaa]">@gum.job</span>
-        <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">retries</span>
-        <span className="text-zinc-500">=</span>
-        <span className="text-[#b5cea8]">3</span>
-        <span className="text-zinc-300">,</span>
-        <span className="text-[#9cdcfe]">timeout</span>
-        <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;20m&quot;</span>
-        <span className="text-zinc-300">,</span>
-        <span className="text-[#9cdcfe]">concurrency</span>
-        <span className="text-zinc-500">=</span>
-        <span className="text-[#b5cea8]">4</span>
-        <span className="text-zinc-300">)</span>
-      </>,
-      <>
-        <span className="text-[#c586c0]">def</span>{" "}
-        <span className="text-[#dcdcaa]">process_upload</span>
-        <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">upload_id</span>
-        <span className="text-zinc-300">: </span>
-        <span className="text-[#4ec9b0]">str</span>
-        <span className="text-zinc-300">):</span>
       </>,
       <>
         {"    "}
-        <span className="text-[#dcdcaa]">extract_text</span>
-        <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">upload_id</span>
-        <span className="text-zinc-300">)</span>
-      </>,
-      <>
-        {"    "}
-        <span className="text-[#dcdcaa]">generate_preview</span>
-        <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">upload_id</span>
-        <span className="text-zinc-300">)</span>
-      </>,
-      <>
-        {"    "}
-        <span className="text-[#dcdcaa]">store_search_chunks</span>
-        <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">upload_id</span>
-        <span className="text-zinc-300">)</span>
-      </>,
-      "",
-      <>
-        <span className="text-[#dcdcaa]">process_upload</span>
-        <span className="text-zinc-300">.</span>
-        <span className="text-[#dcdcaa]">enqueue</span>
-        <span className="text-zinc-300">(</span>
-        <span className="text-[#9cdcfe]">upload_id</span>
-        <span className="text-zinc-500">=</span>
-        <span className="text-[#ce9178]">&quot;upl_123&quot;</span>
         <span className="text-zinc-300">)</span>
       </>,
     ],
   },
   {
     id: "rate_limited",
+    tabLabel: "Rate-limited APIs",
     label: "Call rate-limited APIs safely",
     description: "Keep third-party APIs under control with rate limits and bounded concurrency.",
-    note: "One of Gum's strongest operational controls.",
-    runtimeLabel: "Held under provider limits",
-    runtimeSummary: "Gum paces execution so one burst does not melt the dependency.",
-    logLine: "holding steady at 20 requests/minute across queued runs",
     lines: [
       <>
         <span className="text-[#c586c0]">import</span>{" "}
@@ -408,53 +324,92 @@ const useCases: UseCase[] = [
 export function UseCasesPanel() {
   const [activeId, setActiveId] = useState<UseCase["id"]>("webhooks");
   const active = useCases.find((item) => item.id === activeId) ?? useCases[0];
+  const tabRefs = useRef<Partial<Record<UseCase["id"], HTMLButtonElement | null>>>({});
+
+  useEffect(() => {
+    tabRefs.current[activeId]?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+      inline: "center",
+    });
+  }, [activeId]);
 
   return (
-    <div className="grid w-full max-w-[980px] gap-8 lg:grid-cols-[272px_minmax(0,1fr)] lg:items-stretch lg:gap-8">
-      <div className="flex flex-col pt-1 lg:min-h-[408px]">
-        {useCases.map((item) => {
-          const isActive = item.id === active.id;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setActiveId(item.id)}
-              className={`flex-1 border-l px-0 py-3 text-left transition-colors ${
-                isActive
-                  ? "border-zinc-100 bg-zinc-950/55 text-zinc-100"
-                  : "border-zinc-900 text-zinc-500 hover:border-zinc-700 hover:text-zinc-300"
-              }`}
-            >
-              <div
-                className={`pl-5 pr-4 text-[15px] leading-[1.45] tracking-[-0.01em] ${
-                  isActive ? "font-semibold" : "font-medium"
-                }`}
-              >
-                {item.label}
-              </div>
-            </button>
-          );
-        })}
-      </div>
-
-      <div className="w-full max-w-[640px]">
-        <div className="mb-4 text-[11px] font-medium uppercase tracking-[0.18em] text-zinc-500">
-          {active.label}
-        </div>
-        <p className="mb-5 max-w-xl text-sm leading-relaxed text-zinc-400">{active.description}</p>
-        <div className="gum-code-surface relative w-full overflow-hidden rounded-sm border border-zinc-800 bg-black text-left">
-          <div className="min-h-[300px] bg-black px-4 py-5 font-mono text-[13px] leading-7 text-[#e4e4e7] md:text-sm text-left">
-            <div className="space-y-0.5">
-              {active.lines.map((line, index) => (
-                <div key={`${active.id}-${index}`} className="gum-code-line grid grid-cols-[28px_minmax(0,1fr)] gap-3">
-                  <span className="gum-code-gutter select-none text-right text-xs">{index + 1}</span>
-                  <div className="text-left">{line || <span>&nbsp;</span>}</div>
-                </div>
-              ))}
-            </div>
+    <div className="w-full max-w-[980px]">
+      <div className="relative">
+        <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-8 bg-gradient-to-r from-[#09090b] to-transparent lg:hidden" />
+        <div className="pointer-events-none absolute inset-y-0 right-0 z-10 w-8 bg-gradient-to-l from-[#09090b] to-transparent lg:hidden" />
+        <div className="gum-scrollbar-none overflow-x-auto scroll-smooth px-1 lg:overflow-visible lg:px-0">
+          <div className="flex min-w-max gap-4 border-b border-zinc-900/90 pb-4 lg:min-w-0 lg:grid lg:grid-cols-4 lg:gap-4">
+            {useCases.map((item) => {
+              const isActive = item.id === active.id;
+              return (
+                <button
+                  key={item.id}
+                  ref={(node) => {
+                    tabRefs.current[item.id] = node;
+                  }}
+                  type="button"
+                  onClick={() => setActiveId(item.id)}
+                  className={`relative snap-start whitespace-nowrap border-b pb-2 text-left text-[13px] font-medium tracking-[-0.01em] transition-colors lg:w-full ${
+                    isActive
+                      ? "border-zinc-300 text-zinc-100"
+                      : "border-transparent text-zinc-500 hover:text-zinc-300"
+                  }`}
+                >
+                  {item.tabLabel}
+                  {isActive ? (
+                    <motion.span
+                      layoutId="gum-use-case-active-line"
+                      className="absolute inset-x-0 -bottom-px h-px bg-zinc-200"
+                      transition={{ type: "spring", stiffness: 420, damping: 36 }}
+                    />
+                  ) : null}
+                </button>
+              );
+            })}
           </div>
         </div>
       </div>
+
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.div
+          key={active.id}
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -8 }}
+          transition={{ duration: 0.22, ease: "easeOut" }}
+          className="pt-5"
+        >
+          <div>
+            <p className="max-w-[42rem] text-sm leading-relaxed text-zinc-400">
+              {active.description}
+            </p>
+          </div>
+          <motion.div
+            initial={{ opacity: 0.92, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut", delay: 0.03 }}
+            className="gum-code-surface relative mt-5 w-full overflow-hidden rounded-sm border border-zinc-800 bg-black text-left"
+          >
+            <div className="min-h-[320px] bg-black px-4 py-5 font-mono text-[13px] leading-7 text-[#e4e4e7] md:text-sm text-left">
+              <div className="space-y-0.5">
+                {active.lines.map((line, index) => (
+                  <div
+                    key={`${active.id}-${index}`}
+                    className="gum-code-line grid grid-cols-[28px_minmax(0,1fr)] gap-3"
+                  >
+                    <span className="gum-code-gutter select-none text-right text-xs">
+                      {index + 1}
+                    </span>
+                    <div className="text-left">{line || <span>&nbsp;</span>}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </motion.div>
+        </motion.div>
+      </AnimatePresence>
     </div>
   );
 }
