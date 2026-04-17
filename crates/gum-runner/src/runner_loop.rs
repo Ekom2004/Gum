@@ -58,6 +58,14 @@ pub struct RunnerHeartbeatRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseStateResponse {
+    pub lease_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRunRequest {
     pub runner_id: String,
     pub lease_ttl_secs: u64,

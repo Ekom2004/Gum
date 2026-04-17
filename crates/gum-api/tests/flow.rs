@@ -1,5 +1,5 @@
 use gum_api::routes::{
-    AppendLogRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
+    AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
     RegisterDeployRequest, RegisterRunnerRequest, RegisteredJob, RunnerHeartbeatRequest,
 };
 use gum_api::service;
@@ -298,6 +298,167 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
         second_leased.is_none(),
         "second run should stay queued inside the same rate-limit window"
     );
+}
+
+#[test]
+fn canceling_a_queued_run_marks_it_canceled() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_export".to_string(),
+                name: "export".to_string(),
+                handler_ref: "jobs:export".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 0,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let run = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("enqueue should work");
+
+    let canceled = service::cancel_run(&store, &run.id, CancelRunRequest { reason: None })
+        .expect("cancel should work");
+
+    assert_eq!(canceled.status, RunStatus::Canceled);
+    assert_eq!(canceled.failure_reason.as_deref(), Some("canceled"));
+}
+
+#[test]
+fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_export".to_string(),
+                name: "export".to_string(),
+                handler_ref: "jobs:export".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 0,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+
+    let run = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("run should be leased");
+
+    let cancel_response = service::cancel_run(&store, &run.id, CancelRunRequest { reason: None })
+        .expect("cancel should work");
+    assert_eq!(cancel_response.status, RunStatus::Running);
+    assert_eq!(
+        cancel_response.failure_reason.as_deref(),
+        Some("cancel requested")
+    );
+
+    let lease_state = service::get_lease_state(&store, &leased.lease_id)
+        .expect("lease state should load")
+        .expect("lease should exist");
+    assert!(lease_state.cancel_requested);
+
+    let failure = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Failed,
+            failure_reason: Some("should not be allowed".to_string()),
+        },
+    );
+    assert!(failure
+        .expect_err("non-canceled completion should be rejected")
+        .contains("cancel requested"));
+
+    let canceled = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Canceled,
+            failure_reason: Some("job canceled".to_string()),
+        },
+    )
+    .expect("canceled completion should work");
+    assert_eq!(canceled.status, RunStatus::Canceled);
+    assert_eq!(canceled.failure_reason.as_deref(), Some("job canceled"));
 }
 
 #[test]

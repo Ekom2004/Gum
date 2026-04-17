@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gum_types::AttemptStatus;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::runner_loop::LeasedRun;
 
@@ -18,7 +19,15 @@ pub struct ExecutionOutcome {
 }
 
 pub async fn execute_leased_run(leased: &LeasedRun) -> ExecutionOutcome {
-    match execute_leased_run_inner(leased).await {
+    let (_, cancel_rx) = watch::channel(false);
+    execute_leased_run_with_cancel(leased, cancel_rx).await
+}
+
+pub async fn execute_leased_run_with_cancel(
+    leased: &LeasedRun,
+    cancel_rx: watch::Receiver<bool>,
+) -> ExecutionOutcome {
+    match execute_leased_run_inner(leased, cancel_rx).await {
         Ok(outcome) => outcome,
         Err(message) => ExecutionOutcome {
             status: AttemptStatus::Failed,
@@ -30,7 +39,10 @@ pub async fn execute_leased_run(leased: &LeasedRun) -> ExecutionOutcome {
     }
 }
 
-async fn execute_leased_run_inner(leased: &LeasedRun) -> Result<ExecutionOutcome, String> {
+async fn execute_leased_run_inner(
+    leased: &LeasedRun,
+    mut cancel_rx: watch::Receiver<bool>,
+) -> Result<ExecutionOutcome, String> {
     let bundle_path = file_bundle_path(&leased.bundle_url)?;
     let extract_dir = prepare_extract_dir(&leased.run_id, &leased.attempt_id)?;
     extract_bundle(&bundle_path, &extract_dir).await?;
@@ -73,61 +85,68 @@ async fn execute_leased_run_inner(leased: &LeasedRun) -> Result<ExecutionOutcome
     let stdout_task = tokio::spawn(read_output(stdout));
     let stderr_task = tokio::spawn(read_output(stderr));
 
-    let wait_result = timeout(
-        Duration::from_secs(u64::from(leased.timeout_secs)),
-        child.wait(),
-    )
-    .await;
-    let timed_out = wait_result.is_err();
-    let status = match wait_result {
-        Ok(result) => {
-            result.map_err(|error| format!("failed waiting for python handler: {error}"))?
-        }
-        Err(_) => {
-            child
-                .kill()
-                .await
-                .map_err(|error| format!("failed to kill timed out python handler: {error}"))?;
-            child
-                .wait()
-                .await
-                .map_err(|error| format!("failed to reap timed out python handler: {error}"))?
+    let deadline = Instant::now() + Duration::from_secs(u64::from(leased.timeout_secs));
+    let wait_result = loop {
+        tokio::select! {
+            result = child.wait() => {
+                let status = result
+                    .map_err(|error| format!("failed waiting for python handler: {error}"))?;
+                break WaitResult::Exited(status);
+            }
+            _ = sleep_until(deadline) => {
+                kill_child(&mut child, "timed out").await?;
+                break WaitResult::TimedOut;
+            }
+            changed = cancel_rx.changed() => {
+                match changed {
+                    Ok(()) => {
+                        if *cancel_rx.borrow() {
+                            kill_child(&mut child, "canceled").await?;
+                            break WaitResult::Canceled;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
         }
     };
 
     let stdout = join_output(stdout_task, "stdout").await?;
     let stderr = join_output(stderr_task, "stderr").await?;
 
-    if timed_out {
-        return Ok(ExecutionOutcome {
+    match wait_result {
+        WaitResult::TimedOut => Ok(ExecutionOutcome {
             status: AttemptStatus::TimedOut,
             failure_reason: Some(format!("job timed out after {}s", leased.timeout_secs)),
             stdout,
             stderr,
             app_message: None,
-        });
-    }
-
-    if status.success() {
-        return Ok(ExecutionOutcome {
+        }),
+        WaitResult::Canceled => Ok(ExecutionOutcome {
+            status: AttemptStatus::Canceled,
+            failure_reason: Some("job canceled".to_string()),
+            stdout,
+            stderr,
+            app_message: None,
+        }),
+        WaitResult::Exited(status) if status.success() => Ok(ExecutionOutcome {
             status: AttemptStatus::Succeeded,
             failure_reason: None,
             stdout,
             stderr,
             app_message: None,
-        });
-    }
-
-    Ok(ExecutionOutcome {
-        status: AttemptStatus::Failed,
-        failure_reason: Some(match status.code() {
-            Some(code) => format!("python handler exited with status code {code}"),
-            None => "python handler exited without a status code".to_string(),
         }),
-        stdout,
-        stderr,
-        app_message: None,
-    })
+        WaitResult::Exited(status) => Ok(ExecutionOutcome {
+            status: AttemptStatus::Failed,
+            failure_reason: Some(match status.code() {
+                Some(code) => format!("python handler exited with status code {code}"),
+                None => "python handler exited without a status code".to_string(),
+            }),
+            stdout,
+            stderr,
+            app_message: None,
+        }),
+    }
 }
 
 async fn read_output<T>(mut stream: T) -> Result<String, String>
@@ -149,6 +168,22 @@ async fn join_output(
     handle
         .await
         .map_err(|error| format!("failed to join {stream_name} reader task: {error}"))?
+}
+
+async fn kill_child(child: &mut tokio::process::Child, reason: &str) -> Result<(), String> {
+    child
+        .kill()
+        .await
+        .map_err(|error| format!("failed to kill {reason} python handler: {error}"))?;
+    child
+        .wait()
+        .await
+        .map_err(|error| format!("failed to reap {reason} python handler: {error}"))?;
+    Ok(())
+}
+
+async fn sleep_until(deadline: Instant) {
+    tokio::time::sleep_until(deadline).await;
 }
 
 fn file_bundle_path(bundle_url: &str) -> Result<PathBuf, String> {
@@ -218,4 +253,10 @@ fn python_bin() -> String {
     }
 
     "python3".to_string()
+}
+
+enum WaitResult {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+    Canceled,
 }

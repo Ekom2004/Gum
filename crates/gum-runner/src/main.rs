@@ -1,13 +1,12 @@
 use std::time::Duration;
 
-use gum_runner::execution::execute_leased_run;
 use gum_runner::runner_loop::{
-    AppendLogRequest, CompleteAttemptRequest, LeaseRunRequest, LeasedRun, RegisterRunnerRequest,
-    RunnerHeartbeatRequest, RunnerLoopConfig,
+    AppendLogRequest, CompleteAttemptRequest, LeaseRunRequest, LeaseStateResponse, LeasedRun,
+    RegisterRunnerRequest, RunnerHeartbeatRequest, RunnerLoopConfig,
 };
 use gum_types::AttemptStatus;
 use reqwest::StatusCode;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,17 +33,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match lease_once(&client, &base_url, &config).await {
             Ok(Some(leased)) => {
                 tracing::info!(run_id = %leased.run_id, attempt_id = %leased.attempt_id, "leased run");
-                let (stop_tx, stop_rx) = oneshot::channel();
+                let (heartbeat_stop_tx, heartbeat_stop_rx) = oneshot::channel();
+                let (cancel_stop_tx, cancel_stop_rx) = oneshot::channel();
+                let (cancel_tx, cancel_rx) = watch::channel(false);
                 let heartbeat_task = tokio::spawn(heartbeat_loop(
                     client.clone(),
                     base_url.clone(),
                     config.clone(),
                     vec![leased.lease_id.clone()],
-                    stop_rx,
+                    heartbeat_stop_rx,
                 ));
-                let outcome = execute_leased_run(&leased).await;
-                let _ = stop_tx.send(());
+                let cancel_task = tokio::spawn(cancel_poll_loop(
+                    client.clone(),
+                    base_url.clone(),
+                    leased.lease_id.clone(),
+                    cancel_tx,
+                    cancel_stop_rx,
+                ));
+                let outcome =
+                    gum_runner::execution::execute_leased_run_with_cancel(&leased, cancel_rx).await;
+                let _ = heartbeat_stop_tx.send(());
+                let _ = cancel_stop_tx.send(());
                 let _ = heartbeat_task.await;
+                let _ = cancel_task.await;
                 append_logs(&client, &base_url, &leased, "stdout", &outcome.stdout).await?;
                 append_logs(&client, &base_url, &leased, "stderr", &outcome.stderr).await?;
                 if let Some(message) = &outcome.app_message {
@@ -173,6 +184,34 @@ async fn heartbeat_loop(
     }
 }
 
+async fn cancel_poll_loop(
+    client: reqwest::Client,
+    base_url: String,
+    lease_id: String,
+    cancel_tx: watch::Sender<bool>,
+    mut stop_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                match lease_state_once(&client, &base_url, &lease_id).await {
+                    Ok(Some(state)) if state.cancel_requested => {
+                        let _ = cancel_tx.send(true);
+                        break;
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(lease_id = %lease_id, "lease state poll failed: {}", error);
+                    }
+                }
+            }
+            _ = &mut stop_rx => {
+                break;
+            }
+        }
+    }
+}
+
 async fn heartbeat_once(
     client: &reqwest::Client,
     base_url: &str,
@@ -205,6 +244,40 @@ async fn heartbeat_once(
         .await
         .map_err(|error| format!("failed to read heartbeat error body: {error}"))?;
     Err(format!("runner heartbeat failed: {body}"))
+}
+
+async fn lease_state_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    lease_id: &str,
+) -> Result<Option<LeaseStateResponse>, String> {
+    let response = client
+        .get(format!(
+            "{}/internal/leases/{}",
+            base_url.trim_end_matches('/'),
+            lease_id
+        ))
+        .send()
+        .await
+        .map_err(|error| format!("failed to fetch lease state: {error}"))?;
+
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("failed to read lease state error body: {error}"))?;
+        return Err(format!("lease state request failed: {body}"));
+    }
+
+    response
+        .json::<LeaseStateResponse>()
+        .await
+        .map(Some)
+        .map_err(|error| format!("failed to decode lease state: {error}"))
 }
 
 async fn append_logs(

@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::app_state::AppState;
 use crate::routes::{
-    AppendLogRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
+    AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
     RegisterDeployRequest, RegisterRunnerRequest, RunnerHeartbeatRequest,
 };
 use crate::service;
@@ -17,10 +17,12 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/deploys", post(register_deploy))
         .route("/v1/jobs/:job_id/runs", post(enqueue_run))
         .route("/v1/runs/:run_id", get(get_run))
+        .route("/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/v1/runs/:run_id/replay", post(replay_run))
         .route("/v1/runs/:run_id/logs", get(get_logs))
         .route("/internal/runners/register", post(register_runner))
         .route("/internal/runners/heartbeat", post(heartbeat_runner))
+        .route("/internal/leases/:lease_id", get(get_lease_state))
         .route("/internal/runs/lease", post(lease_run))
         .route(
             "/internal/runs/:run_id/attempts/:attempt_id/logs",
@@ -132,6 +134,18 @@ pub async fn replay_run(
     result.map(Json).map_err(ApiError::from_message)
 }
 
+pub async fn cancel_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(payload): Json<CancelRunRequest>,
+) -> Result<Json<crate::routes::RunResponse>, ApiError> {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || service::cancel_run(&store, &run_id, payload))
+        .await
+        .map_err(|error| ApiError::internal(format!("cancel run task failed: {error}")))?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
 pub async fn get_logs(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -182,6 +196,25 @@ pub async fn heartbeat_runner(
     result
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(ApiError::from_message)
+}
+
+pub async fn get_lease_state(
+    State(state): State<AppState>,
+    Path(lease_id): Path<String>,
+) -> Result<Json<crate::routes::LeaseStateResponse>, ApiError> {
+    let store = state.store.clone();
+    let maybe_state =
+        tokio::task::spawn_blocking(move || service::get_lease_state(&store, &lease_id))
+            .await
+            .map_err(|error| ApiError::internal(format!("get lease state task failed: {error}")))?
+            .map_err(ApiError::from_message)?;
+    match maybe_state {
+        Some(state) => Ok(Json(state)),
+        None => Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "lease not found".to_string(),
+        }),
+    }
 }
 
 pub async fn complete_attempt(

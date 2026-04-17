@@ -6,12 +6,12 @@ use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 use postgres::{Client, NoTls, Row};
 
 use crate::models::{
-    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord, ProjectRecord, RunRecord,
-    RunnerRecord,
+    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LogRecord,
+    ProjectRecord, RunRecord, RunnerRecord,
 };
 use crate::queries::{
-    parse_rate_limit_spec, parse_schedule_interval_ms, CompleteAttemptParams, ControlLeaseParams,
-    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
+    ControlLeaseParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
     RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
 };
 
@@ -20,6 +20,7 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_scheduler.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_runner_liveness.sql");
 const MIGRATION_0004: &str =
     include_str!("../migrations/0004_control_leases_and_compute_classes.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_cancel_revoke.sql");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -51,6 +52,9 @@ impl PostgresStore {
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .batch_execute(MIGRATION_0004)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
+            .batch_execute(MIGRATION_0005)
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .execute(
@@ -355,6 +359,28 @@ impl GumStore for PostgresStore {
         row.map(deploy_from_row).transpose()
     }
 
+    fn get_lease_state(&self, lease_id: &str) -> Result<Option<LeaseStateRecord>, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_opt(
+                "SELECT leases.id AS lease_id,
+                        attempts.id AS attempt_id,
+                        attempts.run_id AS run_id,
+                        (attempts.cancel_requested_at IS NOT NULL OR leases.revoke_requested_at IS NOT NULL) AS cancel_requested
+                 FROM leases
+                 JOIN attempts ON attempts.id = leases.attempt_id
+                 WHERE leases.id = $1",
+                &[&lease_id],
+            )
+            .map_err(|error| format!("failed to load lease state: {error}"))?;
+        Ok(row.map(|row| LeaseStateRecord {
+            lease_id: row.get("lease_id"),
+            run_id: row.get("run_id"),
+            attempt_id: row.get("attempt_id"),
+            cancel_requested: row.get("cancel_requested"),
+        }))
+    }
+
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {
         let mut client = self.connect_client()?;
         let row = client
@@ -590,23 +616,25 @@ impl GumStore for PostgresStore {
         let attempt_row = tx
             .query_one(
                 "INSERT INTO attempts (
-                    id, run_id, attempt_number, status, runner_id, started_at
-                 ) VALUES ($1, $2, $3, 'running', $4, NOW())
+                    id, run_id, attempt_number, status, runner_id, started_at, cancel_requested_at
+                 ) VALUES ($1, $2, $3, 'running', $4, NOW(), NULL)
                  RETURNING *,
                            (EXTRACT(EPOCH FROM started_at) * 1000)::bigint AS started_at_epoch_ms,
-                           (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_at_epoch_ms",
+                           (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_at_epoch_ms,
+                           (EXTRACT(EPOCH FROM cancel_requested_at) * 1000)::bigint AS cancel_requested_at_epoch_ms",
                 &[&attempt_id, &run.id, &attempt_number, &params.runner_id],
             )
             .map_err(|error| format!("failed to insert attempt: {error}"))?;
 
         let lease_row = tx
             .query_one(
-                "INSERT INTO leases (id, attempt_id, runner_id, expires_at)
-                 VALUES ($1, $2, $3, TO_TIMESTAMP($4::double precision / 1000.0))
+                "INSERT INTO leases (id, attempt_id, runner_id, expires_at, revoke_requested_at)
+                 VALUES ($1, $2, $3, TO_TIMESTAMP($4::double precision / 1000.0), NULL)
                  RETURNING id, attempt_id, runner_id,
                            (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint AS expires_at_epoch_ms,
                            NULL::bigint AS acked_at_epoch_ms,
-                           NULL::bigint AS released_at_epoch_ms",
+                           NULL::bigint AS released_at_epoch_ms,
+                           NULL::bigint AS revoke_requested_at_epoch_ms",
                 &[
                     &lease_id,
                     &attempt_id,
@@ -645,7 +673,8 @@ impl GumStore for PostgresStore {
             .query_opt(
                 "SELECT *,
                         (EXTRACT(EPOCH FROM started_at) * 1000)::bigint AS started_at_epoch_ms,
-                        (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_at_epoch_ms
+                        (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_at_epoch_ms,
+                        (EXTRACT(EPOCH FROM cancel_requested_at) * 1000)::bigint AS cancel_requested_at_epoch_ms
                  FROM attempts
                  WHERE id = $1
                  FOR UPDATE",
@@ -657,6 +686,11 @@ impl GumStore for PostgresStore {
 
         if attempt.finished_at_epoch_ms.is_some() || is_terminal_attempt(attempt.status) {
             return Err("attempt already finished".to_string());
+        }
+        if attempt.cancel_requested_at_epoch_ms.is_some()
+            && params.status != AttemptStatus::Canceled
+        {
+            return Err("attempt cancel requested".to_string());
         }
 
         if attempt.runner_id.as_deref() != Some(params.runner_id.as_str()) {
@@ -672,7 +706,8 @@ impl GumStore for PostgresStore {
                  WHERE id = $3
                  RETURNING *,
                            (EXTRACT(EPOCH FROM started_at) * 1000)::bigint AS started_at_epoch_ms,
-                           (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_at_epoch_ms",
+                           (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_at_epoch_ms,
+                           (EXTRACT(EPOCH FROM cancel_requested_at) * 1000)::bigint AS cancel_requested_at_epoch_ms",
                 &[
                     &attempt_status_to_str(params.status),
                     &params.failure_reason,
@@ -754,6 +789,94 @@ impl GumStore for PostgresStore {
             attempt_from_row(updated_attempt_row)?,
             run_from_row(updated_run_row)?,
         ))
+    }
+
+    fn cancel_run(&self, params: CancelRunParams) -> Result<RunRecord, String> {
+        let mut client = self.connect_client()?;
+        let mut tx = client
+            .transaction()
+            .map_err(|error| format!("failed to start cancel transaction: {error}"))?;
+
+        let run_row = tx
+            .query_opt(
+                "SELECT *,
+                        (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms
+                 FROM runs
+                 WHERE id = $1
+                 FOR UPDATE",
+                &[&params.run_id],
+            )
+            .map_err(|error| format!("failed to load run for cancel: {error}"))?
+            .ok_or_else(|| "run not found".to_string())?;
+        let run = run_from_row(run_row)?;
+
+        let updated_run_row = match run.status {
+            RunStatus::Queued => tx
+                .query_one(
+                    "UPDATE runs
+                     SET status = 'canceled',
+                         failure_reason = 'canceled',
+                         finished_at = TO_TIMESTAMP($2::double precision / 1000.0),
+                         updated_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                     WHERE id = $1
+                     RETURNING *,
+                               (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
+                    &[&run.id, &(params.requested_at_epoch_ms as f64)],
+                )
+                .map_err(|error| format!("failed to cancel queued run: {error}"))?,
+            RunStatus::Running => {
+                let attempt_row = tx
+                    .query_opt(
+                        "SELECT id, lease_id
+                         FROM attempts
+                         WHERE run_id = $1
+                           AND status = 'running'
+                         FOR UPDATE",
+                        &[&run.id],
+                    )
+                    .map_err(|error| format!("failed to load running attempt for cancel: {error}"))?
+                    .ok_or_else(|| "running attempt not found".to_string())?;
+                let attempt_id: String = attempt_row.get("id");
+                let lease_id: Option<String> = attempt_row.get("lease_id");
+
+                tx.execute(
+                    "UPDATE attempts
+                     SET cancel_requested_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                     WHERE id = $1",
+                    &[&attempt_id, &(params.requested_at_epoch_ms as f64)],
+                )
+                .map_err(|error| format!("failed to mark attempt cancel requested: {error}"))?;
+
+                if let Some(lease_id) = lease_id {
+                    tx.execute(
+                        "UPDATE leases
+                         SET revoke_requested_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                         WHERE id = $1",
+                        &[&lease_id, &(params.requested_at_epoch_ms as f64)],
+                    )
+                    .map_err(|error| format!("failed to mark lease revoke requested: {error}"))?;
+                }
+
+                tx.query_one(
+                    "UPDATE runs
+                     SET failure_reason = 'cancel requested',
+                         updated_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                     WHERE id = $1
+                     RETURNING *,
+                               (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
+                    &[&run.id, &(params.requested_at_epoch_ms as f64)],
+                )
+                .map_err(|error| format!("failed to mark run cancel requested: {error}"))?
+            }
+            RunStatus::Succeeded
+            | RunStatus::Failed
+            | RunStatus::TimedOut
+            | RunStatus::Canceled => return Err("run already finished".to_string()),
+        };
+
+        tx.commit()
+            .map_err(|error| format!("failed to commit cancel transaction: {error}"))?;
+        run_from_row(updated_run_row)
     }
 
     fn recover_lost_attempts(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String> {
@@ -1034,6 +1157,9 @@ fn attempt_from_row(row: Row) -> Result<AttemptRecord, String> {
     let finished_at_epoch_ms: Option<i64> = row
         .try_get("finished_at_epoch_ms")
         .map_err(|error| format!("attempt row missing finished_at_epoch_ms: {error}"))?;
+    let cancel_requested_at_epoch_ms: Option<i64> = row
+        .try_get("cancel_requested_at_epoch_ms")
+        .map_err(|error| format!("attempt row missing cancel_requested_at_epoch_ms: {error}"))?;
     Ok(AttemptRecord {
         id: row.get("id"),
         run_id: row.get("run_id"),
@@ -1044,10 +1170,14 @@ fn attempt_from_row(row: Row) -> Result<AttemptRecord, String> {
         started_at_epoch_ms,
         finished_at_epoch_ms,
         failure_reason: row.get("failure_reason"),
+        cancel_requested_at_epoch_ms,
     })
 }
 
 fn lease_from_projection_row(row: Row) -> Result<LeaseRecord, String> {
+    let revoke_requested_at_epoch_ms: Option<i64> = row
+        .try_get("revoke_requested_at_epoch_ms")
+        .map_err(|error| format!("lease row missing revoke_requested_at_epoch_ms: {error}"))?;
     Ok(LeaseRecord {
         id: row.get("id"),
         attempt_id: row.get("attempt_id"),
@@ -1055,6 +1185,7 @@ fn lease_from_projection_row(row: Row) -> Result<LeaseRecord, String> {
         expires_at_epoch_ms: row.get("expires_at_epoch_ms"),
         acked_at_epoch_ms: row.get("acked_at_epoch_ms"),
         released_at_epoch_ms: row.get("released_at_epoch_ms"),
+        revoke_requested_at_epoch_ms,
     })
 }
 

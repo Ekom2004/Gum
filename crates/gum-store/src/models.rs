@@ -68,6 +68,7 @@ pub struct AttemptRecord {
     pub started_at_epoch_ms: i64,
     pub finished_at_epoch_ms: Option<i64>,
     pub failure_reason: Option<String>,
+    pub cancel_requested_at_epoch_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +79,7 @@ pub struct LeaseRecord {
     pub expires_at_epoch_ms: i64,
     pub acked_at_epoch_ms: Option<i64>,
     pub released_at_epoch_ms: Option<i64>,
+    pub revoke_requested_at_epoch_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +96,14 @@ pub struct ControlLeaseRecord {
     pub name: String,
     pub holder_id: String,
     pub expires_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseStateRecord {
+    pub lease_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

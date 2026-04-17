@@ -6,12 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 
 use crate::models::{
-    AttemptRecord, ControlLeaseRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord,
-    ProjectRecord, RunRecord, RunnerRecord,
+    AttemptRecord, ControlLeaseRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord,
+    LogRecord, ProjectRecord, RunRecord, RunnerRecord,
 };
 use crate::queries::{
-    parse_rate_limit_spec, parse_schedule_interval_ms, CompleteAttemptParams, ControlLeaseParams,
-    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
+    ControlLeaseParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
     RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
 };
 
@@ -294,6 +294,26 @@ impl GumStore for MemoryStore {
         Ok(state.deploys.get(deploy_id).cloned())
     }
 
+    fn get_lease_state(&self, lease_id: &str) -> Result<Option<LeaseStateRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let Some(lease) = state.leases.get(lease_id) else {
+            return Ok(None);
+        };
+        let Some(attempt) = state.attempts.get(&lease.attempt_id) else {
+            return Ok(None);
+        };
+        Ok(Some(LeaseStateRecord {
+            lease_id: lease.id.clone(),
+            run_id: attempt.run_id.clone(),
+            attempt_id: attempt.id.clone(),
+            cancel_requested: lease.revoke_requested_at_epoch_ms.is_some()
+                || attempt.cancel_requested_at_epoch_ms.is_some(),
+        }))
+    }
+
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {
         let mut state = self
             .state
@@ -463,6 +483,7 @@ impl GumStore for MemoryStore {
             started_at_epoch_ms: now_epoch_ms(),
             finished_at_epoch_ms: None,
             failure_reason: None,
+            cancel_requested_at_epoch_ms: None,
         };
 
         let lease = LeaseRecord {
@@ -472,6 +493,7 @@ impl GumStore for MemoryStore {
             expires_at_epoch_ms: now_epoch_ms() + (params.lease_ttl_secs as i64 * 1000),
             acked_at_epoch_ms: None,
             released_at_epoch_ms: None,
+            revoke_requested_at_epoch_ms: None,
         };
 
         let mut leased_attempt = attempt.clone();
@@ -510,6 +532,11 @@ impl GumStore for MemoryStore {
 
         if attempt.finished_at_epoch_ms.is_some() || is_terminal_attempt(attempt.status) {
             return Err("attempt already finished".to_string());
+        }
+        if attempt.cancel_requested_at_epoch_ms.is_some()
+            && params.status != AttemptStatus::Canceled
+        {
+            return Err("attempt cancel requested".to_string());
         }
 
         if attempt.runner_id.as_deref() != Some(params.runner_id.as_str()) {
@@ -563,6 +590,65 @@ impl GumStore for MemoryStore {
         }
 
         Ok((attempt_snapshot, run.clone()))
+    }
+
+    fn cancel_run(&self, params: CancelRunParams) -> Result<RunRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+
+        let run_status = state
+            .runs
+            .get(&params.run_id)
+            .map(|run| run.status)
+            .ok_or_else(|| "run not found".to_string())?;
+
+        match run_status {
+            RunStatus::Queued => {
+                let run = state
+                    .runs
+                    .get_mut(&params.run_id)
+                    .ok_or_else(|| "run disappeared".to_string())?;
+                run.status = RunStatus::Canceled;
+                run.failure_reason = Some("canceled".to_string());
+                Ok(run.clone())
+            }
+            RunStatus::Running => {
+                let running_attempt_id = state
+                    .attempts
+                    .values()
+                    .find(|attempt| {
+                        attempt.run_id == params.run_id && attempt.status == AttemptStatus::Running
+                    })
+                    .map(|attempt| attempt.id.clone())
+                    .ok_or_else(|| "running attempt not found".to_string())?;
+
+                let attempt = state
+                    .attempts
+                    .get_mut(&running_attempt_id)
+                    .ok_or_else(|| "running attempt disappeared".to_string())?;
+                attempt.cancel_requested_at_epoch_ms = Some(params.requested_at_epoch_ms);
+                let lease_id = attempt.lease_id.clone();
+
+                if let Some(lease_id) = lease_id {
+                    if let Some(lease) = state.leases.get_mut(&lease_id) {
+                        lease.revoke_requested_at_epoch_ms = Some(params.requested_at_epoch_ms);
+                    }
+                }
+
+                let run = state
+                    .runs
+                    .get_mut(&params.run_id)
+                    .ok_or_else(|| "run disappeared".to_string())?;
+                run.failure_reason = Some("cancel requested".to_string());
+                Ok(run.clone())
+            }
+            RunStatus::Succeeded
+            | RunStatus::Failed
+            | RunStatus::TimedOut
+            | RunStatus::Canceled => Err("run already finished".to_string()),
+        }
     }
 
     fn recover_lost_attempts(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String> {

@@ -1,7 +1,8 @@
 use serde_json::Value;
 
 use crate::models::{
-    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord, RunRecord, RunnerRecord,
+    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LogRecord, RunRecord,
+    RunnerRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,12 @@ pub struct CompleteAttemptParams {
     pub failure_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelRunParams {
+    pub run_id: String,
+    pub requested_at_epoch_ms: i64,
+}
+
 pub fn parse_schedule_interval_ms(expr: &str) -> Result<i64, String> {
     if expr.len() < 2 {
         return Err(format!("invalid schedule expression: {expr}"));
@@ -160,6 +167,7 @@ pub trait GumStore {
     fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, String>;
     fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, String>;
     fn get_deploy(&self, deploy_id: &str) -> Result<Option<DeployRecord>, String>;
+    fn get_lease_state(&self, lease_id: &str) -> Result<Option<LeaseStateRecord>, String>;
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String>;
     fn replay_run(&self, params: ReplayRunParams) -> Result<RunRecord, String>;
     fn lease_next_attempt(
@@ -170,6 +178,7 @@ pub trait GumStore {
         &self,
         params: CompleteAttemptParams,
     ) -> Result<(AttemptRecord, RunRecord), String>;
+    fn cancel_run(&self, params: CancelRunParams) -> Result<RunRecord, String>;
     fn recover_lost_attempts(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String>;
     fn tick_schedules(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String>;
     fn append_log(&self, log: LogRecord) -> Result<(), String>;

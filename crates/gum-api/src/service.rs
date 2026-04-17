@@ -1,15 +1,15 @@
 use gum_store::models::LogRecord;
 use gum_store::queries::{
-    CompleteAttemptParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams,
+    CancelRunParams, CompleteAttemptParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams,
     LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams, RegisterRunnerParams,
     ReplayRunParams,
 };
 use gum_types::AttemptStatus;
 
 use crate::routes::{
-    AppendLogRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest, LeaseRunResponse,
-    LogLine, RegisterDeployRequest, RegisterDeployResponse, RegisterRunnerRequest,
-    ReplayRunResponse, RunResponse, RunnerHeartbeatRequest,
+    AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
+    LeaseRunResponse, LeaseStateResponse, LogLine, RegisterDeployRequest, RegisterDeployResponse,
+    RegisterRunnerRequest, ReplayRunResponse, RunResponse, RunnerHeartbeatRequest,
 };
 
 pub fn register_deploy<S: GumStore>(
@@ -170,6 +170,20 @@ pub fn heartbeat_runner<S: GumStore>(
     Ok(())
 }
 
+pub fn get_lease_state<S: GumStore>(
+    store: &S,
+    lease_id: &str,
+) -> Result<Option<LeaseStateResponse>, String> {
+    Ok(store
+        .get_lease_state(lease_id)?
+        .map(|state| LeaseStateResponse {
+            lease_id: state.lease_id,
+            run_id: state.run_id,
+            attempt_id: state.attempt_id,
+            cancel_requested: state.cancel_requested,
+        }))
+}
+
 pub fn complete_attempt<S: GumStore>(
     store: &S,
     attempt_id: &str,
@@ -203,6 +217,18 @@ pub fn append_log<S: GumStore>(
     })
 }
 
+pub fn cancel_run<S: GumStore>(
+    store: &S,
+    run_id: &str,
+    _request: CancelRunRequest,
+) -> Result<RunResponse, String> {
+    let run = store.cancel_run(CancelRunParams {
+        run_id: run_id.to_string(),
+        requested_at_epoch_ms: now_epoch_ms(),
+    })?;
+    Ok(run_response(run))
+}
+
 fn run_response(run: gum_store::models::RunRecord) -> RunResponse {
     RunResponse {
         id: run.id,
@@ -231,4 +257,11 @@ fn message_fingerprint(message: &str) -> u64 {
         hash = hash.wrapping_mul(1099511628211);
     }
     hash
+}
+
+fn now_epoch_ms() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
 }
