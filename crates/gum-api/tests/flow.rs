@@ -1,11 +1,11 @@
 use gum_api::routes::{
     AppendLogRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
-    RegisterDeployRequest, RegisteredJob,
+    RegisterDeployRequest, RegisterRunnerRequest, RegisteredJob, RunnerHeartbeatRequest,
 };
 use gum_api::service;
 use gum_store::memory::MemoryStore;
-use gum_store::queries::GumStore;
 use gum_store::models::ProjectRecord;
+use gum_store::queries::GumStore;
 use gum_types::{AttemptStatus, RunStatus};
 use serde_json::json;
 
@@ -14,11 +14,11 @@ fn enqueue_lease_complete_replay_flow_works() {
     let store = MemoryStore::default();
     store
         .insert_project(ProjectRecord {
-        id: "proj_1".to_string(),
-        name: "Acme".to_string(),
-        slug: "acme".to_string(),
-        api_key_hash: "hash".to_string(),
-    })
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
         .expect("project insert should work");
 
     let deploy = service::register_deploy(
@@ -40,10 +40,21 @@ fn enqueue_lease_complete_replay_flow_works() {
                 timeout_secs: 300,
                 rate_limit_spec: Some("20/m".to_string()),
                 concurrency_limit: Some(5),
+                compute_class: None,
             }],
         },
     )
     .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
 
     assert_eq!(deploy.registered_jobs, 1);
 
@@ -62,6 +73,7 @@ fn enqueue_lease_complete_replay_flow_works() {
         &store,
         LeaseRunRequest {
             runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
         },
     )
     .expect("lease should work")
@@ -105,11 +117,11 @@ fn failed_attempt_requeues_when_retries_remain() {
     let store = MemoryStore::default();
     store
         .insert_project(ProjectRecord {
-        id: "proj_1".to_string(),
-        name: "Acme".to_string(),
-        slug: "acme".to_string(),
-        api_key_hash: "hash".to_string(),
-    })
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
         .expect("project insert should work");
 
     service::register_deploy(
@@ -131,10 +143,21 @@ fn failed_attempt_requeues_when_retries_remain() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                compute_class: None,
             }],
         },
     )
     .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
 
     let run = service::enqueue_run(
         &store,
@@ -150,6 +173,7 @@ fn failed_attempt_requeues_when_retries_remain() {
         &store,
         LeaseRunRequest {
             runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
         },
     )
     .expect("lease should work")
@@ -206,10 +230,31 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
                 timeout_secs: 300,
                 rate_limit_spec: Some("1/h".to_string()),
                 concurrency_limit: None,
+                compute_class: None,
             }],
         },
     )
     .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner 1 should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_2".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner 2 should work");
 
     service::enqueue_run(
         &store,
@@ -235,6 +280,7 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
         &store,
         LeaseRunRequest {
             runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
         },
     )
     .expect("first lease should work");
@@ -244,6 +290,7 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
         &store,
         LeaseRunRequest {
             runner_id: "runner_2".to_string(),
+            lease_ttl_secs: 30,
         },
     )
     .expect("second lease should work");
@@ -284,10 +331,21 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                compute_class: None,
             }],
         },
     )
     .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
 
     let job = store
         .get_job("job_send_followup")
@@ -295,19 +353,19 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
         .expect("job should exist");
     let first_due = job.created_at_epoch_ms + (20 * 60 * 1000);
 
-    let created = service::tick_schedules(&store, first_due)
-        .expect("scheduler tick should work");
+    let created = service::tick_schedules(&store, first_due).expect("scheduler tick should work");
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].status, RunStatus::Queued);
 
-    let created_again = service::tick_schedules(&store, first_due)
-        .expect("second scheduler tick should work");
+    let created_again =
+        service::tick_schedules(&store, first_due).expect("second scheduler tick should work");
     assert_eq!(created_again.len(), 0);
 
     let leased = service::lease_run(
         &store,
         LeaseRunRequest {
             runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
         },
     )
     .expect("lease should work")
@@ -318,4 +376,354 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
         .tick_schedules(first_due + (20 * 60 * 1000))
         .expect("next schedule tick should work");
     assert_eq!(runs.len(), 1);
+}
+
+#[test]
+fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_export_workspace".to_string(),
+                name: "export_workspace".to_string(),
+                handler_ref: "jobs:export_workspace".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 1,
+                timeout_secs: 7_200,
+                rate_limit_spec: None,
+                concurrency_limit: Some(1),
+                compute_class: Some("high-mem".to_string()),
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "high-mem".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 2,
+        },
+    )
+    .expect("register runner should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_2".to_string(),
+            compute_class: "high-mem".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 2,
+        },
+    )
+    .expect("register second runner should work");
+
+    let run = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export_workspace",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 2,
+        },
+    )
+    .expect("lease should work")
+    .expect("run should be leased");
+
+    service::heartbeat_runner(
+        &store,
+        RunnerHeartbeatRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "high-mem".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 2,
+            lease_ttl_secs: 2,
+            active_lease_ids: vec![leased.lease_id.clone()],
+        },
+    )
+    .expect("heartbeat should work");
+
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    let still_running = store
+        .recover_lost_attempts(now_epoch_ms())
+        .expect("recovery should work before renewed lease expires");
+    assert!(
+        still_running.is_empty(),
+        "heartbeat should keep the lease alive"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    let recovered = store
+        .recover_lost_attempts(now_epoch_ms())
+        .expect("recovery should work after lease expiry");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, RunStatus::Queued);
+
+    let reloaded = service::get_run(&store, &run.id)
+        .expect("get run should work")
+        .expect("run should exist");
+    assert_eq!(reloaded.status, RunStatus::Queued);
+    assert_eq!(reloaded.attempt, 1);
+
+    let completion_error = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Succeeded,
+            failure_reason: None,
+        },
+    )
+    .expect_err("recovered attempts should not be completable");
+    assert!(
+        completion_error.contains("already finished"),
+        "stale runner should be fenced after recovery"
+    );
+
+    let leased_again = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_2".to_string(),
+            lease_ttl_secs: 2,
+        },
+    )
+    .expect("second lease should work")
+    .expect("recovered run should be leaseable again");
+    assert_eq!(leased_again.run_id, run.id);
+    assert_ne!(leased_again.attempt_id, leased.attempt_id);
+}
+
+#[test]
+fn compute_class_and_runner_capacity_drive_placement() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![
+                RegisteredJob {
+                    id: "job_export_workspace".to_string(),
+                    name: "export_workspace".to_string(),
+                    handler_ref: "jobs:export_workspace".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 1,
+                    timeout_secs: 7_200,
+                    rate_limit_spec: None,
+                    concurrency_limit: None,
+                    compute_class: Some("high-mem".to_string()),
+                },
+                RegisteredJob {
+                    id: "job_sync_customer".to_string(),
+                    name: "sync_customer".to_string(),
+                    handler_ref: "jobs:sync_customer".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 1,
+                    timeout_secs: 300,
+                    rate_limit_spec: None,
+                    concurrency_limit: None,
+                    compute_class: None,
+                },
+            ],
+        },
+    )
+    .expect("register deploy should work");
+
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_standard".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register standard runner should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_high_mem".to_string(),
+            compute_class: "high-mem".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register high-mem runner should work");
+
+    service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export_workspace",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("enqueue export should work");
+
+    let standard_cannot_take_export = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_standard".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("standard runner lease attempt should work");
+    assert!(
+        standard_cannot_take_export.is_none(),
+        "standard runner should not lease a high-mem job"
+    );
+
+    let high_mem = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_high_mem".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("high-mem lease should work")
+    .expect("high-mem runner should get the export job");
+    assert_eq!(high_mem.job_id, "job_export_workspace");
+
+    service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_sync_customer",
+        EnqueueRunRequest {
+            input: json!({ "customer_id": "cus_123" }),
+        },
+    )
+    .expect("enqueue sync should work");
+    service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_sync_customer",
+        EnqueueRunRequest {
+            input: json!({ "customer_id": "cus_456" }),
+        },
+    )
+    .expect("enqueue second sync should work");
+
+    let standard_first = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_standard".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("standard runner should lease")
+    .expect("standard runner should get the generic job");
+    assert_eq!(standard_first.job_id, "job_sync_customer");
+
+    let standard_second = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_standard".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("second standard lease should work");
+    assert!(
+        standard_second.is_none(),
+        "runner capacity should prevent a second concurrent lease"
+    );
+}
+
+#[test]
+fn control_lease_fences_scheduler_work() {
+    let store = MemoryStore::default();
+    let now = now_epoch_ms();
+
+    let first = store
+        .try_acquire_control_lease(gum_store::queries::ControlLeaseParams {
+            lease_name: "scheduler".to_string(),
+            holder_id: "instance_a".to_string(),
+            ttl_secs: 5,
+            now_epoch_ms: now,
+        })
+        .expect("first control lease should work");
+    assert!(first, "first scheduler instance should acquire leadership");
+
+    let second = store
+        .try_acquire_control_lease(gum_store::queries::ControlLeaseParams {
+            lease_name: "scheduler".to_string(),
+            holder_id: "instance_b".to_string(),
+            ttl_secs: 5,
+            now_epoch_ms: now + 1_000,
+        })
+        .expect("second control lease attempt should work");
+    assert!(
+        !second,
+        "second scheduler instance should be fenced while lease is live"
+    );
+
+    let renewed = store
+        .try_acquire_control_lease(gum_store::queries::ControlLeaseParams {
+            lease_name: "scheduler".to_string(),
+            holder_id: "instance_a".to_string(),
+            ttl_secs: 5,
+            now_epoch_ms: now + 2_000,
+        })
+        .expect("same holder renewal should work");
+    assert!(
+        renewed,
+        "current leader should be able to renew its own lease"
+    );
+
+    let takeover = store
+        .try_acquire_control_lease(gum_store::queries::ControlLeaseParams {
+            lease_name: "scheduler".to_string(),
+            holder_id: "instance_b".to_string(),
+            ttl_secs: 5,
+            now_epoch_ms: now + 8_000,
+        })
+        .expect("expired control lease should be re-acquirable");
+    assert!(takeover, "leadership should transfer after expiry");
+}
+
+fn now_epoch_ms() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
 }

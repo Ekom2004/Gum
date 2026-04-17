@@ -1,5 +1,5 @@
-use gum_store::pg::PostgresStore;
 use gum_store::models::ProjectRecord;
+use gum_store::pg::PostgresStore;
 
 #[derive(Clone)]
 pub struct AppState {

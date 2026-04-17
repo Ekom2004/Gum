@@ -1,6 +1,6 @@
+use gum_types::AttemptStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use gum_types::AttemptStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeasedRun {
@@ -21,11 +21,9 @@ pub struct RunnerLoopConfig {
     pub runner_id: String,
     pub poll_interval_ms: u64,
     pub lease_ttl_secs: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LeaseRunRequest {
-    pub runner_id: String,
+    pub heartbeat_timeout_secs: u64,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,4 +37,28 @@ pub struct CompleteAttemptRequest {
 pub struct AppendLogRequest {
     pub stream: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterRunnerRequest {
+    pub runner_id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub heartbeat_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerHeartbeatRequest {
+    pub runner_id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub heartbeat_timeout_secs: u64,
+    pub lease_ttl_secs: u64,
+    pub active_lease_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRunRequest {
+    pub runner_id: String,
+    pub lease_ttl_secs: u64,
 }

@@ -25,6 +25,7 @@ pub struct RegisteredJob {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub compute_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +66,7 @@ pub struct LogLine {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRunRequest {
     pub runner_id: String,
+    pub lease_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +82,24 @@ pub struct LeaseRunResponse {
     pub handler_ref: String,
     pub timeout_secs: u32,
     pub lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterRunnerRequest {
+    pub runner_id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub heartbeat_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerHeartbeatRequest {
+    pub runner_id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub heartbeat_timeout_secs: u64,
+    pub lease_ttl_secs: u64,
+    pub active_lease_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

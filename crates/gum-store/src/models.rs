@@ -36,6 +36,7 @@ pub struct JobRecord {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub compute_class: Option<String>,
     pub enabled: bool,
     pub created_at_epoch_ms: i64,
 }
@@ -77,6 +78,22 @@ pub struct LeaseRecord {
     pub expires_at_epoch_ms: i64,
     pub acked_at_epoch_ms: Option<i64>,
     pub released_at_epoch_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerRecord {
+    pub id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub heartbeat_timeout_secs: u64,
+    pub last_heartbeat_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlLeaseRecord {
+    pub name: String,
+    pub holder_id: String,
+    pub expires_at_epoch_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,13 +1,15 @@
 use gum_store::models::LogRecord;
 use gum_store::queries::{
-    CompleteAttemptParams, EnqueueRunParams, GumStore, LeaseNextAttemptParams, RegisterDeployParams,
-    RegisterJobParams, ReplayRunParams,
+    CompleteAttemptParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams,
+    LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams, RegisterRunnerParams,
+    ReplayRunParams,
 };
 use gum_types::AttemptStatus;
 
 use crate::routes::{
     AppendLogRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest, LeaseRunResponse,
-    LogLine, RegisterDeployRequest, RegisterDeployResponse, ReplayRunResponse, RunResponse,
+    LogLine, RegisterDeployRequest, RegisterDeployResponse, RegisterRunnerRequest,
+    ReplayRunResponse, RunResponse, RunnerHeartbeatRequest,
 };
 
 pub fn register_deploy<S: GumStore>(
@@ -34,6 +36,7 @@ pub fn register_deploy<S: GumStore>(
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                compute_class: job.compute_class,
             })
             .collect(),
     };
@@ -94,7 +97,10 @@ pub fn get_logs<S: GumStore>(store: &S, run_id: &str) -> Result<Vec<LogLine>, St
         .collect())
 }
 
-pub fn tick_schedules<S: GumStore>(store: &S, now_epoch_ms: i64) -> Result<Vec<RunResponse>, String> {
+pub fn tick_schedules<S: GumStore>(
+    store: &S,
+    now_epoch_ms: i64,
+) -> Result<Vec<RunResponse>, String> {
     Ok(store
         .tick_schedules(now_epoch_ms)?
         .into_iter()
@@ -108,7 +114,7 @@ pub fn lease_run<S: GumStore>(
 ) -> Result<Option<LeaseRunResponse>, String> {
     let Some((run, attempt, lease)) = store.lease_next_attempt(LeaseNextAttemptParams {
         runner_id: request.runner_id,
-        lease_ttl_secs: 30,
+        lease_ttl_secs: request.lease_ttl_secs,
     })?
     else {
         return Ok(None);
@@ -132,8 +138,36 @@ pub fn lease_run<S: GumStore>(
         entrypoint: deploy.entrypoint,
         handler_ref: job.handler_ref,
         timeout_secs: job.timeout_secs,
-        lease_ttl_secs: 30,
+        lease_ttl_secs: request.lease_ttl_secs,
     }))
+}
+
+pub fn register_runner<S: GumStore>(
+    store: &S,
+    request: RegisterRunnerRequest,
+) -> Result<(), String> {
+    store.register_runner(RegisterRunnerParams {
+        runner_id: request.runner_id,
+        compute_class: request.compute_class,
+        max_concurrent_leases: request.max_concurrent_leases,
+        heartbeat_timeout_secs: request.heartbeat_timeout_secs,
+    })?;
+    Ok(())
+}
+
+pub fn heartbeat_runner<S: GumStore>(
+    store: &S,
+    request: RunnerHeartbeatRequest,
+) -> Result<(), String> {
+    store.heartbeat_runner(HeartbeatRunnerParams {
+        runner_id: request.runner_id,
+        compute_class: request.compute_class,
+        max_concurrent_leases: request.max_concurrent_leases,
+        heartbeat_timeout_secs: request.heartbeat_timeout_secs,
+        lease_ttl_secs: request.lease_ttl_secs,
+        active_lease_ids: request.active_lease_ids,
+    })?;
+    Ok(())
 }
 
 pub fn complete_attempt<S: GumStore>(

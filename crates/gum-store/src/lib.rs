@@ -1,5 +1,5 @@
-pub mod models;
 pub mod memory;
+pub mod models;
 pub mod pg;
 pub mod queries;
 
@@ -12,6 +12,8 @@ pub const TABLES: &[&str] = &[
     "runs",
     "attempts",
     "leases",
+    "runners",
+    "control_leases",
     "logs",
 ];
 

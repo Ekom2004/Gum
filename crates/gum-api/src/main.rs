@@ -7,7 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let state = AppState::for_dev().map_err(|message| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("failed to seed dev state: {message}"))
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to seed dev state: {message}"),
+        )
     })?;
     let app = handlers::router(state);
     let addr: SocketAddr = "127.0.0.1:8000".parse().map_err(|error| {

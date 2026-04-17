@@ -19,6 +19,7 @@ class JobPolicy:
     timeout: str | None = None
     rate_limit: str | None = None
     concurrency: int | None = None
+    compute: str | None = None
     name: str | None = None
 
 
@@ -32,6 +33,7 @@ class JobDefinition(Callable[P, R]):
         timeout: str | None = None,
         rate_limit: str | None = None,
         concurrency: int | None = None,
+        compute: str | None = None,
         name: str | None = None,
         client: GumClient | None = None,
     ) -> None:
@@ -46,6 +48,7 @@ class JobDefinition(Callable[P, R]):
             timeout=timeout,
             rate_limit=rate_limit,
             concurrency=concurrency,
+            compute=compute,
             name=self.name,
         )
         update_wrapper(self, fn)
@@ -83,6 +86,7 @@ def job(
     timeout: str | None = None,
     rate_limit: str | None = None,
     concurrency: int | None = None,
+    compute: str | None = None,
     name: str | None = None,
     client: GumClient | None = None,
 ) -> Callable[[Callable[P, R]], JobDefinition[P, R]]:
@@ -94,6 +98,7 @@ def job(
             timeout=timeout,
             rate_limit=rate_limit,
             concurrency=concurrency,
+            compute=compute,
             name=name,
             client=client,
         )

@@ -6,11 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 
 use crate::models::{
-    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord, ProjectRecord, RunRecord,
+    AttemptRecord, ControlLeaseRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord,
+    ProjectRecord, RunRecord, RunnerRecord,
 };
 use crate::queries::{
-    parse_rate_limit_spec, parse_schedule_interval_ms, CompleteAttemptParams, EnqueueRunParams,
-    GumStore, LeaseNextAttemptParams, RegisterDeployParams, ReplayRunParams,
+    parse_rate_limit_spec, parse_schedule_interval_ms, CompleteAttemptParams, ControlLeaseParams,
+    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
 };
 
 #[derive(Default)]
@@ -21,6 +23,8 @@ struct MemoryState {
     runs: HashMap<String, RunRecord>,
     attempts: HashMap<String, AttemptRecord>,
     leases: HashMap<String, LeaseRecord>,
+    runners: HashMap<String, RunnerRecord>,
+    control_leases: HashMap<String, ControlLeaseRecord>,
     logs: Vec<LogRecord>,
 }
 
@@ -44,6 +48,96 @@ impl MemoryStore {
         let id = self.ids.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{prefix}_{id}")
     }
+
+    fn upsert_runner_locked(
+        state: &mut MemoryState,
+        runner_id: &str,
+        compute_class: &str,
+        max_concurrent_leases: u32,
+        heartbeat_timeout_secs: u64,
+        now_epoch_ms: i64,
+    ) -> RunnerRecord {
+        let record = RunnerRecord {
+            id: runner_id.to_string(),
+            compute_class: compute_class.to_string(),
+            max_concurrent_leases,
+            heartbeat_timeout_secs,
+            last_heartbeat_at_epoch_ms: now_epoch_ms,
+        };
+        state.runners.insert(record.id.clone(), record.clone());
+        record
+    }
+
+    fn recover_lost_attempts_locked(state: &mut MemoryState, now_epoch_ms: i64) -> Vec<RunRecord> {
+        let lost_attempt_ids: Vec<String> = state
+            .attempts
+            .values()
+            .filter(|attempt| attempt.status == AttemptStatus::Running)
+            .filter_map(|attempt| {
+                let lease_id = attempt.lease_id.as_ref()?;
+                let lease = state.leases.get(lease_id)?;
+                if lease.acked_at_epoch_ms.is_some() || lease.released_at_epoch_ms.is_some() {
+                    return None;
+                }
+
+                let lease_expired = lease.expires_at_epoch_ms <= now_epoch_ms;
+                let runner_stale = state
+                    .runners
+                    .get(&lease.runner_id)
+                    .map(|runner| {
+                        runner
+                            .last_heartbeat_at_epoch_ms
+                            .saturating_add((runner.heartbeat_timeout_secs as i64) * 1000)
+                            <= now_epoch_ms
+                    })
+                    .unwrap_or(false);
+
+                if lease_expired || runner_stale {
+                    Some(attempt.id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut recovered_runs = Vec::new();
+
+        for attempt_id in lost_attempt_ids {
+            let Some(attempt) = state.attempts.get_mut(&attempt_id) else {
+                continue;
+            };
+            if attempt.status != AttemptStatus::Running {
+                continue;
+            }
+
+            attempt.status = AttemptStatus::Failed;
+            attempt.failure_reason = Some("runner lost lease".to_string());
+            attempt.finished_at_epoch_ms = Some(now_epoch_ms);
+            let attempt_snapshot = attempt.clone();
+
+            if let Some(lease_id) = &attempt_snapshot.lease_id {
+                if let Some(lease) = state.leases.get_mut(lease_id) {
+                    lease.released_at_epoch_ms = Some(now_epoch_ms);
+                }
+            }
+
+            let Some(run) = state.runs.get_mut(&attempt_snapshot.run_id) else {
+                continue;
+            };
+
+            if run.attempt_count < run.max_attempts {
+                run.status = RunStatus::Queued;
+                run.failure_reason = None;
+            } else {
+                run.status = RunStatus::Failed;
+                run.failure_reason = Some("runner lost lease".to_string());
+            }
+
+            recovered_runs.push(run.clone());
+        }
+
+        recovered_runs
+    }
 }
 
 impl GumStore for MemoryStore {
@@ -51,7 +145,10 @@ impl GumStore for MemoryStore {
         &self,
         params: RegisterDeployParams,
     ) -> Result<(DeployRecord, Vec<JobRecord>), String> {
-        let mut state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         if !state.projects.contains_key(&params.project_id) {
             return Err("project not found".to_string());
         }
@@ -82,6 +179,7 @@ impl GumStore for MemoryStore {
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                compute_class: job.compute_class,
                 enabled: true,
                 created_at_epoch_ms,
             };
@@ -93,23 +191,114 @@ impl GumStore for MemoryStore {
         Ok((deploy, jobs))
     }
 
+    fn register_runner(&self, params: RegisterRunnerParams) -> Result<RunnerRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        Ok(Self::upsert_runner_locked(
+            &mut state,
+            &params.runner_id,
+            &params.compute_class,
+            params.max_concurrent_leases,
+            params.heartbeat_timeout_secs,
+            now_epoch_ms(),
+        ))
+    }
+
+    fn heartbeat_runner(&self, params: HeartbeatRunnerParams) -> Result<RunnerRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let heartbeat_at = now_epoch_ms();
+        let runner = Self::upsert_runner_locked(
+            &mut state,
+            &params.runner_id,
+            &params.compute_class,
+            params.max_concurrent_leases,
+            params.heartbeat_timeout_secs,
+            heartbeat_at,
+        );
+
+        for lease_id in params.active_lease_ids {
+            let lease = state
+                .leases
+                .get_mut(&lease_id)
+                .ok_or_else(|| format!("lease not found: {lease_id}"))?;
+            if lease.runner_id != params.runner_id {
+                return Err(format!("runner does not own lease: {lease_id}"));
+            }
+            if lease.acked_at_epoch_ms.is_some() || lease.released_at_epoch_ms.is_some() {
+                continue;
+            }
+
+            lease.expires_at_epoch_ms =
+                heartbeat_at.saturating_add((params.lease_ttl_secs as i64) * 1000);
+        }
+
+        Ok(runner)
+    }
+
+    fn try_acquire_control_lease(&self, params: ControlLeaseParams) -> Result<bool, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let can_acquire = match state.control_leases.get(&params.lease_name) {
+            Some(existing) => {
+                existing.holder_id == params.holder_id
+                    || existing.expires_at_epoch_ms <= params.now_epoch_ms
+            }
+            None => true,
+        };
+
+        if !can_acquire {
+            return Ok(false);
+        }
+
+        state.control_leases.insert(
+            params.lease_name.clone(),
+            ControlLeaseRecord {
+                name: params.lease_name,
+                holder_id: params.holder_id,
+                expires_at_epoch_ms: params
+                    .now_epoch_ms
+                    .saturating_add((params.ttl_secs as i64) * 1000),
+            },
+        );
+        Ok(true)
+    }
+
     fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, String> {
-        let state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         Ok(state.jobs.get(job_id).cloned())
     }
 
     fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, String> {
-        let state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         Ok(state.runs.get(run_id).cloned())
     }
 
     fn get_deploy(&self, deploy_id: &str) -> Result<Option<DeployRecord>, String> {
-        let state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         Ok(state.deploys.get(deploy_id).cloned())
     }
 
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {
-        let mut state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         let job = state
             .jobs
             .get(&params.job_id)
@@ -141,7 +330,10 @@ impl GumStore for MemoryStore {
     }
 
     fn replay_run(&self, params: ReplayRunParams) -> Result<RunRecord, String> {
-        let mut state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         let source = state
             .runs
             .get(&params.source_run_id)
@@ -170,7 +362,25 @@ impl GumStore for MemoryStore {
         &self,
         params: LeaseNextAttemptParams,
     ) -> Result<Option<(RunRecord, AttemptRecord, LeaseRecord)>, String> {
-        let mut state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        Self::recover_lost_attempts_locked(&mut state, now_epoch_ms());
+        let runner = state
+            .runners
+            .get(&params.runner_id)
+            .cloned()
+            .ok_or_else(|| "runner not registered".to_string())?;
+        let runner_active_leases = state
+            .attempts
+            .values()
+            .filter(|attempt| attempt.status == AttemptStatus::Running)
+            .filter(|attempt| attempt.runner_id.as_deref() == Some(params.runner_id.as_str()))
+            .count() as u32;
+        if runner_active_leases >= runner.max_concurrent_leases {
+            return Ok(None);
+        }
 
         let mut selected: Option<RunRecord> = None;
         for run in state.runs.values() {
@@ -181,6 +391,12 @@ impl GumStore for MemoryStore {
                 Some(job) if job.enabled => job,
                 _ => continue,
             };
+
+            if let Some(required_class) = &job.compute_class {
+                if runner.compute_class != *required_class {
+                    continue;
+                }
+            }
 
             if let Some(limit) = job.concurrency_limit {
                 let active = state
@@ -270,7 +486,9 @@ impl GumStore for MemoryStore {
             None => return Err("selected run disappeared before lease".to_string()),
         };
 
-        state.attempts.insert(leased_attempt.id.clone(), leased_attempt.clone());
+        state
+            .attempts
+            .insert(leased_attempt.id.clone(), leased_attempt.clone());
         state.leases.insert(lease.id.clone(), lease.clone());
 
         Ok(Some((leased_run, leased_attempt, lease)))
@@ -280,12 +498,19 @@ impl GumStore for MemoryStore {
         &self,
         params: CompleteAttemptParams,
     ) -> Result<(AttemptRecord, RunRecord), String> {
-        let mut state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
 
         let attempt = state
             .attempts
             .get_mut(&params.attempt_id)
             .ok_or_else(|| "attempt not found".to_string())?;
+
+        if attempt.finished_at_epoch_ms.is_some() || is_terminal_attempt(attempt.status) {
+            return Err("attempt already finished".to_string());
+        }
 
         if attempt.runner_id.as_deref() != Some(params.runner_id.as_str()) {
             return Err("runner mismatch".to_string());
@@ -340,8 +565,19 @@ impl GumStore for MemoryStore {
         Ok((attempt_snapshot, run.clone()))
     }
 
+    fn recover_lost_attempts(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        Ok(Self::recover_lost_attempts_locked(&mut state, now_epoch_ms))
+    }
+
     fn tick_schedules(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String> {
-        let mut state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         let jobs: Vec<JobRecord> = state
             .jobs
             .values()
@@ -405,13 +641,19 @@ impl GumStore for MemoryStore {
     }
 
     fn append_log(&self, log: LogRecord) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         state.logs.push(log);
         Ok(())
     }
 
     fn list_run_logs(&self, run_id: &str) -> Result<Vec<LogRecord>, String> {
-        let state = self.state.lock().map_err(|_| "memory store lock poisoned".to_string())?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
         Ok(state
             .logs
             .iter()
@@ -426,4 +668,14 @@ fn now_epoch_ms() -> i64 {
         Ok(duration) => duration.as_millis() as i64,
         Err(_) => 0,
     }
+}
+
+fn is_terminal_attempt(status: AttemptStatus) -> bool {
+    matches!(
+        status,
+        AttemptStatus::Succeeded
+            | AttemptStatus::Failed
+            | AttemptStatus::TimedOut
+            | AttemptStatus::Canceled
+    )
 }

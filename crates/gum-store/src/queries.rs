@@ -1,6 +1,8 @@
 use serde_json::Value;
 
-use crate::models::{AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord, RunRecord};
+use crate::models::{
+    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord, RunRecord, RunnerRecord,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterDeployParams {
@@ -24,6 +26,7 @@ pub struct RegisterJobParams {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub compute_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,32 @@ pub struct ReplayRunParams {
 pub struct LeaseNextAttemptParams {
     pub runner_id: String,
     pub lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterRunnerParams {
+    pub runner_id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub heartbeat_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatRunnerParams {
+    pub runner_id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub heartbeat_timeout_secs: u64,
+    pub lease_ttl_secs: u64,
+    pub active_lease_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlLeaseParams {
+    pub lease_name: String,
+    pub holder_id: String,
+    pub ttl_secs: u64,
+    pub now_epoch_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +150,13 @@ pub fn parse_rate_limit_spec(spec: &str) -> Result<RateLimitSpec, String> {
 }
 
 pub trait GumStore {
-    fn register_deploy(&self, params: RegisterDeployParams) -> Result<(DeployRecord, Vec<JobRecord>), String>;
+    fn register_deploy(
+        &self,
+        params: RegisterDeployParams,
+    ) -> Result<(DeployRecord, Vec<JobRecord>), String>;
+    fn register_runner(&self, params: RegisterRunnerParams) -> Result<RunnerRecord, String>;
+    fn heartbeat_runner(&self, params: HeartbeatRunnerParams) -> Result<RunnerRecord, String>;
+    fn try_acquire_control_lease(&self, params: ControlLeaseParams) -> Result<bool, String>;
     fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, String>;
     fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, String>;
     fn get_deploy(&self, deploy_id: &str) -> Result<Option<DeployRecord>, String>;
@@ -135,6 +170,7 @@ pub trait GumStore {
         &self,
         params: CompleteAttemptParams,
     ) -> Result<(AttemptRecord, RunRecord), String>;
+    fn recover_lost_attempts(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String>;
     fn tick_schedules(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String>;
     fn append_log(&self, log: LogRecord) -> Result<(), String>;
     fn list_run_logs(&self, run_id: &str) -> Result<Vec<LogRecord>, String>;

@@ -26,6 +26,7 @@ class DiscoveredJob:
     timeout_secs: int
     rate_limit_spec: str | None
     concurrency_limit: int | None
+    compute_class: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,7 @@ def deploy_project(
                 "timeout_secs": job.timeout_secs,
                 "rate_limit_spec": job.rate_limit_spec,
                 "concurrency_limit": job.concurrency_limit,
+                "compute_class": job.compute_class,
             }
             for job in jobs
         ],
@@ -137,6 +139,7 @@ def _discover_jobs_in_file(path: Path, module_name: str) -> list[DiscoveredJob]:
             timeout_secs = _timeout_secs(kwargs.get("timeout"))
             rate_limit_spec = _optional_string(kwargs.get("rate_limit"))
             concurrency_limit = _optional_int(kwargs.get("concurrency"))
+            compute_class = _optional_string(kwargs.get("compute"))
             trigger_mode = "both" if every else "manual"
 
             jobs.append(
@@ -150,6 +153,7 @@ def _discover_jobs_in_file(path: Path, module_name: str) -> list[DiscoveredJob]:
                     timeout_secs=timeout_secs,
                     rate_limit_spec=rate_limit_spec,
                     concurrency_limit=concurrency_limit,
+                    compute_class=compute_class,
                 )
             )
     return jobs

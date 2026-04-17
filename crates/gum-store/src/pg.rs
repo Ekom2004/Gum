@@ -2,19 +2,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use postgres::{Client, NoTls, Row};
 use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
+use postgres::{Client, NoTls, Row};
 
 use crate::models::{
     AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LogRecord, ProjectRecord, RunRecord,
+    RunnerRecord,
 };
 use crate::queries::{
-    parse_rate_limit_spec, parse_schedule_interval_ms, CompleteAttemptParams, EnqueueRunParams,
-    GumStore, LeaseNextAttemptParams, RegisterDeployParams, ReplayRunParams,
+    parse_rate_limit_spec, parse_schedule_interval_ms, CompleteAttemptParams, ControlLeaseParams,
+    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_slice1.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_scheduler.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_runner_liveness.sql");
+const MIGRATION_0004: &str =
+    include_str!("../migrations/0004_control_leases_and_compute_classes.sql");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -42,6 +47,12 @@ impl PostgresStore {
             .batch_execute(MIGRATION_0002)
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
+            .batch_execute(MIGRATION_0003)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
+            .batch_execute(MIGRATION_0004)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
             .execute(
                 "INSERT INTO projects (id, name, slug, api_key_hash)
                  VALUES ($1, $2, $3, $4)
@@ -50,7 +61,12 @@ impl PostgresStore {
                      slug = EXCLUDED.slug,
                      api_key_hash = EXCLUDED.api_key_hash,
                      updated_at = NOW()",
-                &[&project.id, &project.name, &project.slug, &project.api_key_hash],
+                &[
+                    &project.id,
+                    &project.name,
+                    &project.slug,
+                    &project.api_key_hash,
+                ],
             )
             .map_err(|error| format!("failed to seed dev project: {error}"))?;
         Ok(())
@@ -78,7 +94,10 @@ impl GumStore for PostgresStore {
             .map_err(|error| format!("failed to start deploy transaction: {error}"))?;
 
         let project_exists = tx
-            .query_opt("SELECT id FROM projects WHERE id = $1", &[&params.project_id])
+            .query_opt(
+                "SELECT id FROM projects WHERE id = $1",
+                &[&params.project_id],
+            )
             .map_err(|error| format!("failed to check project: {error}"))?;
         if project_exists.is_none() {
             return Err("project not found".to_string());
@@ -127,6 +146,7 @@ impl GumStore for PostgresStore {
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                compute_class: job.compute_class,
                 enabled: true,
                 created_at_epoch_ms,
             };
@@ -134,8 +154,8 @@ impl GumStore for PostgresStore {
             tx.execute(
                 "INSERT INTO jobs (
                     id, project_id, deploy_id, name, handler_ref, trigger_mode, schedule_expr,
-                    retries, timeout_secs, rate_limit_spec, concurrency_limit, enabled
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    retries, timeout_secs, rate_limit_spec, concurrency_limit, compute_class, enabled
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT (id) DO UPDATE
                  SET project_id = EXCLUDED.project_id,
                      deploy_id = EXCLUDED.deploy_id,
@@ -147,6 +167,7 @@ impl GumStore for PostgresStore {
                      timeout_secs = EXCLUDED.timeout_secs,
                      rate_limit_spec = EXCLUDED.rate_limit_spec,
                      concurrency_limit = EXCLUDED.concurrency_limit,
+                     compute_class = EXCLUDED.compute_class,
                      enabled = EXCLUDED.enabled,
                      updated_at = NOW()",
                 &[
@@ -161,6 +182,7 @@ impl GumStore for PostgresStore {
                     &(record.timeout_secs as i32),
                     &record.rate_limit_spec,
                     &record.concurrency_limit.map(|value| value as i32),
+                    &record.compute_class,
                     &record.enabled,
                 ],
             )
@@ -171,6 +193,132 @@ impl GumStore for PostgresStore {
         tx.commit()
             .map_err(|error| format!("failed to commit deploy transaction: {error}"))?;
         Ok((deploy, jobs))
+    }
+
+    fn register_runner(&self, params: RegisterRunnerParams) -> Result<RunnerRecord, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_one(
+                "INSERT INTO runners (
+                    id, compute_class, max_concurrent_leases, heartbeat_timeout_secs, last_heartbeat_at
+                 ) VALUES ($1, $2, $3, $4, NOW())
+                 ON CONFLICT (id) DO UPDATE
+                 SET compute_class = EXCLUDED.compute_class,
+                     max_concurrent_leases = EXCLUDED.max_concurrent_leases,
+                     heartbeat_timeout_secs = EXCLUDED.heartbeat_timeout_secs,
+                     last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+                     updated_at = NOW()
+                 RETURNING id,
+                           compute_class,
+                           max_concurrent_leases,
+                           heartbeat_timeout_secs,
+                           (EXTRACT(EPOCH FROM last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms",
+                &[
+                    &params.runner_id,
+                    &params.compute_class,
+                    &(params.max_concurrent_leases as i32),
+                    &(params.heartbeat_timeout_secs as i32),
+                ],
+            )
+            .map_err(|error| format!("failed to register runner: {error}"))?;
+        runner_from_row(row)
+    }
+
+    fn heartbeat_runner(&self, params: HeartbeatRunnerParams) -> Result<RunnerRecord, String> {
+        let mut client = self.connect_client()?;
+        let mut tx = client
+            .transaction()
+            .map_err(|error| format!("failed to start heartbeat transaction: {error}"))?;
+
+        let runner_row = tx
+            .query_one(
+                "INSERT INTO runners (
+                    id, compute_class, max_concurrent_leases, heartbeat_timeout_secs, last_heartbeat_at
+                 ) VALUES ($1, $2, $3, $4, NOW())
+                 ON CONFLICT (id) DO UPDATE
+                 SET compute_class = EXCLUDED.compute_class,
+                     max_concurrent_leases = EXCLUDED.max_concurrent_leases,
+                     heartbeat_timeout_secs = EXCLUDED.heartbeat_timeout_secs,
+                     last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+                     updated_at = NOW()
+                 RETURNING id,
+                           compute_class,
+                           max_concurrent_leases,
+                           heartbeat_timeout_secs,
+                           (EXTRACT(EPOCH FROM last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms",
+                &[
+                    &params.runner_id,
+                    &params.compute_class,
+                    &(params.max_concurrent_leases as i32),
+                    &(params.heartbeat_timeout_secs as i32),
+                ],
+            )
+            .map_err(|error| format!("failed to upsert runner heartbeat: {error}"))?;
+
+        for lease_id in &params.active_lease_ids {
+            let ownership = tx
+                .query_opt(
+                    "SELECT runner_id, acked_at, released_at
+                     FROM leases
+                     WHERE id = $1
+                     FOR UPDATE",
+                    &[lease_id],
+                )
+                .map_err(|error| format!("failed to load lease for heartbeat: {error}"))?
+                .ok_or_else(|| format!("lease not found: {lease_id}"))?;
+
+            let runner_id: String = ownership.get("runner_id");
+            if runner_id != params.runner_id {
+                return Err(format!("runner does not own lease: {lease_id}"));
+            }
+
+            let acked_at: Option<std::time::SystemTime> = ownership.get("acked_at");
+            let released_at: Option<std::time::SystemTime> = ownership.get("released_at");
+            if acked_at.is_some() || released_at.is_some() {
+                continue;
+            }
+
+            tx.execute(
+                "UPDATE leases
+                 SET expires_at = NOW() + ($1::bigint * INTERVAL '1 second')
+                 WHERE id = $2",
+                &[&(params.lease_ttl_secs as i64), lease_id],
+            )
+            .map_err(|error| format!("failed to renew lease {lease_id}: {error}"))?;
+        }
+
+        tx.commit()
+            .map_err(|error| format!("failed to commit heartbeat transaction: {error}"))?;
+        runner_from_row(runner_row)
+    }
+
+    fn try_acquire_control_lease(&self, params: ControlLeaseParams) -> Result<bool, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_opt(
+                "INSERT INTO control_leases (name, holder_id, expires_at, updated_at)
+                 VALUES (
+                    $1,
+                    $2,
+                    TO_TIMESTAMP($3::double precision / 1000.0) + ($4::bigint * INTERVAL '1 second'),
+                    TO_TIMESTAMP($3::double precision / 1000.0)
+                 )
+                 ON CONFLICT (name) DO UPDATE
+                 SET holder_id = EXCLUDED.holder_id,
+                     expires_at = EXCLUDED.expires_at,
+                     updated_at = EXCLUDED.updated_at
+                 WHERE control_leases.holder_id = EXCLUDED.holder_id
+                    OR control_leases.expires_at <= TO_TIMESTAMP($3::double precision / 1000.0)
+                 RETURNING name",
+                &[
+                    &params.lease_name,
+                    &params.holder_id,
+                    &(params.now_epoch_ms as f64),
+                    &(params.ttl_secs as i64),
+                ],
+            )
+            .map_err(|error| format!("failed to acquire control lease: {error}"))?;
+        Ok(row.is_some())
     }
 
     fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, String> {
@@ -294,10 +442,45 @@ impl GumStore for PostgresStore {
         &self,
         params: LeaseNextAttemptParams,
     ) -> Result<Option<(RunRecord, AttemptRecord, LeaseRecord)>, String> {
+        self.recover_lost_attempts(now_epoch_ms())?;
+
         let mut client = self.connect_client()?;
         let mut tx = client
             .transaction()
             .map_err(|error| format!("failed to start lease transaction: {error}"))?;
+
+        let runner_row = tx
+            .query_opt(
+                "SELECT id,
+                        compute_class,
+                        max_concurrent_leases,
+                        heartbeat_timeout_secs,
+                        (EXTRACT(EPOCH FROM last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms
+                 FROM runners
+                 WHERE id = $1
+                 FOR UPDATE",
+                &[&params.runner_id],
+            )
+            .map_err(|error| format!("failed to load runner for lease: {error}"))?
+            .ok_or_else(|| "runner not registered".to_string())?;
+        let runner = runner_from_row(runner_row)?;
+
+        let active_runner_leases: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) AS count
+                 FROM attempts
+                 WHERE status = 'running'
+                   AND runner_id = $1",
+                &[&params.runner_id],
+            )
+            .map_err(|error| format!("failed to count active runner leases: {error}"))?
+            .get("count");
+        if active_runner_leases >= i64::from(runner.max_concurrent_leases) {
+            tx.commit().map_err(|error| {
+                format!("failed to close full-runner lease transaction: {error}")
+            })?;
+            return Ok(None);
+        }
 
         let candidate_rows = tx
             .query(
@@ -326,7 +509,7 @@ impl GumStore for PostgresStore {
             let run = run_from_row(run_row)?;
             let job_row = tx
                 .query_one(
-                    "SELECT project_id, rate_limit_spec
+                    "SELECT project_id, rate_limit_spec, compute_class
                      FROM jobs
                      WHERE id = $1",
                     &[&run.job_id],
@@ -334,6 +517,13 @@ impl GumStore for PostgresStore {
                 .map_err(|error| format!("failed to load job for rate-limit check: {error}"))?;
             let project_id: String = job_row.get("project_id");
             let rate_limit_spec: Option<String> = job_row.get("rate_limit_spec");
+            let compute_class: Option<String> = job_row.get("compute_class");
+
+            if let Some(required_class) = compute_class {
+                if runner.compute_class != required_class {
+                    continue;
+                }
+            }
 
             let allowed = if let Some(rate_limit_spec) = rate_limit_spec {
                 let spec = parse_rate_limit_spec(&rate_limit_spec)?;
@@ -417,7 +607,12 @@ impl GumStore for PostgresStore {
                            (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint AS expires_at_epoch_ms,
                            NULL::bigint AS acked_at_epoch_ms,
                            NULL::bigint AS released_at_epoch_ms",
-                &[&lease_id, &attempt_id, &params.runner_id, &(expires_at as f64)],
+                &[
+                    &lease_id,
+                    &attempt_id,
+                    &params.runner_id,
+                    &(expires_at as f64),
+                ],
             )
             .map_err(|error| format!("failed to insert lease: {error}"))?;
 
@@ -459,6 +654,10 @@ impl GumStore for PostgresStore {
             .map_err(|error| format!("failed to load attempt for completion: {error}"))?
             .ok_or_else(|| "attempt not found".to_string())?;
         let attempt = attempt_from_row(attempt_row)?;
+
+        if attempt.finished_at_epoch_ms.is_some() || is_terminal_attempt(attempt.status) {
+            return Err("attempt already finished".to_string());
+        }
 
         if attempt.runner_id.as_deref() != Some(params.runner_id.as_str()) {
             return Err("runner mismatch".to_string());
@@ -551,7 +750,106 @@ impl GumStore for PostgresStore {
         tx.commit()
             .map_err(|error| format!("failed to commit completion transaction: {error}"))?;
 
-        Ok((attempt_from_row(updated_attempt_row)?, run_from_row(updated_run_row)?))
+        Ok((
+            attempt_from_row(updated_attempt_row)?,
+            run_from_row(updated_run_row)?,
+        ))
+    }
+
+    fn recover_lost_attempts(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String> {
+        let mut client = self.connect_client()?;
+        let mut tx = client
+            .transaction()
+            .map_err(|error| format!("failed to start recovery transaction: {error}"))?;
+
+        let rows = tx
+            .query(
+                "SELECT attempts.id AS attempt_id,
+                        attempts.run_id AS run_id,
+                        attempts.lease_id AS lease_id,
+                        runs.attempt_count AS attempt_count,
+                        runs.max_attempts AS max_attempts
+                 FROM attempts
+                 JOIN runs ON runs.id = attempts.run_id
+                 JOIN leases ON leases.id = attempts.lease_id
+                 LEFT JOIN runners ON runners.id = leases.runner_id
+                 WHERE attempts.status = 'running'
+                   AND leases.acked_at IS NULL
+                   AND leases.released_at IS NULL
+                   AND (
+                     leases.expires_at <= TO_TIMESTAMP($1::double precision / 1000.0)
+                     OR (
+                       runners.id IS NOT NULL
+                       AND runners.last_heartbeat_at
+                           + (runners.heartbeat_timeout_secs * INTERVAL '1 second')
+                           <= TO_TIMESTAMP($1::double precision / 1000.0)
+                     )
+                   )
+                 FOR UPDATE OF attempts, runs, leases SKIP LOCKED",
+                &[&(now_epoch_ms as f64)],
+            )
+            .map_err(|error| format!("failed to load lost attempts: {error}"))?;
+
+        let mut recovered_runs = Vec::new();
+        for row in rows {
+            let attempt_id: String = row.get("attempt_id");
+            let run_id: String = row.get("run_id");
+            let lease_id: String = row.get("lease_id");
+            let attempt_count: i32 = row.get("attempt_count");
+            let max_attempts: i32 = row.get("max_attempts");
+            let final_failure = attempt_count >= max_attempts;
+
+            tx.execute(
+                "UPDATE attempts
+                 SET status = 'failed',
+                     failure_reason = 'runner lost lease',
+                     finished_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                 WHERE id = $1",
+                &[&attempt_id, &(now_epoch_ms as f64)],
+            )
+            .map_err(|error| format!("failed to mark lost attempt failed: {error}"))?;
+
+            tx.execute(
+                "UPDATE leases
+                 SET released_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                 WHERE id = $1",
+                &[&lease_id, &(now_epoch_ms as f64)],
+            )
+            .map_err(|error| format!("failed to release lost lease: {error}"))?;
+
+            // Recovery only changes the currently leased attempt. The run keeps its
+            // existing attempt_count so a requeue naturally leases the next attempt number.
+            let run_row = if final_failure {
+                tx.query_one(
+                    "UPDATE runs
+                     SET status = 'failed',
+                         failure_reason = 'runner lost lease',
+                         finished_at = TO_TIMESTAMP($2::double precision / 1000.0),
+                         updated_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                     WHERE id = $1
+                     RETURNING *, (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
+                    &[&run_id, &(now_epoch_ms as f64)],
+                )
+                .map_err(|error| format!("failed to finalize lost run: {error}"))?
+            } else {
+                tx.query_one(
+                    "UPDATE runs
+                     SET status = 'queued',
+                         failure_reason = NULL,
+                         updated_at = TO_TIMESTAMP($2::double precision / 1000.0)
+                     WHERE id = $1
+                     RETURNING *, (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
+                    &[&run_id, &(now_epoch_ms as f64)],
+                )
+                .map_err(|error| format!("failed to requeue lost run: {error}"))?
+            };
+
+            recovered_runs.push(run_from_row(run_row)?);
+        }
+
+        tx.commit()
+            .map_err(|error| format!("failed to commit recovery transaction: {error}"))?;
+        Ok(recovered_runs)
     }
 
     fn tick_schedules(&self, now_epoch_ms: i64) -> Result<Vec<RunRecord>, String> {
@@ -638,7 +936,13 @@ impl GumStore for PostgresStore {
             .execute(
                 "INSERT INTO logs (id, run_id, attempt_id, stream, message)
                  VALUES ($1, $2, $3, $4, $5)",
-                &[&log.id, &log.run_id, &log.attempt_id, &log.stream, &log.message],
+                &[
+                    &log.id,
+                    &log.run_id,
+                    &log.attempt_id,
+                    &log.stream,
+                    &log.message,
+                ],
             )
             .map_err(|error| format!("failed to append log: {error}"))?;
         Ok(())
@@ -693,6 +997,7 @@ fn job_from_row(row: Row) -> Result<JobRecord, String> {
         timeout_secs: timeout_secs as u32,
         rate_limit_spec: row.get("rate_limit_spec"),
         concurrency_limit: concurrency_limit.map(|value| value as u32),
+        compute_class: row.get("compute_class"),
         enabled: row.get("enabled"),
         created_at_epoch_ms,
     })
@@ -750,6 +1055,18 @@ fn lease_from_projection_row(row: Row) -> Result<LeaseRecord, String> {
         expires_at_epoch_ms: row.get("expires_at_epoch_ms"),
         acked_at_epoch_ms: row.get("acked_at_epoch_ms"),
         released_at_epoch_ms: row.get("released_at_epoch_ms"),
+    })
+}
+
+fn runner_from_row(row: Row) -> Result<RunnerRecord, String> {
+    let max_concurrent_leases: i32 = row.get("max_concurrent_leases");
+    let heartbeat_timeout_secs: i32 = row.get("heartbeat_timeout_secs");
+    Ok(RunnerRecord {
+        id: row.get("id"),
+        compute_class: row.get("compute_class"),
+        max_concurrent_leases: max_concurrent_leases as u32,
+        heartbeat_timeout_secs: heartbeat_timeout_secs as u64,
+        last_heartbeat_at_epoch_ms: row.get("last_heartbeat_at_epoch_ms"),
     })
 }
 
@@ -856,4 +1173,14 @@ fn now_epoch_ms() -> i64 {
 
 fn timestamp_after_seconds(seconds: u64) -> i64 {
     now_epoch_ms() + (seconds as i64 * 1000)
+}
+
+fn is_terminal_attempt(status: AttemptStatus) -> bool {
+    matches!(
+        status,
+        AttemptStatus::Succeeded
+            | AttemptStatus::Failed
+            | AttemptStatus::TimedOut
+            | AttemptStatus::Canceled
+    )
 }

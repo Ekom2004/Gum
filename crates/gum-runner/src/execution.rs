@@ -73,10 +73,16 @@ async fn execute_leased_run_inner(leased: &LeasedRun) -> Result<ExecutionOutcome
     let stdout_task = tokio::spawn(read_output(stdout));
     let stderr_task = tokio::spawn(read_output(stderr));
 
-    let wait_result = timeout(Duration::from_secs(u64::from(leased.timeout_secs)), child.wait()).await;
+    let wait_result = timeout(
+        Duration::from_secs(u64::from(leased.timeout_secs)),
+        child.wait(),
+    )
+    .await;
     let timed_out = wait_result.is_err();
     let status = match wait_result {
-        Ok(result) => result.map_err(|error| format!("failed waiting for python handler: {error}"))?,
+        Ok(result) => {
+            result.map_err(|error| format!("failed waiting for python handler: {error}"))?
+        }
         Err(_) => {
             child
                 .kill()

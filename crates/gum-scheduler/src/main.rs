@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gum_api::{app_state::AppState, service};
+use gum_store::queries::{ControlLeaseParams, GumStore};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter("info").init();
@@ -24,19 +25,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     runtime.block_on(async move {
         let tick_interval = std::time::Duration::from_secs(5);
+        let leader_ttl_secs = 15;
+        let leader_id = format!("scheduler-{}", std::process::id());
 
-        tracing::info!("gum-scheduler started");
+        tracing::info!(leader_id = %leader_id, "gum-scheduler started");
         loop {
             let now_epoch_ms = now_epoch_ms();
-            let created = service::tick_schedules(&state.store, now_epoch_ms).map_err(|message| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("scheduler tick failed: {message}"),
-                )
-            })?;
+            let is_leader = state
+                .store
+                .try_acquire_control_lease(ControlLeaseParams {
+                    lease_name: "scheduler".to_string(),
+                    holder_id: leader_id.clone(),
+                    ttl_secs: leader_ttl_secs,
+                    now_epoch_ms,
+                })
+                .map_err(|message| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("control lease acquisition failed: {message}"),
+                    )
+                })?;
+            if !is_leader {
+                tokio::time::sleep(tick_interval).await;
+                continue;
+            }
+
+            let recovered = state
+                .store
+                .recover_lost_attempts(now_epoch_ms)
+                .map_err(|message| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("lost-attempt recovery failed: {message}"),
+                    )
+                })?;
+            let created =
+                service::tick_schedules(&state.store, now_epoch_ms).map_err(|message| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("scheduler tick failed: {message}"),
+                    )
+                })?;
 
             if !created.is_empty() {
                 tracing::info!("scheduled {} run(s)", created.len());
+            }
+            if !recovered.is_empty() {
+                tracing::info!("recovered {} lost run(s)", recovered.len());
             }
 
             tokio::time::sleep(tick_interval).await;

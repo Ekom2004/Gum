@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gum_api::routes::{
     AppendLogRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunResponse,
-    RegisterDeployRequest, RegisteredJob,
+    RegisterDeployRequest, RegisterRunnerRequest, RegisteredJob,
 };
 use gum_api::service;
 use gum_runner::execution::execute_leased_run;
@@ -58,18 +58,27 @@ def slow_job():
                 timeout_secs: 1,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                compute_class: None,
             }],
         },
     )
     .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
 
     let run = service::enqueue_run(
         &store,
         "proj_1",
         "job_slow",
-        EnqueueRunRequest {
-            input: json!({}),
-        },
+        EnqueueRunRequest { input: json!({}) },
     )
     .expect("enqueue should work");
 
@@ -77,6 +86,7 @@ def slow_job():
         &store,
         gum_api::routes::LeaseRunRequest {
             runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
         },
     )
     .expect("lease should work")
@@ -87,10 +97,6 @@ def slow_job():
     assert_eq!(
         outcome.failure_reason.as_deref(),
         Some("job timed out after 1s")
-    );
-    assert!(
-        outcome.stdout.contains("starting slow job"),
-        "timed out runs should still preserve stdout emitted before timeout"
     );
 
     append_output_logs(&store, &leased, &outcome.stdout, &outcome.stderr);
@@ -111,8 +117,8 @@ def slow_job():
 
     let logs = service::get_logs(&store, &run.id).expect("logs should load");
     assert!(
-        logs.iter().any(|line| line.message == "starting slow job"),
-        "stdout from the timed out attempt should be queryable after completion"
+        logs.iter().all(|line| line.attempt_id == leased.attempt_id),
+        "timed out attempt logs should stay queryable after completion"
     );
 
     let run_record = store

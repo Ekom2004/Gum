@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::app_state::AppState;
 use crate::routes::{
     AppendLogRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
-    RegisterDeployRequest,
+    RegisterDeployRequest, RegisterRunnerRequest, RunnerHeartbeatRequest,
 };
 use crate::service;
 
@@ -19,6 +19,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/:run_id", get(get_run))
         .route("/v1/runs/:run_id/replay", post(replay_run))
         .route("/v1/runs/:run_id/logs", get(get_logs))
+        .route("/internal/runners/register", post(register_runner))
+        .route("/internal/runners/heartbeat", post(heartbeat_runner))
         .route("/internal/runs/lease", post(lease_run))
         .route(
             "/internal/runs/:run_id/attempts/:attempt_id/logs",
@@ -65,7 +67,13 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.message })).into_response()
+        (
+            self.status,
+            Json(ErrorBody {
+                error: self.message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -148,6 +156,32 @@ pub async fn lease_run(
         Some(run) => Ok(Json(run).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+pub async fn register_runner(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterRunnerRequest>,
+) -> Result<StatusCode, ApiError> {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || service::register_runner(&store, payload))
+        .await
+        .map_err(|error| ApiError::internal(format!("register runner task failed: {error}")))?;
+    result
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(ApiError::from_message)
+}
+
+pub async fn heartbeat_runner(
+    State(state): State<AppState>,
+    Json(payload): Json<RunnerHeartbeatRequest>,
+) -> Result<StatusCode, ApiError> {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || service::heartbeat_runner(&store, payload))
+        .await
+        .map_err(|error| ApiError::internal(format!("runner heartbeat task failed: {error}")))?;
+    result
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(ApiError::from_message)
 }
 
 pub async fn complete_attempt(
