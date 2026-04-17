@@ -7,4 +7,6 @@ dist/
 build/
 *.egg-info/
 .DS_Store
-
+website/node_modules/
+website/.next/
+website/tsconfig.tsbuildinfo

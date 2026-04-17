@@ -1,9 +1,9 @@
 # Gum
 
-Run background jobs that don't break.
+Deploy production functions on Gum.
 
-Gum is a managed execution layer for background jobs. The first version is
-focused on Python jobs with:
+Gum is a managed execution platform for production functions. The first version
+is focused on Python execution with:
 
 - enqueue
 - schedules
@@ -16,3 +16,4 @@ focused on Python jobs with:
 
 Locked product and architecture docs live in [`docs/`](./docs).
 
+The marketing site now lives in [`website/`](./website).
