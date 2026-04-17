@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/gum-types",
+  "crates/gum-store",
+  "crates/gum-queue",
+  "crates/gum-runner",
+  "crates/gum-api",
+  "crates/gum-scheduler",
+]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+axum = "0.7"
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
