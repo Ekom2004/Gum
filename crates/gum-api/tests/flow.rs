@@ -462,6 +462,89 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
 }
 
 #[test]
+fn admin_views_expose_runs_runners_and_leases() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_export".to_string(),
+                name: "export".to_string(),
+                handler_ref: "jobs:export".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 0,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                compute_class: Some("high-mem".to_string()),
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "high-mem".to_string(),
+            max_concurrent_leases: 2,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+
+    let run = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("run should be leased");
+
+    let runs = service::list_runs(&store, 50).expect("runs should list");
+    assert_eq!(runs.runs.len(), 1);
+    assert_eq!(runs.runs[0].id, run.id);
+
+    let runners = service::list_runners(&store).expect("runners should list");
+    assert_eq!(runners.runners.len(), 1);
+    assert_eq!(runners.runners[0].id, "runner_1");
+    assert_eq!(runners.runners[0].active_lease_count, 1);
+
+    let leases = service::list_leases(&store).expect("leases should list");
+    assert_eq!(leases.leases.len(), 1);
+    assert_eq!(leases.leases[0].lease_id, leased.lease_id);
+    assert_eq!(leases.leases[0].runner_id, "runner_1");
+    assert!(!leases.leases[0].cancel_requested);
+}
+
+#[test]
 fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
     let store = MemoryStore::default();
     store

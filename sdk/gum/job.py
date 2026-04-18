@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import update_wrapper
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, Callable, Generic, ParamSpec, TypeVar
 
 from .client import BackfillRef, GumClient, RunRef, default_client
 
@@ -11,107 +9,87 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class JobPolicy:
-    id: str | None = None
+    id: str
+    name: str
+    handler_ref: str
     every: str | None = None
-    retries: int | None = None
-    timeout: str | None = None
+    retries: int = 0
+    timeout: str = "5m"
     rate_limit: str | None = None
     concurrency: int | None = None
-    compute: str | None = None
-    name: str | None = None
+    compute_class: str | None = None
 
 
-class JobDefinition(Callable[P, R]):
+class GumJob(Generic[P, R]):
     def __init__(
         self,
-        fn: Callable[P, R],
+        func: Callable[P, R],
         *,
-        every: str | None = None,
-        retries: int | None = None,
-        timeout: str | None = None,
-        rate_limit: str | None = None,
-        concurrency: int | None = None,
-        compute: str | None = None,
-        name: str | None = None,
-        client: GumClient | None = None,
+        every: str | None,
+        retries: int,
+        timeout: str,
+        rate_limit: str | None,
+        concurrency: int | None,
+        compute: str | None,
+        client: GumClient | None,
     ) -> None:
-        self._fn = fn
+        self._func = func
         self._client = client
-        self.name = name or fn.__name__
-        self.id = f"job_{self.name}"
+        self.name = func.__name__
+        self.id = f"job_{func.__name__}"
         self.policy = JobPolicy(
             id=self.id,
+            name=self.name,
+            handler_ref=f"{func.__module__}:{func.__name__}",
             every=every,
             retries=retries,
             timeout=timeout,
             rate_limit=rate_limit,
             concurrency=concurrency,
-            compute=compute,
-            name=self.name,
+            compute_class=compute,
         )
-        update_wrapper(self, fn)
+        self.__name__ = func.__name__
+        self.__doc__ = getattr(func, "__doc__")
+        self.__module__ = func.__module__
+        self.__gum_policy__ = self.policy
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
-        return self._fn(*args, **kwargs)
+        return self._func(*args, **kwargs)
 
-    def enqueue(
-        self,
-        payload: Mapping[str, Any] | None = None,
-        /,
-        *,
-        client: GumClient | None = None,
-        **kwargs: Any,
-    ) -> RunRef:
-        normalized = _normalize_payload(payload, kwargs)
-        active_client = client or self._client or default_client()
-        return active_client.enqueue(self.id, normalized)
+    def enqueue(self, **payload: object) -> RunRef:
+        return self._gum_client().enqueue(self.id, payload)
 
-    def backfill(
-        self,
-        items: Sequence[Mapping[str, Any]],
-        *,
-        client: GumClient | None = None,
-    ) -> BackfillRef:
-        normalized = [dict(item) for item in items]
-        active_client = client or self._client or default_client()
-        return active_client.backfill(self.id, normalized)
+    def backfill(self, items: list[dict[str, object]]) -> BackfillRef:
+        return self._gum_client().backfill(self.id, items)
+
+    def _gum_client(self) -> GumClient:
+        if self._client is not None:
+            return self._client
+        return default_client()
 
 
 def job(
     *,
     every: str | None = None,
-    retries: int | None = None,
-    timeout: str | None = None,
+    retries: int = 0,
+    timeout: str = "5m",
     rate_limit: str | None = None,
     concurrency: int | None = None,
     compute: str | None = None,
-    name: str | None = None,
     client: GumClient | None = None,
-) -> Callable[[Callable[P, R]], JobDefinition[P, R]]:
-    def wrap(fn: Callable[P, R]) -> JobDefinition[P, R]:
-        return JobDefinition(
-            fn,
+) -> Callable[[Callable[P, R]], GumJob[P, R]]:
+    def decorator(func: Callable[P, R]) -> GumJob[P, R]:
+        return GumJob(
+            func,
             every=every,
             retries=retries,
             timeout=timeout,
             rate_limit=rate_limit,
             concurrency=concurrency,
             compute=compute,
-            name=name,
             client=client,
         )
 
-    return wrap
-
-
-def _normalize_payload(
-    payload: Mapping[str, Any] | None,
-    kwargs: Mapping[str, Any],
-) -> dict[str, Any]:
-    if payload is not None and kwargs:
-        raise ValueError("use either a payload mapping or keyword arguments, not both")
-    if payload is None:
-        return dict(kwargs)
-    return dict(payload)
+    return decorator

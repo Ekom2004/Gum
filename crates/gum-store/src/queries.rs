@@ -1,8 +1,8 @@
 use serde_json::Value;
 
 use crate::models::{
-    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LogRecord, RunRecord,
-    RunnerRecord,
+    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord,
+    LogRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +168,9 @@ pub trait GumStore {
     fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, String>;
     fn get_deploy(&self, deploy_id: &str) -> Result<Option<DeployRecord>, String>;
     fn get_lease_state(&self, lease_id: &str) -> Result<Option<LeaseStateRecord>, String>;
+    fn list_recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>, String>;
+    fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String>;
+    fn list_active_leases(&self) -> Result<Vec<LeaseStatusRecord>, String>;
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String>;
     fn replay_run(&self, params: ReplayRunParams) -> Result<RunRecord, String>;
     fn lease_next_attempt(

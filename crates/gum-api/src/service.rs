@@ -8,8 +8,10 @@ use gum_types::AttemptStatus;
 
 use crate::routes::{
     AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
-    LeaseRunResponse, LeaseStateResponse, LogLine, RegisterDeployRequest, RegisterDeployResponse,
-    RegisterRunnerRequest, ReplayRunResponse, RunResponse, RunnerHeartbeatRequest,
+    LeaseRunResponse, LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
+    RegisterDeployRequest, RegisterDeployResponse, RegisterRunnerRequest, ReplayRunResponse,
+    RunResponse, RunnerHeartbeatRequest, RunnerStatusResponse, RunnersListResponse,
+    RunsListResponse,
 };
 
 pub fn register_deploy<S: GumStore>(
@@ -95,6 +97,49 @@ pub fn get_logs<S: GumStore>(store: &S, run_id: &str) -> Result<Vec<LogLine>, St
             message: entry.message,
         })
         .collect())
+}
+
+pub fn list_runs<S: GumStore>(store: &S, limit: usize) -> Result<RunsListResponse, String> {
+    Ok(RunsListResponse {
+        runs: store
+            .list_recent_runs(limit)?
+            .into_iter()
+            .map(run_response)
+            .collect(),
+    })
+}
+
+pub fn list_runners<S: GumStore>(store: &S) -> Result<RunnersListResponse, String> {
+    Ok(RunnersListResponse {
+        runners: store
+            .list_runners()?
+            .into_iter()
+            .map(|runner| RunnerStatusResponse {
+                id: runner.id,
+                compute_class: runner.compute_class,
+                max_concurrent_leases: runner.max_concurrent_leases,
+                last_heartbeat_at_epoch_ms: runner.last_heartbeat_at_epoch_ms,
+                active_lease_count: runner.active_lease_count,
+            })
+            .collect(),
+    })
+}
+
+pub fn list_leases<S: GumStore>(store: &S) -> Result<LeasesListResponse, String> {
+    Ok(LeasesListResponse {
+        leases: store
+            .list_active_leases()?
+            .into_iter()
+            .map(|lease| LeaseStatusResponse {
+                lease_id: lease.lease_id,
+                run_id: lease.run_id,
+                attempt_id: lease.attempt_id,
+                runner_id: lease.runner_id,
+                expires_at_epoch_ms: lease.expires_at_epoch_ms,
+                cancel_requested: lease.cancel_requested,
+            })
+            .collect(),
+    })
 }
 
 pub fn tick_schedules<S: GumStore>(

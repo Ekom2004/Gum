@@ -20,6 +20,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/v1/runs/:run_id/replay", post(replay_run))
         .route("/v1/runs/:run_id/logs", get(get_logs))
+        .route("/internal/admin/runs", get(list_runs))
+        .route("/internal/admin/runners", get(list_runners))
+        .route("/internal/admin/leases", get(list_leases))
         .route("/internal/runners/register", post(register_runner))
         .route("/internal/runners/heartbeat", post(heartbeat_runner))
         .route("/internal/leases/:lease_id", get(get_lease_state))
@@ -154,6 +157,36 @@ pub async fn get_logs(
     let result = tokio::task::spawn_blocking(move || service::get_logs(&store, &run_id))
         .await
         .map_err(|error| ApiError::internal(format!("get logs task failed: {error}")))?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
+pub async fn list_runs(
+    State(state): State<AppState>,
+) -> Result<Json<crate::routes::RunsListResponse>, ApiError> {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || service::list_runs(&store, 50))
+        .await
+        .map_err(|error| ApiError::internal(format!("list runs task failed: {error}")))?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
+pub async fn list_runners(
+    State(state): State<AppState>,
+) -> Result<Json<crate::routes::RunnersListResponse>, ApiError> {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || service::list_runners(&store))
+        .await
+        .map_err(|error| ApiError::internal(format!("list runners task failed: {error}")))?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
+pub async fn list_leases(
+    State(state): State<AppState>,
+) -> Result<Json<crate::routes::LeasesListResponse>, ApiError> {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || service::list_leases(&store))
+        .await
+        .map_err(|error| ApiError::internal(format!("list leases task failed: {error}")))?;
     result.map(Json).map_err(ApiError::from_message)
 }
 

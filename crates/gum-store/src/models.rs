@@ -107,6 +107,25 @@ pub struct LeaseStateRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerStatusRecord {
+    pub id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub last_heartbeat_at_epoch_ms: i64,
+    pub active_lease_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseStatusRecord {
+    pub lease_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub runner_id: String,
+    pub expires_at_epoch_ms: i64,
+    pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRecord {
     pub id: String,
     pub run_id: String,

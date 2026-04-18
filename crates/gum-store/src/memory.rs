@@ -7,7 +7,7 @@ use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 
 use crate::models::{
     AttemptRecord, ControlLeaseRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord,
-    LogRecord, ProjectRecord, RunRecord, RunnerRecord,
+    LeaseStatusRecord, LogRecord, ProjectRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 use crate::queries::{
     parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
@@ -312,6 +312,81 @@ impl GumStore for MemoryStore {
             cancel_requested: lease.revoke_requested_at_epoch_ms.is_some()
                 || attempt.cancel_requested_at_epoch_ms.is_some(),
         }))
+    }
+
+    fn list_recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut runs: Vec<RunRecord> = state.runs.values().cloned().collect();
+        runs.sort_by(|left, right| {
+            right
+                .scheduled_at_epoch_ms
+                .cmp(&left.scheduled_at_epoch_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if runs.len() > limit {
+            runs.truncate(limit);
+        }
+        Ok(runs)
+    }
+
+    fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut runners: Vec<RunnerStatusRecord> = state
+            .runners
+            .values()
+            .map(|runner| RunnerStatusRecord {
+                id: runner.id.clone(),
+                compute_class: runner.compute_class.clone(),
+                max_concurrent_leases: runner.max_concurrent_leases,
+                last_heartbeat_at_epoch_ms: runner.last_heartbeat_at_epoch_ms,
+                active_lease_count: state
+                    .attempts
+                    .values()
+                    .filter(|attempt| attempt.status == AttemptStatus::Running)
+                    .filter(|attempt| attempt.runner_id.as_deref() == Some(runner.id.as_str()))
+                    .count() as u32,
+            })
+            .collect();
+        runners.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(runners)
+    }
+
+    fn list_active_leases(&self) -> Result<Vec<LeaseStatusRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut leases: Vec<LeaseStatusRecord> = state
+            .leases
+            .values()
+            .filter(|lease| {
+                lease.acked_at_epoch_ms.is_none() && lease.released_at_epoch_ms.is_none()
+            })
+            .filter_map(|lease| {
+                let attempt = state.attempts.get(&lease.attempt_id)?;
+                Some(LeaseStatusRecord {
+                    lease_id: lease.id.clone(),
+                    run_id: attempt.run_id.clone(),
+                    attempt_id: attempt.id.clone(),
+                    runner_id: lease.runner_id.clone(),
+                    expires_at_epoch_ms: lease.expires_at_epoch_ms,
+                    cancel_requested: lease.revoke_requested_at_epoch_ms.is_some()
+                        || attempt.cancel_requested_at_epoch_ms.is_some(),
+                })
+            })
+            .collect();
+        leases.sort_by(|left, right| {
+            left.expires_at_epoch_ms
+                .cmp(&right.expires_at_epoch_ms)
+                .then_with(|| left.lease_id.cmp(&right.lease_id))
+        });
+        Ok(leases)
     }
 
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {

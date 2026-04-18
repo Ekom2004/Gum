@@ -36,9 +36,35 @@ class RunRecord:
 
 
 @dataclass(slots=True)
+class LogLine:
+    attempt_id: str
+    stream: str
+    message: str
+
+
+@dataclass(slots=True)
 class DeployRef:
     id: str
     registered_jobs: int
+
+
+@dataclass(slots=True)
+class RunnerStatus:
+    id: str
+    compute_class: str
+    max_concurrent_leases: int
+    last_heartbeat_at_epoch_ms: int
+    active_lease_count: int
+
+
+@dataclass(slots=True)
+class LeaseStatus:
+    lease_id: str
+    run_id: str
+    attempt_id: str
+    runner_id: str
+    expires_at_epoch_ms: int
+    cancel_requested: bool
 
 
 class RunsAPI:
@@ -53,6 +79,31 @@ class RunsAPI:
         body = self._client._request("POST", f"/v1/runs/{run_id}/replay")
         return _run_ref_from_payload(body)
 
+    def cancel(self, run_id: str) -> RunRef:
+        body = self._client._request("POST", f"/v1/runs/{run_id}/cancel", {"reason": None})
+        return _run_ref_from_payload(body)
+
+    def logs(self, run_id: str) -> list[LogLine]:
+        body = self._client._request("GET", f"/v1/runs/{run_id}/logs")
+        return [_log_line_from_payload(item) for item in body]
+
+    def list(self) -> list[RunRecord]:
+        body = self._client._request("GET", "/internal/admin/runs")
+        return [_run_record_from_payload(item) for item in body.get("runs", [])]
+
+
+class AdminAPI:
+    def __init__(self, client: "GumClient") -> None:
+        self._client = client
+
+    def runners(self) -> list[RunnerStatus]:
+        body = self._client._request("GET", "/internal/admin/runners")
+        return [_runner_status_from_payload(item) for item in body.get("runners", [])]
+
+    def leases(self) -> list[LeaseStatus]:
+        body = self._client._request("GET", "/internal/admin/leases")
+        return [_lease_status_from_payload(item) for item in body.get("leases", [])]
+
 
 @dataclass(slots=True)
 class GumClient:
@@ -63,6 +114,10 @@ class GumClient:
     @property
     def runs(self) -> RunsAPI:
         return RunsAPI(self)
+
+    @property
+    def admin(self) -> AdminAPI:
+        return AdminAPI(self)
 
     def enqueue(self, job_id: str, payload: dict[str, Any]) -> RunRef:
         body = self._request("POST", f"/v1/jobs/{job_id}/runs", {"input": payload})
@@ -134,4 +189,33 @@ def _run_record_from_payload(payload: dict[str, Any]) -> RunRecord:
         trigger_type=payload.get("trigger_type"),
         failure_reason=payload.get("failure_reason"),
         replay_of=payload.get("replay_of"),
+    )
+
+
+def _log_line_from_payload(payload: dict[str, Any]) -> LogLine:
+    return LogLine(
+        attempt_id=payload["attempt_id"],
+        stream=payload["stream"],
+        message=payload["message"],
+    )
+
+
+def _runner_status_from_payload(payload: dict[str, Any]) -> RunnerStatus:
+    return RunnerStatus(
+        id=payload["id"],
+        compute_class=payload["compute_class"],
+        max_concurrent_leases=payload["max_concurrent_leases"],
+        last_heartbeat_at_epoch_ms=payload["last_heartbeat_at_epoch_ms"],
+        active_lease_count=payload["active_lease_count"],
+    )
+
+
+def _lease_status_from_payload(payload: dict[str, Any]) -> LeaseStatus:
+    return LeaseStatus(
+        lease_id=payload["lease_id"],
+        run_id=payload["run_id"],
+        attempt_id=payload["attempt_id"],
+        runner_id=payload["runner_id"],
+        expires_at_epoch_ms=payload["expires_at_epoch_ms"],
+        cancel_requested=payload["cancel_requested"],
     )

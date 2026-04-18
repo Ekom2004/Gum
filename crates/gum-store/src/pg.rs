@@ -6,8 +6,8 @@ use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 use postgres::{Client, NoTls, Row};
 
 use crate::models::{
-    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LogRecord,
-    ProjectRecord, RunRecord, RunnerRecord,
+    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord,
+    LogRecord, ProjectRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 use crate::queries::{
     parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
@@ -379,6 +379,85 @@ impl GumStore for PostgresStore {
             attempt_id: row.get("attempt_id"),
             cancel_requested: row.get("cancel_requested"),
         }))
+    }
+
+    fn list_recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT *,
+                        (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms
+                 FROM runs
+                 ORDER BY scheduled_at DESC, id DESC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .map_err(|error| format!("failed to list recent runs: {error}"))?;
+        rows.into_iter().map(run_from_row).collect()
+    }
+
+    fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT runners.id,
+                        runners.compute_class,
+                        runners.max_concurrent_leases,
+                        (EXTRACT(EPOCH FROM runners.last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms,
+                        COUNT(attempts.id)::bigint AS active_lease_count
+                 FROM runners
+                 LEFT JOIN attempts
+                   ON attempts.runner_id = runners.id
+                  AND attempts.status = 'running'
+                 GROUP BY runners.id, runners.compute_class, runners.max_concurrent_leases, runners.last_heartbeat_at
+                 ORDER BY runners.id ASC",
+                &[],
+            )
+            .map_err(|error| format!("failed to list runners: {error}"))?;
+        rows.into_iter()
+            .map(|row| {
+                let active_lease_count: i64 = row.get("active_lease_count");
+                Ok(RunnerStatusRecord {
+                    id: row.get("id"),
+                    compute_class: row.get("compute_class"),
+                    max_concurrent_leases: row.get::<_, i32>("max_concurrent_leases") as u32,
+                    last_heartbeat_at_epoch_ms: row.get("last_heartbeat_at_epoch_ms"),
+                    active_lease_count: active_lease_count as u32,
+                })
+            })
+            .collect()
+    }
+
+    fn list_active_leases(&self) -> Result<Vec<LeaseStatusRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT leases.id AS lease_id,
+                        attempts.run_id AS run_id,
+                        attempts.id AS attempt_id,
+                        leases.runner_id AS runner_id,
+                        (EXTRACT(EPOCH FROM leases.expires_at) * 1000)::bigint AS expires_at_epoch_ms,
+                        (attempts.cancel_requested_at IS NOT NULL OR leases.revoke_requested_at IS NOT NULL) AS cancel_requested
+                 FROM leases
+                 JOIN attempts ON attempts.id = leases.attempt_id
+                 WHERE leases.acked_at IS NULL
+                   AND leases.released_at IS NULL
+                 ORDER BY leases.expires_at ASC, leases.id ASC",
+                &[],
+            )
+            .map_err(|error| format!("failed to list active leases: {error}"))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(LeaseStatusRecord {
+                    lease_id: row.get("lease_id"),
+                    run_id: row.get("run_id"),
+                    attempt_id: row.get("attempt_id"),
+                    runner_id: row.get("runner_id"),
+                    expires_at_epoch_ms: row.get("expires_at_epoch_ms"),
+                    cancel_requested: row.get("cancel_requested"),
+                })
+            })
+            .collect()
     }
 
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {

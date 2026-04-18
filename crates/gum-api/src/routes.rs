@@ -111,6 +111,40 @@ pub struct LeaseStateResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunsListResponse {
+    pub runs: Vec<RunResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerStatusResponse {
+    pub id: String,
+    pub compute_class: String,
+    pub max_concurrent_leases: u32,
+    pub last_heartbeat_at_epoch_ms: i64,
+    pub active_lease_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnersListResponse {
+    pub runners: Vec<RunnerStatusResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseStatusResponse {
+    pub lease_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub runner_id: String,
+    pub expires_at_epoch_ms: i64,
+    pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeasesListResponse {
+    pub leases: Vec<LeaseStatusResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteAttemptRequest {
     pub runner_id: String,
     pub status: AttemptStatus,
