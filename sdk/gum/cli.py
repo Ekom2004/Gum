@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import sys
 import time
 from typing import Iterable
 
-from .client import GumAPIError, LeaseStatus, LogLine, RunRecord, RunnerStatus, default_client
+from .auth import AdminAuthError, clear_admin_key, default_admin_key, load_admin_key, store_admin_key
+from .client import GumAPIError, GumClient, LeaseStatus, LogLine, RunRecord, RunnerStatus, default_client
 
 
 TERMINAL_RUN_STATUSES = {"succeeded", "failed", "timed_out", "canceled"}
@@ -40,6 +42,36 @@ def main(argv: list[str] | None = None) -> int:
     live_parser.add_argument("--lines", type=int, default=20)
     live_parser.add_argument("--once", action="store_true")
 
+    admin_parser = subparsers.add_parser("admin", help="admin and support commands")
+    admin_parser.add_argument("--interval", type=float, default=1.0)
+    admin_parser.add_argument("--lines", type=int, default=20)
+    admin_parser.add_argument("--once", action="store_true")
+    admin_subparsers = admin_parser.add_subparsers(dest="admin_command")
+
+    admin_subparsers.add_parser("login", help="store an encrypted admin key locally")
+    admin_subparsers.add_parser("logout", help="remove stored admin credentials")
+
+    admin_runs_parser = admin_subparsers.add_parser("runs", help="inspect runs")
+    admin_runs_subparsers = admin_runs_parser.add_subparsers(dest="admin_runs_command", required=True)
+    admin_runs_list_parser = admin_runs_subparsers.add_parser("list", help="show recent runs")
+    admin_runs_list_parser.add_argument("--limit", type=int, default=20)
+    admin_runs_get_parser = admin_runs_subparsers.add_parser("get", help="show one run")
+    admin_runs_get_parser.add_argument("run_id")
+
+    admin_logs_parser = admin_subparsers.add_parser("logs", help="show logs for one run")
+    admin_logs_parser.add_argument("run_id")
+    admin_logs_parser.add_argument("--attempt")
+
+    admin_runners_parser = admin_subparsers.add_parser("runners", help="inspect runners")
+    admin_runners_parser.add_subparsers(dest="admin_runners_command", required=True).add_parser(
+        "list", help="show runners"
+    )
+
+    admin_leases_parser = admin_subparsers.add_parser("leases", help="inspect active leases")
+    admin_leases_parser.add_subparsers(dest="admin_leases_command", required=True).add_parser(
+        "list", help="show leases"
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "deploy":
@@ -66,7 +98,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "list":
-            runs = client.runs.list()[: args.limit]
+            admin_client = require_admin_client(client)
+            runs = admin_client.runs.list()[: args.limit]
             print(render_run_table(runs))
             return 0
 
@@ -99,12 +132,16 @@ def main(argv: list[str] | None = None) -> int:
                     log_lines=args.lines,
                     once=args.once,
                 )
+            admin_client = require_admin_client(client)
             return admin_live_view(
-                client=client,
+                client=admin_client,
                 interval_secs=args.interval,
                 once=args.once,
             )
-    except GumAPIError as exc:
+
+        if args.command == "admin":
+            return handle_admin_command(args, client)
+    except (GumAPIError, AdminAuthError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -112,7 +149,75 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-def run_live_view(*, client, run_id: str, interval_secs: float, log_lines: int, once: bool) -> int:
+def handle_admin_command(args: argparse.Namespace, client: GumClient) -> int:
+    if args.admin_command == "login":
+        admin_key = getpass.getpass("Admin key: ").strip()
+        passphrase = getpass.getpass("Set local passphrase: ")
+        confirm = getpass.getpass("Confirm passphrase: ")
+        if passphrase != confirm:
+            raise AdminAuthError("passphrases do not match")
+        store_admin_key(admin_key, passphrase)
+        print("Stored admin credentials for Gum.")
+        return 0
+
+    if args.admin_command == "logout":
+        if clear_admin_key():
+            print("Cleared stored admin credentials.")
+        else:
+            print("No stored admin credentials.")
+        return 0
+
+    admin_client = require_admin_client(client)
+
+    if args.admin_command is None:
+        return admin_live_view(
+            client=admin_client,
+            interval_secs=args.interval,
+            once=args.once,
+        )
+
+    if args.admin_command == "runs":
+        if args.admin_runs_command == "list":
+            runs = admin_client.runs.list()[: args.limit]
+            print(render_run_table(runs))
+            return 0
+        if args.admin_runs_command == "get":
+            run = admin_client.runs.get(args.run_id)
+            print(render_run_record(run))
+            return 0
+
+    if args.admin_command == "logs":
+        logs = admin_client.runs.logs(args.run_id)
+        print(render_logs(logs, attempt_id=args.attempt))
+        return 0
+
+    if args.admin_command == "runners":
+        print(render_runner_table(admin_client.admin.runners()))
+        return 0
+
+    if args.admin_command == "leases":
+        print(render_lease_table(admin_client.admin.leases()))
+        return 0
+
+    raise AdminAuthError("unsupported admin command")
+
+
+def require_admin_client(client: GumClient) -> GumClient:
+    admin_key = getattr(client, "admin_key", None) or default_admin_key()
+    if admin_key is None:
+        passphrase = getpass.getpass("Unlock passphrase: ")
+        admin_key = load_admin_key(passphrase)
+    if not isinstance(client, GumClient):
+        return client
+    return GumClient(
+        base_url=client.base_url,
+        api_key=client.api_key,
+        admin_key=admin_key,
+        timeout_secs=client.timeout_secs,
+    )
+
+
+def run_live_view(*, client: GumClient, run_id: str, interval_secs: float, log_lines: int, once: bool) -> int:
     while True:
         run = client.runs.get(run_id)
         logs = client.runs.logs(run_id)
@@ -206,7 +311,7 @@ def render_live_frame(run: RunRecord, logs: list[LogLine], *, log_lines: int, in
     return "\n".join(body) + "\n"
 
 
-def admin_live_view(*, client, interval_secs: float, once: bool) -> int:
+def admin_live_view(*, client: GumClient, interval_secs: float, once: bool) -> int:
     while True:
         runs = client.runs.list()
         runners = client.admin.runners()
@@ -237,7 +342,7 @@ def render_admin_live_frame(
     running = sum(1 for run in runs if run.status == "running")
     failed = sum(1 for run in runs if run.status in {"failed", "timed_out"})
     header = (
-        f"GUM LIVE  queued: {queued}   running: {running}   failed: {failed}   "
+        f"GUM ADMIN  queued: {queued}   running: {running}   failed: {failed}   "
         f"runners: {len(runners)}   active leases: {len(leases)}"
     )
     body = [

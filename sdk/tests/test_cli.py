@@ -90,10 +90,21 @@ class CliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = _FakeClient()
         self._old_default_client = gum_cli.default_client
+        self._old_store_admin_key = gum_cli.store_admin_key
+        self._old_clear_admin_key = gum_cli.clear_admin_key
+        self._old_load_admin_key = gum_cli.load_admin_key
+        self._old_default_admin_key = gum_cli.default_admin_key
+        self._old_getpass = gum_cli.getpass.getpass
         gum_cli.default_client = lambda: self.client
+        gum_cli.default_admin_key = lambda: None
 
     def tearDown(self) -> None:
         gum_cli.default_client = self._old_default_client
+        gum_cli.store_admin_key = self._old_store_admin_key
+        gum_cli.clear_admin_key = self._old_clear_admin_key
+        gum_cli.load_admin_key = self._old_load_admin_key
+        gum_cli.default_admin_key = self._old_default_admin_key
+        gum_cli.getpass.getpass = self._old_getpass
 
     def test_get_command_prints_run_details(self) -> None:
         stdout = io.StringIO()
@@ -105,6 +116,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("Status:   running", output)
 
     def test_list_command_prints_recent_runs(self) -> None:
+        gum_cli.load_admin_key = lambda _: "admin-secret"
+        gum_cli.getpass.getpass = lambda _: "passphrase"
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             exit_code = gum_cli.main(["list"])
@@ -141,12 +154,14 @@ class CliTests(unittest.TestCase):
         self.assertIn("[stdout] building csv", output)
 
     def test_live_without_run_id_renders_admin_dashboard(self) -> None:
+        gum_cli.load_admin_key = lambda _: "admin-secret"
+        gum_cli.getpass.getpass = lambda _: "passphrase"
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             exit_code = gum_cli.main(["live", "--once"])
         self.assertEqual(exit_code, 0)
         output = stdout.getvalue()
-        self.assertIn("GUM LIVE", output)
+        self.assertIn("GUM ADMIN", output)
         self.assertIn("runner_1", output)
         self.assertIn("lease_1", output)
 
@@ -161,6 +176,46 @@ class CliTests(unittest.TestCase):
             exit_code = gum_cli.main(["get", "run_123"])
         self.assertEqual(exit_code, 1)
         self.assertIn("GET /v1/runs/run_123 failed", stderr.getvalue())
+
+    def test_admin_login_stores_encrypted_credentials(self) -> None:
+        stored: list[tuple[str, str]] = []
+        gum_cli.store_admin_key = lambda admin_key, passphrase: stored.append((admin_key, passphrase))
+        prompts = iter(["real-admin-key", "1234", "1234"])
+        gum_cli.getpass.getpass = lambda _: next(prompts)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["admin", "login"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stored, [("real-admin-key", "1234")])
+        self.assertIn("Stored admin credentials for Gum.", stdout.getvalue())
+
+    def test_admin_logout_clears_stored_credentials(self) -> None:
+        gum_cli.clear_admin_key = lambda: True
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["admin", "logout"])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Cleared stored admin credentials.", stdout.getvalue())
+
+    def test_admin_dashboard_unlocks_before_requesting_admin_data(self) -> None:
+        gum_cli.load_admin_key = lambda passphrase: "admin-secret" if passphrase == "1234" else ""
+        gum_cli.getpass.getpass = lambda _: "1234"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["admin", "--once"])
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("GUM ADMIN", output)
+        self.assertIn("runner_1", output)
+
+    def test_admin_runs_list_uses_unlocked_admin_key(self) -> None:
+        gum_cli.load_admin_key = lambda _: "admin-secret"
+        gum_cli.getpass.getpass = lambda _: "1234"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["admin", "runs", "list"])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("run_123", stdout.getvalue())
 
 
 if __name__ == "__main__":

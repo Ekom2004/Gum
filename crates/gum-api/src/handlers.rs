@@ -1,5 +1,5 @@
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -65,6 +65,13 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
             message: message.into(),
         }
     }
@@ -162,7 +169,9 @@ pub async fn get_logs(
 
 pub async fn list_runs(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<crate::routes::RunsListResponse>, ApiError> {
+    require_admin(&state.admin_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::list_runs(&store, 50))
         .await
@@ -172,7 +181,9 @@ pub async fn list_runs(
 
 pub async fn list_runners(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<crate::routes::RunnersListResponse>, ApiError> {
+    require_admin(&state.admin_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::list_runners(&store))
         .await
@@ -182,7 +193,9 @@ pub async fn list_runners(
 
 pub async fn list_leases(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<crate::routes::LeasesListResponse>, ApiError> {
+    require_admin(&state.admin_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::list_leases(&store))
         .await
@@ -262,6 +275,57 @@ pub async fn complete_attempt(
     .await
     .map_err(|error| ApiError::internal(format!("complete attempt task failed: {error}")))?;
     result.map(Json).map_err(ApiError::from_message)
+}
+
+fn require_admin(admin_key: &str, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Err(ApiError::unauthorized("missing admin authorization"));
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(ApiError::unauthorized("invalid admin authorization"));
+    };
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return Err(ApiError::unauthorized("invalid admin authorization"));
+    };
+    if token != admin_key {
+        return Err(ApiError::unauthorized("invalid admin authorization"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_admin;
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn admin_auth_rejects_missing_header() {
+        let headers = HeaderMap::new();
+        let error =
+            require_admin("admin-secret", &headers).expect_err("missing header should fail");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn admin_auth_rejects_wrong_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        let error = require_admin("admin-secret", &headers).expect_err("wrong token should fail");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn admin_auth_accepts_matching_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-secret"),
+        );
+        require_admin("admin-secret", &headers).expect("matching token should pass");
+    }
 }
 
 pub async fn append_log(

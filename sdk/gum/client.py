@@ -88,7 +88,7 @@ class RunsAPI:
         return [_log_line_from_payload(item) for item in body]
 
     def list(self) -> list[RunRecord]:
-        body = self._client._request("GET", "/internal/admin/runs")
+        body = self._client._request("GET", "/internal/admin/runs", use_admin_auth=True)
         return [_run_record_from_payload(item) for item in body.get("runs", [])]
 
 
@@ -97,11 +97,11 @@ class AdminAPI:
         self._client = client
 
     def runners(self) -> list[RunnerStatus]:
-        body = self._client._request("GET", "/internal/admin/runners")
+        body = self._client._request("GET", "/internal/admin/runners", use_admin_auth=True)
         return [_runner_status_from_payload(item) for item in body.get("runners", [])]
 
     def leases(self) -> list[LeaseStatus]:
-        body = self._client._request("GET", "/internal/admin/leases")
+        body = self._client._request("GET", "/internal/admin/leases", use_admin_auth=True)
         return [_lease_status_from_payload(item) for item in body.get("leases", [])]
 
 
@@ -109,6 +109,7 @@ class AdminAPI:
 class GumClient:
     base_url: str
     api_key: str | None = None
+    admin_key: str | None = None
     timeout_secs: float = 30.0
 
     @property
@@ -140,11 +141,14 @@ class GumClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        use_admin_auth: bool = False,
     ) -> Any:
         url = f"{self.base_url.rstrip('/')}{path}"
         headers = {"Accept": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        token = self.admin_key if use_admin_auth else self.api_key
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
         data = None
         if payload is not None:
@@ -170,6 +174,7 @@ def default_client() -> GumClient:
     return GumClient(
         base_url=os.environ.get("GUM_API_BASE_URL", "http://127.0.0.1:8000"),
         api_key=os.environ.get("GUM_API_KEY"),
+        admin_key=os.environ.get("GUM_ADMIN_KEY"),
     )
 
 
