@@ -217,8 +217,9 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(
 struct App {
     view: View,
     selected_index: usize,
-    filter_query: String,
+    status_filter: RunFilter,
     filter_mode: bool,
+    filter_selected_index: usize,
     message: String,
     message_is_error: bool,
     snapshot: Snapshot,
@@ -229,8 +230,9 @@ impl App {
         Self {
             view: View::Runs,
             selected_index: 0,
-            filter_query: String::new(),
+            status_filter: RunFilter::All,
             filter_mode: false,
+            filter_selected_index: 0,
             message: "Connected to Gum admin.".to_string(),
             message_is_error: false,
             snapshot: Snapshot::empty(),
@@ -238,7 +240,7 @@ impl App {
     }
 
     fn filtered_runs(&self) -> Vec<RunRecord> {
-        filter_runs(&self.snapshot.runs, &self.filter_query)
+        filter_runs(&self.snapshot.runs, self.status_filter)
     }
 
     fn selected_run(&self) -> Option<RunRecord> {
@@ -281,6 +283,41 @@ impl App {
     fn set_error(&mut self, message: impl Into<String>) {
         self.message = message.into();
         self.message_is_error = true;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunFilter {
+    All,
+    Running,
+    Queued,
+    Failed,
+    TimedOut,
+    Canceled,
+    Succeeded,
+}
+
+impl RunFilter {
+    const OPTIONS: [RunFilter; 7] = [
+        RunFilter::All,
+        RunFilter::Running,
+        RunFilter::Queued,
+        RunFilter::Failed,
+        RunFilter::TimedOut,
+        RunFilter::Canceled,
+        RunFilter::Succeeded,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            RunFilter::All => "all",
+            RunFilter::Running => "running",
+            RunFilter::Queued => "queued",
+            RunFilter::Failed => "failed",
+            RunFilter::TimedOut => "timed_out",
+            RunFilter::Canceled => "canceled",
+            RunFilter::Succeeded => "succeeded",
+        }
     }
 }
 
@@ -377,23 +414,18 @@ async fn handle_key(app: &mut App, client: &ApiClient, code: KeyCode) -> Result<
             }
             KeyCode::Enter => {
                 app.filter_mode = false;
-                app.set_message(format!(
-                    "Run filter: {}",
-                    if app.filter_query.is_empty() {
-                        "all".to_string()
-                    } else {
-                        app.filter_query.clone()
-                    }
-                ));
+                app.status_filter = RunFilter::OPTIONS[app.filter_selected_index];
+                app.set_message(format!("Run filter: {}", app.status_filter.label()));
                 app.clamp_selection();
             }
-            KeyCode::Backspace => {
-                app.filter_query.pop();
-                app.clamp_selection();
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.filter_selected_index =
+                    (app.filter_selected_index + 1) % RunFilter::OPTIONS.len();
             }
-            KeyCode::Char(ch) => {
-                app.filter_query.push(ch);
-                app.clamp_selection();
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.filter_selected_index = (app.filter_selected_index + RunFilter::OPTIONS.len()
+                    - 1)
+                    % RunFilter::OPTIONS.len();
             }
             _ => {}
         }
@@ -426,7 +458,11 @@ async fn handle_key(app: &mut App, client: &ApiClient, code: KeyCode) -> Result<
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::Char('/') => {
             app.filter_mode = true;
-            app.set_message("Type to filter runs. Enter applies. Esc cancels.");
+            app.filter_selected_index = RunFilter::OPTIONS
+                .iter()
+                .position(|filter| *filter == app.status_filter)
+                .unwrap_or(0);
+            app.set_message("Select a status filter. Enter applies. Esc cancels.");
         }
         KeyCode::Char('c') => {
             if let Some(run) = app.selected_run() {
@@ -537,22 +573,13 @@ fn render_message(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         Color::Green
     };
-    let line = if app.filter_mode {
-        Line::from(vec![
-            Span::styled(
-                "FILTER ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.filter_query.clone()),
-        ])
-    } else {
-        Line::from(Span::styled(
-            app.message.clone(),
-            Style::default().fg(color),
-        ))
-    };
+    let line = Line::from(vec![
+        Span::styled(
+            format!("filter: {}  ", app.status_filter.label()),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(app.message.clone(), Style::default().fg(color)),
+    ]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -755,9 +782,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_filter_popup(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(60, 3, frame.area());
-    let block = Block::default().title(" FILTER ").borders(Borders::ALL);
-    let widget = Paragraph::new(app.filter_query.clone()).block(block);
+    let area = centered_rect(40, 11, frame.area());
+    let lines = RunFilter::OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, filter)| {
+            let marker = if index == app.filter_selected_index {
+                "▶"
+            } else {
+                " "
+            };
+            Line::from(format!("{marker} {}", filter.label()))
+        })
+        .collect::<Vec<_>>();
+    let widget = Paragraph::new(lines)
+        .block(panel_block(" FILTER BY STATUS "))
+        .wrap(Wrap { trim: true });
     frame.render_widget(Clear, area);
     frame.render_widget(widget, area);
 }
@@ -855,22 +895,16 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     chars[..max_chars - 1].iter().collect::<String>() + "…"
 }
 
-fn filter_runs(runs: &[RunRecord], query: &str) -> Vec<RunRecord> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return runs.to_vec();
-    }
+fn filter_runs(runs: &[RunRecord], filter: RunFilter) -> Vec<RunRecord> {
     runs.iter()
-        .filter(|run| {
-            run.id.to_lowercase().contains(&query)
-                || run.job_id.to_lowercase().contains(&query)
-                || run.status.to_lowercase().contains(&query)
-                || run
-                    .trigger_type
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&query)
+        .filter(|run| match filter {
+            RunFilter::All => true,
+            RunFilter::Running => run.status == "running",
+            RunFilter::Queued => run.status == "queued",
+            RunFilter::Failed => run.status == "failed",
+            RunFilter::TimedOut => run.status == "timed_out",
+            RunFilter::Canceled => run.status == "canceled",
+            RunFilter::Succeeded => run.status == "succeeded",
         })
         .cloned()
         .collect()
@@ -902,7 +936,7 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_runs, select_item, RunRecord};
+    use super::{filter_runs, select_item, RunFilter, RunRecord};
 
     fn run(id: &str, job_id: &str, status: &str) -> RunRecord {
         RunRecord {
@@ -917,14 +951,15 @@ mod tests {
     }
 
     #[test]
-    fn filter_runs_matches_job_and_status() {
+    fn filter_runs_matches_selected_status() {
         let runs = vec![
             run("run_1", "job_export", "running"),
             run("run_2", "job_sync", "failed"),
         ];
-        assert_eq!(filter_runs(&runs, "export").len(), 1);
-        assert_eq!(filter_runs(&runs, "failed").len(), 1);
-        assert_eq!(filter_runs(&runs, "missing").len(), 0);
+        assert_eq!(filter_runs(&runs, RunFilter::All).len(), 2);
+        assert_eq!(filter_runs(&runs, RunFilter::Running).len(), 1);
+        assert_eq!(filter_runs(&runs, RunFilter::Failed).len(), 1);
+        assert_eq!(filter_runs(&runs, RunFilter::Queued).len(), 0);
     }
 
     #[test]
