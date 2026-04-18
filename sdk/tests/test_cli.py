@@ -217,6 +217,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("run_123", stdout.getvalue())
 
+    def test_filter_runs_matches_job_id_and_status(self) -> None:
+        filtered = gum_cli.filter_runs([self.client.runs._run], "export")
+        self.assertEqual(len(filtered), 1)
+        filtered = gum_cli.filter_runs([self.client.runs._run], "running")
+        self.assertEqual(len(filtered), 1)
+        filtered = gum_cli.filter_runs([self.client.runs._run], "missing")
+        self.assertEqual(filtered, [])
+
+    def test_render_view_tabs_marks_active_view(self) -> None:
+        tabs = gum_cli.render_view_tabs("runners")
+        self.assertIn("[2:runners]", tabs)
+        self.assertIn("1:runs", tabs)
+        self.assertIn("3:leases", tabs)
+
+    def test_render_runs_panel_uses_status_symbol_for_selected_run(self) -> None:
+        lines = gum_cli.render_runs_panel([self.client.runs._run], 0)
+        self.assertIn("> ●", lines[1])
+
 
 if __name__ == "__main__":
     unittest.main()

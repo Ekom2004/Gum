@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import curses
 import getpass
+import os
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from typing import Iterable
 
 from .auth import AdminAuthError, clear_admin_key, default_admin_key, load_admin_key, store_admin_key
@@ -11,6 +17,26 @@ from .client import GumAPIError, GumClient, LeaseStatus, LogLine, RunRecord, Run
 
 
 TERMINAL_RUN_STATUSES = {"succeeded", "failed", "timed_out", "canceled"}
+RUN_FAILURE_STATUSES = {"failed", "timed_out"}
+CONSOLE_VIEWS = ("runs", "runners", "leases")
+STATUS_SYMBOLS = {
+    "queued": "○",
+    "running": "●",
+    "failed": "×",
+    "timed_out": "!",
+    "canceled": "■",
+    "succeeded": "✓",
+}
+
+
+@dataclass
+class AdminConsoleState:
+    view: str = "runs"
+    selected_index: int = 0
+    filter_query: str = ""
+    filter_mode: bool = False
+    message: str = ""
+    message_level: str = "info"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -170,6 +196,8 @@ def handle_admin_command(args: argparse.Namespace, client: GumClient) -> int:
     admin_client = require_admin_client(client)
 
     if args.admin_command is None:
+        if not args.once and sys.stdin.isatty() and sys.stdout.isatty():
+            return launch_ratatui_admin(client=admin_client)
         return admin_live_view(
             client=admin_client,
             interval_secs=args.interval,
@@ -214,6 +242,40 @@ def require_admin_client(client: GumClient) -> GumClient:
         api_key=client.api_key,
         admin_key=admin_key,
         timeout_secs=client.timeout_secs,
+    )
+
+
+def launch_ratatui_admin(*, client: GumClient) -> int:
+    command, workdir = resolve_admin_tui_command()
+    env = {
+        **os.environ,
+        "GUM_API_BASE_URL": client.base_url,
+    }
+    if client.admin_key is not None:
+        env["GUM_ADMIN_KEY"] = client.admin_key
+    try:
+        completed = subprocess.run(command, cwd=workdir, env=env, check=False)
+    except OSError as exc:
+        raise AdminAuthError(f"failed to launch gum-admin: {exc}") from exc
+    return completed.returncode
+
+
+def resolve_admin_tui_command() -> tuple[list[str], str | None]:
+    explicit = os.environ.get("GUM_ADMIN_TUI_BIN")
+    if explicit:
+        return [explicit], None
+    installed = shutil.which("gum-admin")
+    if installed:
+        return [installed], None
+
+    repo_root = Path(__file__).resolve().parents[2]
+    cargo_toml = repo_root / "Cargo.toml"
+    crate_dir = repo_root / "crates" / "gum-admin"
+    if cargo_toml.exists() and crate_dir.exists():
+        return ["cargo", "run", "-q", "-p", "gum-admin", "--"], str(repo_root)
+
+    raise AdminAuthError(
+        "gum-admin binary not found; set GUM_ADMIN_TUI_BIN or run inside the Gum repo"
     )
 
 
@@ -333,6 +395,382 @@ def admin_live_view(*, client: GumClient, interval_secs: float, once: bool) -> i
             time.sleep(interval_secs)
         except KeyboardInterrupt:
             return 0
+
+
+def run_admin_console(*, client: GumClient, interval_secs: float) -> int:
+    state = AdminConsoleState()
+    return curses.wrapper(lambda screen: _admin_console_loop(screen, client, interval_secs, state))
+
+
+def _admin_console_loop(screen, client: GumClient, interval_secs: float, state: AdminConsoleState) -> int:
+    init_console_colors()
+    curses.curs_set(0)
+    screen.nodelay(True)
+    screen.timeout(max(100, int(interval_secs * 1000)))
+    while True:
+        try:
+            snapshot = fetch_admin_snapshot(client, state)
+        except GumAPIError as exc:
+            state.message = str(exc)
+            state.message_level = "error"
+            snapshot = AdminSnapshot(runs=[], runners=[], leases=[], logs=[])
+        draw_admin_console(screen, state, snapshot, interval_secs)
+        key = screen.getch()
+        if key == -1:
+            continue
+        if state.filter_mode:
+            if handle_filter_key(state, key):
+                continue
+            if key == 27:
+                state.filter_mode = False
+                state.message = "Filter canceled."
+                continue
+        if key in (ord("q"),):
+            return 0
+        if key in (ord("1"),):
+            state.view = "runs"
+            state.selected_index = 0
+        elif key in (ord("2"),):
+            state.view = "runners"
+            state.selected_index = 0
+        elif key in (ord("3"),):
+            state.view = "leases"
+            state.selected_index = 0
+        elif key in (ord("j"), curses.KEY_DOWN):
+            move_selection(state, snapshot, 1)
+        elif key in (ord("k"), curses.KEY_UP):
+            move_selection(state, snapshot, -1)
+        elif key == ord("/"):
+            state.filter_mode = True
+            state.message = "Type to filter runs. Enter applies. Esc cancels."
+        elif key in (ord("c"),):
+            if state.view == "runs":
+                run = selected_run(snapshot.runs, state)
+                if run is not None:
+                    try:
+                        client.runs.cancel(run.id)
+                        state.message = f"Canceled {run.id}."
+                    except GumAPIError as exc:
+                        state.message = str(exc)
+        elif key in (ord("r"),):
+            if state.view == "runs":
+                run = selected_run(snapshot.runs, state)
+                if run is not None:
+                    try:
+                        replayed = client.runs.replay(run.id)
+                        state.message = f"Replayed {replayed.id}."
+                    except GumAPIError as exc:
+                        state.message = str(exc)
+        elif key in (10, 13, curses.KEY_ENTER):
+            state.message = "Selected item shown in detail pane."
+
+
+@dataclass
+class AdminSnapshot:
+    runs: list[RunRecord]
+    runners: list[RunnerStatus]
+    leases: list[LeaseStatus]
+    logs: list[LogLine]
+
+
+def fetch_admin_snapshot(client: GumClient, state: AdminConsoleState) -> AdminSnapshot:
+    runs = filter_runs(client.runs.list(), state.filter_query)
+    runners = client.admin.runners()
+    leases = client.admin.leases()
+    logs: list[LogLine] = []
+    run = selected_run(runs, state)
+    if run is not None:
+        logs = client.runs.logs(run.id)
+    clamp_selection(state, runs, runners, leases)
+    return AdminSnapshot(runs=runs, runners=runners, leases=leases, logs=logs)
+
+
+def filter_runs(runs: list[RunRecord], query: str) -> list[RunRecord]:
+    query = query.strip().lower()
+    if not query:
+        return runs
+    return [
+        run
+        for run in runs
+        if query in run.id.lower()
+        or query in run.job_id.lower()
+        or query in run.status.lower()
+        or query in (run.trigger_type or "").lower()
+    ]
+
+
+def selected_run(runs: list[RunRecord], state: AdminConsoleState) -> RunRecord | None:
+    if not runs:
+        return None
+    if state.selected_index < 0:
+        state.selected_index = 0
+    if state.selected_index >= len(runs):
+        state.selected_index = len(runs) - 1
+    return runs[state.selected_index]
+
+
+def clamp_selection(
+    state: AdminConsoleState,
+    runs: list[RunRecord],
+    runners: list[RunnerStatus],
+    leases: list[LeaseStatus],
+) -> None:
+    items = {
+        "runs": len(runs),
+        "runners": len(runners),
+        "leases": len(leases),
+    }[state.view]
+    if items == 0:
+        state.selected_index = 0
+        return
+    state.selected_index = max(0, min(state.selected_index, items - 1))
+
+
+def move_selection(state: AdminConsoleState, snapshot: AdminSnapshot, delta: int) -> None:
+    items = {
+        "runs": len(snapshot.runs),
+        "runners": len(snapshot.runners),
+        "leases": len(snapshot.leases),
+    }[state.view]
+    if items == 0:
+        state.selected_index = 0
+        return
+    state.selected_index = (state.selected_index + delta) % items
+
+
+def handle_filter_key(state: AdminConsoleState, key: int) -> bool:
+    if key in (10, 13, curses.KEY_ENTER):
+        state.filter_mode = False
+        state.message = f'Run filter: "{state.filter_query or "all"}"'
+        return True
+    if key in (curses.KEY_BACKSPACE, 127, 8):
+        state.filter_query = state.filter_query[:-1]
+        return True
+    if 32 <= key <= 126:
+        state.filter_query += chr(key)
+        return True
+    return False
+
+
+def draw_admin_console(screen, state: AdminConsoleState, snapshot: AdminSnapshot, interval_secs: float) -> None:
+    screen.erase()
+    height, width = screen.getmaxyx()
+    status_line = render_admin_header(snapshot)
+    screen.addnstr(0, 0, status_line, width - 1, color_attr("header"))
+    screen.hline(1, 0, curses.ACS_HLINE, width)
+    screen.addnstr(2, 0, render_view_tabs(state.view), width - 1, color_attr("tabs"))
+    if state.filter_mode:
+        screen.addnstr(3, 0, f"Filter: {state.filter_query}", width - 1, color_attr("accent"))
+    elif state.message:
+        screen.addnstr(3, 0, state.message, width - 1, color_attr("message", state.message_level))
+
+    top_start = 5
+    top_height = max(10, height // 2)
+    left_width = max(48, width // 2)
+    draw_boxed_panel(
+        screen,
+        start_y=top_start,
+        start_x=0,
+        width=left_width,
+        height=top_height - top_start,
+        title=panel_title(state.view),
+        lines=render_primary_panel(state, snapshot),
+    )
+    draw_boxed_panel(
+        screen,
+        start_y=top_start,
+        start_x=left_width + 1,
+        width=width - left_width - 1,
+        height=top_height - top_start,
+        title="DETAIL",
+        lines=render_detail_panel(state, snapshot),
+    )
+    draw_boxed_panel(
+        screen,
+        start_y=top_height + 1,
+        start_x=0,
+        width=width,
+        height=height - top_height - 3,
+        title="LOGS",
+        lines=render_logs_panel(snapshot.logs),
+    )
+    footer = "j/k move  / filter  enter inspect  c cancel  r replay  1 runs  2 runners  3 leases  q quit"
+    screen.addnstr(height - 1, 0, footer[: width - 1], width - 1, color_attr("footer"))
+    screen.refresh()
+
+
+def render_admin_header(snapshot: AdminSnapshot) -> str:
+    queued = sum(1 for run in snapshot.runs if run.status == "queued")
+    running = sum(1 for run in snapshot.runs if run.status == "running")
+    failed = sum(1 for run in snapshot.runs if run.status in RUN_FAILURE_STATUSES)
+    return (
+        f"GUM ADMIN  queued: {queued}   running: {running}   failed: {failed}   "
+        f"runners: {len(snapshot.runners)}   active leases: {len(snapshot.leases)}"
+    )
+
+
+def render_view_tabs(active_view: str) -> str:
+    parts: list[str] = []
+    for index, view in enumerate(CONSOLE_VIEWS, start=1):
+        label = f"{index}:{view}"
+        if view == active_view:
+            label = f"[{label}]"
+        parts.append(label)
+    return "  ".join(parts)
+
+
+def render_primary_panel(state: AdminConsoleState, snapshot: AdminSnapshot) -> list[str]:
+    if state.view == "runs":
+        return render_runs_panel(snapshot.runs, state.selected_index)
+    if state.view == "runners":
+        return render_runners_panel(snapshot.runners, state.selected_index)
+    return render_leases_panel(snapshot.leases, state.selected_index)
+
+
+def render_runs_panel(runs: list[RunRecord], selected_index: int) -> list[str]:
+    lines = ["status   job                  run id               attempt  trigger"]
+    if not runs:
+        return lines + ["No runs found."]
+    for index, run in enumerate(runs[:20]):
+        marker = ">" if index == selected_index else " "
+        symbol = status_symbol(run.status)
+        lines.append(
+            f"{marker} {symbol:<2} {run.job_id:<20} {run.id:<20} {run.attempt:<8} {(run.trigger_type or '--'):<10}"
+        )
+    return lines
+
+
+def render_runners_panel(runners: list[RunnerStatus], selected_index: int) -> list[str]:
+    lines = ["id                   class       active/max  heartbeat(ms)"]
+    if not runners:
+        return lines + ["No runners found."]
+    for index, runner in enumerate(runners[:20]):
+        marker = ">" if index == selected_index else " "
+        lines.append(
+            f"{marker} {runner.id:<20} {runner.compute_class:<11} {runner.active_lease_count}/{runner.max_concurrent_leases:<9} {runner.last_heartbeat_at_epoch_ms}"
+        )
+    return lines
+
+
+def render_leases_panel(leases: list[LeaseStatus], selected_index: int) -> list[str]:
+    lines = ["lease id             run id               runner               cancel"]
+    if not leases:
+        return lines + ["No active leases."]
+    for index, lease in enumerate(leases[:20]):
+        marker = ">" if index == selected_index else " "
+        cancel = "yes" if lease.cancel_requested else "no"
+        lines.append(
+            f"{marker} {lease.lease_id:<20} {lease.run_id:<20} {lease.runner_id:<20} {cancel:<6}"
+        )
+    return lines
+
+
+def render_detail_panel(state: AdminConsoleState, snapshot: AdminSnapshot) -> list[str]:
+    if state.view == "runs":
+        run = selected_run(snapshot.runs, state)
+        if run is None:
+            return ["No run selected."]
+        return [
+            f"run:      {run.id}",
+            f"job:      {run.job_id}",
+            f"status:   {status_symbol(run.status)} {run.status}",
+            f"attempt:  {run.attempt}",
+            f"trigger:  {run.trigger_type or '--'}",
+            f"replay:   {run.replay_of or '--'}",
+            f"failure:  {run.failure_reason or '--'}",
+        ]
+    if state.view == "runners":
+        if not snapshot.runners:
+            return ["No runner selected."]
+        runner = snapshot.runners[state.selected_index]
+        return [
+            f"runner:   {runner.id}",
+            f"class:    {runner.compute_class}",
+            f"active:   {runner.active_lease_count}/{runner.max_concurrent_leases}",
+            f"seen:     {runner.last_heartbeat_at_epoch_ms}",
+        ]
+    if not snapshot.leases:
+        return ["No lease selected."]
+    lease = snapshot.leases[state.selected_index]
+    return [
+        f"lease:    {lease.lease_id}",
+        f"run:      {lease.run_id}",
+        f"attempt:  {lease.attempt_id}",
+        f"runner:   {lease.runner_id}",
+        f"expires:  {lease.expires_at_epoch_ms}",
+        f"cancel:   {'yes' if lease.cancel_requested else 'no'}",
+    ]
+
+
+def render_logs_panel(logs: list[LogLine]) -> list[str]:
+    lines: list[str] = []
+    if not logs:
+        return ["No logs for selected run."]
+    for log in logs[-12:]:
+        lines.append(f"[{log.stream}] {log.message}")
+    return lines
+
+
+def draw_boxed_panel(screen, *, start_y: int, start_x: int, width: int, height: int, title: str, lines: list[str]) -> None:
+    if width <= 4 or height <= 2:
+        return
+    bottom = start_y + height - 1
+    right = start_x + width - 1
+    screen.addch(start_y, start_x, curses.ACS_ULCORNER)
+    screen.hline(start_y, start_x + 1, curses.ACS_HLINE, max(0, width - 2))
+    screen.addch(start_y, right, curses.ACS_URCORNER)
+    screen.vline(start_y + 1, start_x, curses.ACS_VLINE, max(0, height - 2))
+    screen.vline(start_y + 1, right, curses.ACS_VLINE, max(0, height - 2))
+    screen.addch(bottom, start_x, curses.ACS_LLCORNER)
+    screen.hline(bottom, start_x + 1, curses.ACS_HLINE, max(0, width - 2))
+    screen.addch(bottom, right, curses.ACS_LRCORNER)
+    screen.addnstr(start_y, start_x + 2, f" {title} ", max(1, width - 4), color_attr("panel_title"))
+    for offset, line in enumerate(lines[: max(0, height - 2)]):
+        screen.addnstr(start_y + 1 + offset, start_x + 1, line, max(1, width - 2))
+
+
+def panel_title(view: str) -> str:
+    return {
+        "runs": "RUNS",
+        "runners": "RUNNERS",
+        "leases": "LEASES",
+    }[view]
+
+
+def status_symbol(status: str) -> str:
+    return STATUS_SYMBOLS.get(status, "?")
+
+
+def init_console_colors() -> None:
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_WHITE, -1)
+    curses.init_pair(2, curses.COLOR_CYAN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    curses.init_pair(5, curses.COLOR_GREEN, -1)
+
+
+def color_attr(kind: str, level: str | None = None) -> int:
+    if not curses.has_colors():
+        return curses.A_NORMAL
+    if kind == "header":
+        return curses.color_pair(2) | curses.A_BOLD
+    if kind == "tabs":
+        return curses.color_pair(1) | curses.A_BOLD
+    if kind == "panel_title":
+        return curses.color_pair(2) | curses.A_BOLD
+    if kind == "footer":
+        return curses.color_pair(1)
+    if kind == "accent":
+        return curses.color_pair(3) | curses.A_BOLD
+    if kind == "message":
+        if level == "error":
+            return curses.color_pair(4) | curses.A_BOLD
+        return curses.color_pair(5) | curses.A_BOLD
+    return curses.A_NORMAL
 
 
 def render_admin_live_frame(
