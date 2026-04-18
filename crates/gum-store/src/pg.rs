@@ -7,12 +7,15 @@ use postgres::{Client, NoTls, Row};
 
 use crate::models::{
     AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord,
-    LogRecord, ProjectRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
+    LogRecord, ProjectRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord,
+    ProviderHealthState, ProviderTargetRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 use crate::queries::{
-    parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
+    compute_retry_disposition, is_provider_failure_class, parse_rate_limit_spec,
+    parse_schedule_interval_ms, provider_slug_from_job, CancelRunParams, CompleteAttemptParams,
     ControlLeaseParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
-    RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
+    RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
+    SetProviderHealthParams, UpsertProviderTargetParams,
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_slice1.sql");
@@ -21,6 +24,8 @@ const MIGRATION_0003: &str = include_str!("../migrations/0003_runner_liveness.sq
 const MIGRATION_0004: &str =
     include_str!("../migrations/0004_control_leases_and_compute_classes.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_cancel_revoke.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_provider_health.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_retry_policy.sql");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -57,6 +62,12 @@ impl PostgresStore {
             .batch_execute(MIGRATION_0005)
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
+            .batch_execute(MIGRATION_0006)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
+            .batch_execute(MIGRATION_0007)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
             .execute(
                 "INSERT INTO projects (id, name, slug, api_key_hash)
                  VALUES ($1, $2, $3, $4)
@@ -84,6 +95,181 @@ impl PostgresStore {
     fn next_id(&self, prefix: &str) -> String {
         let counter = self.ids.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{prefix}_{}_{}", now_epoch_ms(), counter)
+    }
+
+    fn provider_health_by_slug_tx(
+        tx: &mut postgres::Transaction<'_>,
+        provider_slug: &str,
+    ) -> Result<Option<ProviderHealthRecord>, String> {
+        let row = tx
+            .query_opt(
+                "SELECT provider_health.provider_target_id,
+                        provider_targets.name AS provider_name,
+                        provider_targets.slug AS provider_slug,
+                        provider_health.state,
+                        provider_health.reason,
+                        (EXTRACT(EPOCH FROM provider_health.last_changed_at) * 1000)::bigint AS last_changed_at_epoch_ms,
+                        CASE
+                            WHEN provider_health.last_success_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM provider_health.last_success_at) * 1000)::bigint
+                        END AS last_success_at_epoch_ms,
+                        CASE
+                            WHEN provider_health.last_failure_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM provider_health.last_failure_at) * 1000)::bigint
+                        END AS last_failure_at_epoch_ms,
+                        provider_health.degraded_score,
+                        provider_health.down_score
+                 FROM provider_health
+                 JOIN provider_targets ON provider_targets.id = provider_health.provider_target_id
+                 WHERE provider_targets.slug = $1",
+                &[&provider_slug],
+            )
+            .map_err(|error| format!("failed to load provider health by slug: {error}"))?;
+        row.map(provider_health_from_row).transpose()
+    }
+
+    fn apply_provider_signal_tx(
+        &self,
+        tx: &mut postgres::Transaction<'_>,
+        provider_slug: &str,
+        signal_status: ProviderCheckStatus,
+        error_class: Option<&str>,
+        now_epoch_ms: i64,
+    ) -> Result<(), String> {
+        let target_row = tx
+            .query_opt(
+                "SELECT *,
+                        (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_epoch_ms
+                 FROM provider_targets
+                 WHERE slug = $1",
+                &[&provider_slug],
+            )
+            .map_err(|error| format!("failed to load provider target by slug: {error}"))?;
+        let Some(target_row) = target_row else {
+            return Ok(());
+        };
+        let target = provider_target_from_row(target_row)?;
+        let previous = Self::provider_health_by_slug_tx(tx, provider_slug)?;
+
+        tx.execute(
+            "INSERT INTO provider_checks (
+                id, provider_target_id, status, latency_ms, error_class, status_code, checked_at
+             ) VALUES ($1, $2, $3, NULL, $4, NULL, TO_TIMESTAMP($5::double precision / 1000.0))",
+            &[
+                &self.next_id("pcheck"),
+                &target.id,
+                &provider_check_status_to_str(signal_status),
+                &error_class.map(str::to_string),
+                &(now_epoch_ms as f64),
+            ],
+        )
+        .map_err(|error| format!("failed to record provider request signal: {error}"))?;
+
+        let (
+            state,
+            reason,
+            last_success_at_epoch_ms,
+            last_failure_at_epoch_ms,
+            degraded_score,
+            down_score,
+        ) = match signal_status {
+            ProviderCheckStatus::Success => (
+                ProviderHealthState::Healthy,
+                None,
+                Some(now_epoch_ms),
+                previous
+                    .as_ref()
+                    .and_then(|record| record.last_failure_at_epoch_ms),
+                previous
+                    .as_ref()
+                    .map(|record| record.degraded_score.saturating_sub(2))
+                    .unwrap_or(0),
+                0,
+            ),
+            ProviderCheckStatus::Failure => {
+                let next_down = (previous
+                    .as_ref()
+                    .map(|record| record.down_score)
+                    .unwrap_or(0)
+                    + 1)
+                .clamp(0, 10);
+                (
+                    if next_down >= 3 {
+                        ProviderHealthState::Down
+                    } else {
+                        ProviderHealthState::Degraded
+                    },
+                    Some(
+                        error_class
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "provider request failed".to_string()),
+                    ),
+                    previous
+                        .as_ref()
+                        .and_then(|record| record.last_success_at_epoch_ms),
+                    Some(now_epoch_ms),
+                    (previous
+                        .as_ref()
+                        .map(|record| record.degraded_score)
+                        .unwrap_or(0)
+                        + 1)
+                    .clamp(0, 10),
+                    next_down,
+                )
+            }
+        };
+
+        let last_changed_at_epoch_ms = if previous
+            .as_ref()
+            .map(|record| record.state == state)
+            .unwrap_or(false)
+        {
+            previous
+                .as_ref()
+                .map(|record| record.last_changed_at_epoch_ms)
+                .unwrap_or(now_epoch_ms)
+        } else {
+            now_epoch_ms
+        };
+
+        tx.execute(
+            "INSERT INTO provider_health (
+                provider_target_id, state, reason, last_changed_at, last_success_at,
+                last_failure_at, degraded_score, down_score, updated_at
+             ) VALUES (
+                $1,
+                $2,
+                $3,
+                TO_TIMESTAMP($4::double precision / 1000.0),
+                CASE WHEN $5::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($5::double precision / 1000.0) END,
+                CASE WHEN $6::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($6::double precision / 1000.0) END,
+                $7,
+                $8,
+                NOW()
+             )
+             ON CONFLICT (provider_target_id) DO UPDATE
+             SET state = EXCLUDED.state,
+                 reason = EXCLUDED.reason,
+                 last_changed_at = EXCLUDED.last_changed_at,
+                 last_success_at = EXCLUDED.last_success_at,
+                 last_failure_at = EXCLUDED.last_failure_at,
+                 degraded_score = EXCLUDED.degraded_score,
+                 down_score = EXCLUDED.down_score,
+                 updated_at = NOW()",
+            &[
+                &target.id,
+                &provider_health_state_to_str(state),
+                &reason,
+                &(last_changed_at_epoch_ms as f64),
+                &last_success_at_epoch_ms.map(|value| value as f64),
+                &last_failure_at_epoch_ms.map(|value| value as f64),
+                &degraded_score,
+                &down_score,
+            ],
+        )
+        .map_err(|error| format!("failed to update provider health from request signal: {error}"))?;
+
+        Ok(())
     }
 }
 
@@ -197,6 +383,188 @@ impl GumStore for PostgresStore {
         tx.commit()
             .map_err(|error| format!("failed to commit deploy transaction: {error}"))?;
         Ok((deploy, jobs))
+    }
+
+    fn upsert_provider_target(
+        &self,
+        params: UpsertProviderTargetParams,
+    ) -> Result<ProviderTargetRecord, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_one(
+                "INSERT INTO provider_targets (
+                    id, name, slug, probe_kind, probe_config_json, enabled, updated_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                 ON CONFLICT (id) DO UPDATE
+                 SET name = EXCLUDED.name,
+                     slug = EXCLUDED.slug,
+                     probe_kind = EXCLUDED.probe_kind,
+                     probe_config_json = EXCLUDED.probe_config_json,
+                     enabled = EXCLUDED.enabled,
+                     updated_at = NOW()
+                 RETURNING *,
+                           (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_epoch_ms",
+                &[
+                    &params.id,
+                    &params.name,
+                    &params.slug,
+                    &params.probe_kind,
+                    &params.probe_config_json,
+                    &params.enabled,
+                ],
+            )
+            .map_err(|error| format!("failed to upsert provider target: {error}"))?;
+        provider_target_from_row(row)
+    }
+
+    fn record_provider_check(
+        &self,
+        params: RecordProviderCheckParams,
+    ) -> Result<ProviderCheckRecord, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_one(
+                "INSERT INTO provider_checks (
+                    id, provider_target_id, status, latency_ms, error_class, status_code, checked_at
+                 ) VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    TO_TIMESTAMP($7::double precision / 1000.0)
+                 )
+                 RETURNING *,
+                           (EXTRACT(EPOCH FROM checked_at) * 1000)::bigint AS checked_at_epoch_ms",
+                &[
+                    &self.next_id("pch"),
+                    &params.provider_target_id,
+                    &provider_check_status_to_str(params.status),
+                    &params.latency_ms.map(|value| value as i32),
+                    &params.error_class,
+                    &params.status_code.map(|value| value as i32),
+                    &(params.checked_at_epoch_ms as f64),
+                ],
+            )
+            .map_err(|error| format!("failed to record provider check: {error}"))?;
+        provider_check_from_row(row)
+    }
+
+    fn set_provider_health(
+        &self,
+        params: SetProviderHealthParams,
+    ) -> Result<ProviderHealthRecord, String> {
+        let mut client = self.connect_client()?;
+        let mut tx = client
+            .transaction()
+            .map_err(|error| format!("failed to start provider health transaction: {error}"))?;
+        tx.execute(
+                "INSERT INTO provider_health (
+                    provider_target_id, state, reason, last_changed_at, last_success_at,
+                    last_failure_at, degraded_score, down_score, updated_at
+                 ) VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    TO_TIMESTAMP($4::double precision / 1000.0),
+                    CASE WHEN $5::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($5::double precision / 1000.0) END,
+                    CASE WHEN $6::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($6::double precision / 1000.0) END,
+                    $7,
+                    $8,
+                    NOW()
+                 )
+                 ON CONFLICT (provider_target_id) DO UPDATE
+                 SET state = EXCLUDED.state,
+                     reason = EXCLUDED.reason,
+                     last_changed_at = EXCLUDED.last_changed_at,
+                     last_success_at = EXCLUDED.last_success_at,
+                     last_failure_at = EXCLUDED.last_failure_at,
+                     degraded_score = EXCLUDED.degraded_score,
+                     down_score = EXCLUDED.down_score,
+                     updated_at = NOW()",
+                &[
+                    &params.provider_target_id,
+                    &provider_health_state_to_str(params.state),
+                    &params.reason,
+                    &(params.last_changed_at_epoch_ms as f64),
+                    &params.last_success_at_epoch_ms.map(|value| value as f64),
+                    &params.last_failure_at_epoch_ms.map(|value| value as f64),
+                    &params.degraded_score,
+                    &params.down_score,
+                ],
+            )
+            .map_err(|error| format!("failed to set provider health: {error}"))?;
+        let row = tx
+            .query_one(
+                "SELECT provider_health.provider_target_id,
+                        provider_targets.name AS provider_name,
+                        provider_targets.slug AS provider_slug,
+                        provider_health.state,
+                        provider_health.reason,
+                        (EXTRACT(EPOCH FROM provider_health.last_changed_at) * 1000)::bigint AS last_changed_at_epoch_ms,
+                        CASE
+                            WHEN provider_health.last_success_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM provider_health.last_success_at) * 1000)::bigint
+                        END AS last_success_at_epoch_ms,
+                        CASE
+                            WHEN provider_health.last_failure_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM provider_health.last_failure_at) * 1000)::bigint
+                        END AS last_failure_at_epoch_ms,
+                        provider_health.degraded_score,
+                        provider_health.down_score
+                 FROM provider_health
+                 JOIN provider_targets ON provider_targets.id = provider_health.provider_target_id
+                 WHERE provider_health.provider_target_id = $1",
+                &[&params.provider_target_id],
+            )
+            .map_err(|error| format!("failed to reload provider health: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("failed to commit provider health transaction: {error}"))?;
+        provider_health_from_row(row)
+    }
+
+    fn list_provider_targets(&self) -> Result<Vec<ProviderTargetRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT *,
+                        (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_epoch_ms
+                 FROM provider_targets
+                 ORDER BY slug ASC",
+                &[],
+            )
+            .map_err(|error| format!("failed to list provider targets: {error}"))?;
+        rows.into_iter().map(provider_target_from_row).collect()
+    }
+
+    fn list_provider_health(&self) -> Result<Vec<ProviderHealthRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT provider_health.provider_target_id,
+                        provider_targets.name AS provider_name,
+                        provider_targets.slug AS provider_slug,
+                        provider_health.state,
+                        provider_health.reason,
+                        (EXTRACT(EPOCH FROM provider_health.last_changed_at) * 1000)::bigint AS last_changed_at_epoch_ms,
+                        CASE
+                            WHEN provider_health.last_success_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM provider_health.last_success_at) * 1000)::bigint
+                        END AS last_success_at_epoch_ms,
+                        CASE
+                            WHEN provider_health.last_failure_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM provider_health.last_failure_at) * 1000)::bigint
+                        END AS last_failure_at_epoch_ms,
+                        provider_health.degraded_score,
+                        provider_health.down_score
+                 FROM provider_health
+                 JOIN provider_targets ON provider_targets.id = provider_health.provider_target_id
+                 ORDER BY provider_targets.slug ASC",
+                &[],
+            )
+            .map_err(|error| format!("failed to list provider health: {error}"))?;
+        rows.into_iter().map(provider_health_from_row).collect()
     }
 
     fn register_runner(&self, params: RegisterRunnerParams) -> Result<RunnerRecord, String> {
@@ -593,6 +961,7 @@ impl GumStore for PostgresStore {
                  FROM runs
                  JOIN jobs ON jobs.id = runs.job_id
                  WHERE runs.status = 'queued'
+                   AND (runs.retry_after_epoch_ms IS NULL OR runs.retry_after_epoch_ms <= $1)
                    AND jobs.enabled = TRUE
                    AND (
                      jobs.concurrency_limit IS NULL OR (
@@ -605,7 +974,7 @@ impl GumStore for PostgresStore {
                    )
                  ORDER BY runs.created_at ASC
                  FOR UPDATE OF runs SKIP LOCKED",
-                &[],
+                &[&now_epoch_ms()],
             )
             .map_err(|error| format!("failed to select candidate runs for lease: {error}"))?;
 
@@ -683,6 +1052,10 @@ impl GumStore for PostgresStore {
             .query_one(
                 "UPDATE runs
                  SET status = 'running',
+                     failure_reason = NULL,
+                     failure_class = NULL,
+                     retry_after_epoch_ms = NULL,
+                     waiting_for_provider_slug = NULL,
                      attempt_count = attempt_count + 1,
                      started_at = COALESCE(started_at, NOW()),
                      updated_at = NOW()
@@ -781,8 +1154,9 @@ impl GumStore for PostgresStore {
                 "UPDATE attempts
                  SET status = $1,
                      failure_reason = $2,
+                     failure_class = $3,
                      finished_at = NOW()
-                 WHERE id = $3
+                 WHERE id = $4
                  RETURNING *,
                            (EXTRACT(EPOCH FROM started_at) * 1000)::bigint AS started_at_epoch_ms,
                            (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_at_epoch_ms,
@@ -790,6 +1164,7 @@ impl GumStore for PostgresStore {
                 &[
                     &attempt_status_to_str(params.status),
                     &params.failure_reason,
+                    &params.failure_class,
                     &params.attempt_id,
                 ],
             )
@@ -813,50 +1188,94 @@ impl GumStore for PostgresStore {
             )
             .map_err(|error| format!("failed to load run for completion: {error}"))?;
         let run = run_from_row(run_row)?;
+        let job_row = tx
+            .query_one(
+                "SELECT *,
+                        (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_epoch_ms
+                 FROM jobs
+                 WHERE id = $1",
+                &[&run.job_id],
+            )
+            .map_err(|error| format!("failed to load job for completion: {error}"))?;
+        let job = job_from_row(job_row)?;
+        let provider_slug = provider_slug_from_job(&job)?;
 
-        let (next_status, failure_reason, finished_now) = match params.status {
-            AttemptStatus::Succeeded => (RunStatus::Succeeded, None, true),
-            AttemptStatus::TimedOut => {
-                if run.attempt_count < run.max_attempts {
-                    (RunStatus::Queued, None, false)
-                } else {
-                    (RunStatus::TimedOut, params.failure_reason.clone(), true)
-                }
+        if let Some(provider_slug) = provider_slug.as_deref() {
+            if params.status == AttemptStatus::Succeeded {
+                self.apply_provider_signal_tx(
+                    &mut tx,
+                    provider_slug,
+                    ProviderCheckStatus::Success,
+                    None,
+                    now_epoch_ms(),
+                )?;
+            } else if is_provider_failure_class(params.failure_class.as_deref()) {
+                self.apply_provider_signal_tx(
+                    &mut tx,
+                    provider_slug,
+                    ProviderCheckStatus::Failure,
+                    params.failure_class.as_deref(),
+                    now_epoch_ms(),
+                )?;
             }
-            AttemptStatus::Failed => {
-                if run.attempt_count < run.max_attempts {
-                    (RunStatus::Queued, None, false)
-                } else {
-                    (RunStatus::Failed, params.failure_reason.clone(), true)
-                }
-            }
-            AttemptStatus::Canceled => (RunStatus::Canceled, params.failure_reason.clone(), true),
-            AttemptStatus::Queued | AttemptStatus::Leased | AttemptStatus::Running => {
-                return Err("attempt completion requires terminal status".to_string())
-            }
+        }
+
+        let provider_health = if let Some(provider_slug) = provider_slug.as_deref() {
+            Self::provider_health_by_slug_tx(&mut tx, provider_slug)?
+        } else {
+            None
         };
+        let disposition = compute_retry_disposition(
+            &run.id,
+            run.attempt_count,
+            run.max_attempts,
+            params.status,
+            params.failure_reason.clone(),
+            params.failure_class.clone(),
+            provider_slug.as_deref(),
+            provider_health.as_ref().map(|record| record.state),
+            now_epoch_ms(),
+        );
 
-        let updated_run_row = if finished_now {
+        let updated_run_row = if disposition.finished_now {
             tx.query_one(
                 "UPDATE runs
                  SET status = $1,
                      failure_reason = $2,
+                     failure_class = $3,
+                     retry_after_epoch_ms = NULL,
+                     waiting_for_provider_slug = NULL,
                      finished_at = NOW(),
                      updated_at = NOW()
-                 WHERE id = $3
+                 WHERE id = $4
                  RETURNING *, (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
-                &[&run_status_to_str(next_status), &failure_reason, &run.id],
+                &[
+                    &run_status_to_str(disposition.next_status),
+                    &disposition.failure_reason,
+                    &disposition.failure_class,
+                    &run.id,
+                ],
             )
             .map_err(|error| format!("failed to finalize run: {error}"))?
         } else {
             tx.query_one(
                 "UPDATE runs
                  SET status = $1,
-                     failure_reason = NULL,
+                     failure_reason = $2,
+                     failure_class = $3,
+                     retry_after_epoch_ms = $4,
+                     waiting_for_provider_slug = $5,
                      updated_at = NOW()
-                 WHERE id = $2
+                 WHERE id = $6
                  RETURNING *, (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
-                &[&run_status_to_str(next_status), &run.id],
+                &[
+                    &run_status_to_str(disposition.next_status),
+                    &disposition.failure_reason,
+                    &disposition.failure_class,
+                    &disposition.retry_after_epoch_ms,
+                    &disposition.waiting_for_provider_slug,
+                    &run.id,
+                ],
             )
             .map_err(|error| format!("failed to requeue run: {error}"))?
         };
@@ -1005,6 +1424,7 @@ impl GumStore for PostgresStore {
                 "UPDATE attempts
                  SET status = 'failed',
                      failure_reason = 'runner lost lease',
+                     failure_class = 'gum_internal_error',
                      finished_at = TO_TIMESTAMP($2::double precision / 1000.0)
                  WHERE id = $1",
                 &[&attempt_id, &(now_epoch_ms as f64)],
@@ -1026,6 +1446,9 @@ impl GumStore for PostgresStore {
                     "UPDATE runs
                      SET status = 'failed',
                          failure_reason = 'runner lost lease',
+                         failure_class = 'gum_internal_error',
+                         retry_after_epoch_ms = NULL,
+                         waiting_for_provider_slug = NULL,
                          finished_at = TO_TIMESTAMP($2::double precision / 1000.0),
                          updated_at = TO_TIMESTAMP($2::double precision / 1000.0)
                      WHERE id = $1
@@ -1038,6 +1461,9 @@ impl GumStore for PostgresStore {
                     "UPDATE runs
                      SET status = 'queued',
                          failure_reason = NULL,
+                         failure_class = NULL,
+                         retry_after_epoch_ms = NULL,
+                         waiting_for_provider_slug = NULL,
                          updated_at = TO_TIMESTAMP($2::double precision / 1000.0)
                      WHERE id = $1
                      RETURNING *, (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
@@ -1224,6 +1650,9 @@ fn run_from_row(row: Row) -> Result<RunRecord, String> {
         max_attempts: max_attempts as u32,
         scheduled_at_epoch_ms,
         failure_reason: row.get("failure_reason"),
+        failure_class: row.get("failure_class"),
+        retry_after_epoch_ms: row.get("retry_after_epoch_ms"),
+        waiting_for_provider_slug: row.get("waiting_for_provider_slug"),
         replay_of_run_id: row.get("replay_of_run_id"),
     })
 }
@@ -1249,6 +1678,7 @@ fn attempt_from_row(row: Row) -> Result<AttemptRecord, String> {
         started_at_epoch_ms,
         finished_at_epoch_ms,
         failure_reason: row.get("failure_reason"),
+        failure_class: row.get("failure_class"),
         cancel_requested_at_epoch_ms,
     })
 }
@@ -1277,6 +1707,53 @@ fn runner_from_row(row: Row) -> Result<RunnerRecord, String> {
         max_concurrent_leases: max_concurrent_leases as u32,
         heartbeat_timeout_secs: heartbeat_timeout_secs as u64,
         last_heartbeat_at_epoch_ms: row.get("last_heartbeat_at_epoch_ms"),
+    })
+}
+
+fn provider_target_from_row(row: Row) -> Result<ProviderTargetRecord, String> {
+    let created_at_epoch_ms: i64 = row
+        .try_get("created_at_epoch_ms")
+        .map_err(|error| format!("provider target row missing created_at_epoch_ms: {error}"))?;
+    Ok(ProviderTargetRecord {
+        id: row.get("id"),
+        name: row.get("name"),
+        slug: row.get("slug"),
+        probe_kind: row.get("probe_kind"),
+        probe_config_json: row.get("probe_config_json"),
+        enabled: row.get("enabled"),
+        created_at_epoch_ms,
+    })
+}
+
+fn provider_check_from_row(row: Row) -> Result<ProviderCheckRecord, String> {
+    let latency_ms: Option<i32> = row.get("latency_ms");
+    let status_code: Option<i32> = row.get("status_code");
+    let checked_at_epoch_ms: i64 = row
+        .try_get("checked_at_epoch_ms")
+        .map_err(|error| format!("provider check row missing checked_at_epoch_ms: {error}"))?;
+    Ok(ProviderCheckRecord {
+        id: row.get("id"),
+        provider_target_id: row.get("provider_target_id"),
+        status: provider_check_status_from_str(row.get("status"))?,
+        latency_ms: latency_ms.map(|value| value as u32),
+        error_class: row.get("error_class"),
+        status_code: status_code.map(|value| value as u16),
+        checked_at_epoch_ms,
+    })
+}
+
+fn provider_health_from_row(row: Row) -> Result<ProviderHealthRecord, String> {
+    Ok(ProviderHealthRecord {
+        provider_target_id: row.get("provider_target_id"),
+        provider_name: row.get("provider_name"),
+        provider_slug: row.get("provider_slug"),
+        state: provider_health_state_from_str(row.get("state"))?,
+        reason: row.get("reason"),
+        last_changed_at_epoch_ms: row.get("last_changed_at_epoch_ms"),
+        last_success_at_epoch_ms: row.get("last_success_at_epoch_ms"),
+        last_failure_at_epoch_ms: row.get("last_failure_at_epoch_ms"),
+        degraded_score: row.get("degraded_score"),
+        down_score: row.get("down_score"),
     })
 }
 
@@ -1371,6 +1848,38 @@ fn attempt_status_from_str(value: String) -> Result<AttemptStatus, String> {
         "timed_out" => Ok(AttemptStatus::TimedOut),
         "canceled" => Ok(AttemptStatus::Canceled),
         _ => Err(format!("unknown attempt status: {value}")),
+    }
+}
+
+fn provider_check_status_to_str(value: ProviderCheckStatus) -> &'static str {
+    match value {
+        ProviderCheckStatus::Success => "success",
+        ProviderCheckStatus::Failure => "failure",
+    }
+}
+
+fn provider_check_status_from_str(value: String) -> Result<ProviderCheckStatus, String> {
+    match value.as_str() {
+        "success" => Ok(ProviderCheckStatus::Success),
+        "failure" => Ok(ProviderCheckStatus::Failure),
+        _ => Err(format!("unknown provider check status: {value}")),
+    }
+}
+
+fn provider_health_state_to_str(value: ProviderHealthState) -> &'static str {
+    match value {
+        ProviderHealthState::Healthy => "healthy",
+        ProviderHealthState::Degraded => "degraded",
+        ProviderHealthState::Down => "down",
+    }
+}
+
+fn provider_health_state_from_str(value: String) -> Result<ProviderHealthState, String> {
+    match value.as_str() {
+        "healthy" => Ok(ProviderHealthState::Healthy),
+        "degraded" => Ok(ProviderHealthState::Degraded),
+        "down" => Ok(ProviderHealthState::Down),
+        _ => Err(format!("unknown provider health state: {value}")),
     }
 }
 

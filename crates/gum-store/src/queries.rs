@@ -2,7 +2,8 @@ use serde_json::Value;
 
 use crate::models::{
     AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord,
-    LogRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
+    LogRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord, ProviderHealthState,
+    ProviderTargetRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,12 +82,55 @@ pub struct CompleteAttemptParams {
     pub runner_id: String,
     pub status: gum_types::AttemptStatus,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelRunParams {
     pub run_id: String,
     pub requested_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertProviderTargetParams {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub probe_kind: String,
+    pub probe_config_json: Value,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordProviderCheckParams {
+    pub provider_target_id: String,
+    pub status: ProviderCheckStatus,
+    pub latency_ms: Option<u32>,
+    pub error_class: Option<String>,
+    pub status_code: Option<u16>,
+    pub checked_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetProviderHealthParams {
+    pub provider_target_id: String,
+    pub state: ProviderHealthState,
+    pub reason: Option<String>,
+    pub last_changed_at_epoch_ms: i64,
+    pub last_success_at_epoch_ms: Option<i64>,
+    pub last_failure_at_epoch_ms: Option<i64>,
+    pub degraded_score: i32,
+    pub down_score: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryDisposition {
+    pub next_status: gum_types::RunStatus,
+    pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
+    pub retry_after_epoch_ms: Option<i64>,
+    pub waiting_for_provider_slug: Option<String>,
+    pub finished_now: bool,
 }
 
 pub fn parse_schedule_interval_ms(expr: &str) -> Result<i64, String> {
@@ -156,11 +200,196 @@ pub fn parse_rate_limit_spec(spec: &str) -> Result<RateLimitSpec, String> {
     })
 }
 
+pub fn provider_slug_from_job(job: &JobRecord) -> Result<Option<String>, String> {
+    let Some(spec) = job.rate_limit_spec.as_deref() else {
+        return Ok(None);
+    };
+    Ok(parse_rate_limit_spec(spec)?.pool)
+}
+
+pub fn is_provider_failure_class(failure_class: Option<&str>) -> bool {
+    matches!(
+        failure_class,
+        Some(
+            "provider_timeout"
+                | "provider_connect_error"
+                | "provider_5xx"
+                | "provider_429"
+                | "provider_auth_error"
+        )
+    )
+}
+
+pub fn is_retryable_failure_class(failure_class: Option<&str>) -> bool {
+    match failure_class {
+        None => true,
+        Some("user_code_error" | "provider_auth_error") => false,
+        Some(
+            "provider_timeout"
+            | "provider_connect_error"
+            | "provider_5xx"
+            | "provider_429"
+            | "gum_internal_error"
+            | "job_timeout"
+            | "provider_probe_error"
+            | "provider_probe_config_error"
+            | "provider_http_error",
+        ) => true,
+        Some(_) => true,
+    }
+}
+
+pub fn compute_retry_disposition(
+    run_id: &str,
+    attempt_count: u32,
+    max_attempts: u32,
+    status: gum_types::AttemptStatus,
+    failure_reason: Option<String>,
+    failure_class: Option<String>,
+    provider_slug: Option<&str>,
+    provider_health: Option<ProviderHealthState>,
+    now_epoch_ms: i64,
+) -> RetryDisposition {
+    use gum_types::{AttemptStatus, RunStatus};
+
+    match status {
+        AttemptStatus::Succeeded => RetryDisposition {
+            next_status: RunStatus::Succeeded,
+            failure_reason: None,
+            failure_class: None,
+            retry_after_epoch_ms: None,
+            waiting_for_provider_slug: None,
+            finished_now: true,
+        },
+        AttemptStatus::Canceled => RetryDisposition {
+            next_status: RunStatus::Canceled,
+            failure_reason,
+            failure_class,
+            retry_after_epoch_ms: None,
+            waiting_for_provider_slug: None,
+            finished_now: true,
+        },
+        AttemptStatus::Failed | AttemptStatus::TimedOut => {
+            let terminal_status = match status {
+                AttemptStatus::TimedOut => RunStatus::TimedOut,
+                _ => RunStatus::Failed,
+            };
+            if attempt_count >= max_attempts
+                || !is_retryable_failure_class(failure_class.as_deref())
+            {
+                return RetryDisposition {
+                    next_status: terminal_status,
+                    failure_reason,
+                    failure_class,
+                    retry_after_epoch_ms: None,
+                    waiting_for_provider_slug: None,
+                    finished_now: true,
+                };
+            }
+
+            if provider_slug.is_some()
+                && provider_health == Some(ProviderHealthState::Down)
+                && is_provider_failure_class(failure_class.as_deref())
+            {
+                let provider_slug = provider_slug.unwrap_or("provider");
+                return RetryDisposition {
+                    next_status: RunStatus::Queued,
+                    failure_reason: Some(format!(
+                        "waiting for provider recovery: {} appears down",
+                        provider_slug
+                    )),
+                    failure_class: Some("blocked_by_downstream".to_string()),
+                    retry_after_epoch_ms: Some(now_epoch_ms + downstream_block_delay_ms()),
+                    waiting_for_provider_slug: Some(provider_slug.to_string()),
+                    finished_now: false,
+                };
+            }
+
+            let delay_ms = retry_backoff_delay_ms(run_id, attempt_count, failure_class.as_deref());
+            let retry_reason = match failure_class.as_deref() {
+                Some(class_name) => {
+                    format!("retrying after {} in {}s", class_name, delay_ms / 1000)
+                }
+                None => format!("retrying in {}s", delay_ms / 1000),
+            };
+            RetryDisposition {
+                next_status: RunStatus::Queued,
+                failure_reason: Some(retry_reason),
+                failure_class,
+                retry_after_epoch_ms: Some(now_epoch_ms + delay_ms),
+                waiting_for_provider_slug: None,
+                finished_now: false,
+            }
+        }
+        AttemptStatus::Queued | AttemptStatus::Leased | AttemptStatus::Running => {
+            RetryDisposition {
+                next_status: gum_types::RunStatus::Queued,
+                failure_reason,
+                failure_class,
+                retry_after_epoch_ms: None,
+                waiting_for_provider_slug: None,
+                finished_now: false,
+            }
+        }
+    }
+}
+
+pub fn retry_backoff_delay_ms(
+    run_id: &str,
+    attempt_count: u32,
+    failure_class: Option<&str>,
+) -> i64 {
+    let capped_attempt = attempt_count.min(6);
+    let base_ms: i64 = match failure_class {
+        Some("provider_429") => 15_000,
+        Some("provider_timeout" | "provider_connect_error" | "provider_5xx") => 2_000,
+        Some("gum_internal_error") => 5_000,
+        Some("job_timeout") => 10_000,
+        _ => 3_000,
+    };
+    let exponential_ms = base_ms.saturating_mul(1_i64 << capped_attempt.saturating_sub(1));
+    let capped_ms = exponential_ms.min(300_000);
+    capped_ms + deterministic_jitter_ms(run_id, attempt_count, capped_ms / 5)
+}
+
+pub fn downstream_block_delay_ms() -> i64 {
+    30_000
+}
+
+// Deterministic jitter keeps retries from stampeding together without making tests flaky.
+fn deterministic_jitter_ms(run_id: &str, attempt_count: u32, max_jitter_ms: i64) -> i64 {
+    if max_jitter_ms <= 0 {
+        return 0;
+    }
+
+    let mut hash = 1469598103934665603_u64;
+    for byte in run_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash ^= u64::from(attempt_count);
+    (hash % max_jitter_ms as u64) as i64
+}
+
 pub trait GumStore {
     fn register_deploy(
         &self,
         params: RegisterDeployParams,
     ) -> Result<(DeployRecord, Vec<JobRecord>), String>;
+    fn upsert_provider_target(
+        &self,
+        params: UpsertProviderTargetParams,
+    ) -> Result<ProviderTargetRecord, String>;
+    fn record_provider_check(
+        &self,
+        params: RecordProviderCheckParams,
+    ) -> Result<ProviderCheckRecord, String>;
+    fn set_provider_health(
+        &self,
+        params: SetProviderHealthParams,
+    ) -> Result<ProviderHealthRecord, String>;
+    fn list_provider_targets(&self) -> Result<Vec<ProviderTargetRecord>, String>;
+    fn list_provider_health(&self) -> Result<Vec<ProviderHealthRecord>, String>;
     fn register_runner(&self, params: RegisterRunnerParams) -> Result<RunnerRecord, String>;
     fn heartbeat_runner(&self, params: HeartbeatRunnerParams) -> Result<RunnerRecord, String>;
     fn try_acquire_control_lease(&self, params: ControlLeaseParams) -> Result<bool, String>;

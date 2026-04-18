@@ -109,6 +109,7 @@ def slow_job():
             runner_id: "runner_1".to_string(),
             status: outcome.status,
             failure_reason: outcome.failure_reason.clone(),
+            failure_class: outcome.failure_class.clone(),
         },
     )
     .expect("completion should work");
@@ -231,6 +232,7 @@ def slow_job():
             runner_id: "runner_1".to_string(),
             status: outcome.status,
             failure_reason: outcome.failure_reason.clone(),
+            failure_class: outcome.failure_class.clone(),
         },
     )
     .expect("completion should work");

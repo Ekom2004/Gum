@@ -4,8 +4,10 @@ use gum_api::routes::{
 };
 use gum_api::service;
 use gum_store::memory::MemoryStore;
-use gum_store::models::ProjectRecord;
-use gum_store::queries::GumStore;
+use gum_store::models::{ProjectRecord, ProviderCheckStatus, ProviderHealthState};
+use gum_store::queries::{
+    GumStore, RecordProviderCheckParams, SetProviderHealthParams, UpsertProviderTargetParams,
+};
 use gum_types::{AttemptStatus, RunStatus};
 use serde_json::json;
 
@@ -100,6 +102,7 @@ fn enqueue_lease_complete_replay_flow_works() {
             runner_id: "runner_1".to_string(),
             status: AttemptStatus::Succeeded,
             failure_reason: None,
+            failure_class: None,
         },
     )
     .expect("complete should work");
@@ -186,6 +189,7 @@ fn failed_attempt_requeues_when_retries_remain() {
             runner_id: "runner_1".to_string(),
             status: AttemptStatus::Failed,
             failure_reason: Some("transient failure".to_string()),
+            failure_class: Some("provider_5xx".to_string()),
         },
     )
     .expect("complete should work");
@@ -197,6 +201,228 @@ fn failed_attempt_requeues_when_retries_remain() {
         .expect("get run should work")
         .expect("run should exist");
     assert_eq!(reloaded.status, RunStatus::Queued);
+    assert_eq!(reloaded.failure_class.as_deref(), Some("provider_5xx"));
+    assert!(reloaded.retry_after_epoch_ms.is_some());
+}
+
+#[test]
+fn provider_down_blocks_retry_until_recovery() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_generate_summary".to_string(),
+                name: "generate_summary".to_string(),
+                handler_ref: "jobs:generate_summary".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 5,
+                timeout_secs: 300,
+                rate_limit_spec: Some("openai:60/m".to_string()),
+                concurrency_limit: Some(5),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+    store
+        .upsert_provider_target(UpsertProviderTargetParams {
+            id: "provider_openai".to_string(),
+            name: "OpenAI".to_string(),
+            slug: "openai".to_string(),
+            probe_kind: "http".to_string(),
+            probe_config_json: json!({"url": "https://api.openai.com/v1/models"}),
+            enabled: true,
+        })
+        .expect("provider target should be stored");
+    store
+        .set_provider_health(SetProviderHealthParams {
+            provider_target_id: "provider_openai".to_string(),
+            state: ProviderHealthState::Down,
+            reason: Some("probe failures".to_string()),
+            last_changed_at_epoch_ms: 1_000,
+            last_success_at_epoch_ms: None,
+            last_failure_at_epoch_ms: Some(1_000),
+            degraded_score: 3,
+            down_score: 3,
+        })
+        .expect("provider health should be stored");
+
+    let _run = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_generate_summary",
+        EnqueueRunRequest {
+            input: json!({"doc_id": "doc_123"}),
+        },
+    )
+    .expect("enqueue should work");
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("run should be leased");
+
+    let retried = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Failed,
+            failure_reason: Some("upstream unavailable".to_string()),
+            failure_class: Some("provider_5xx".to_string()),
+        },
+    )
+    .expect("completion should work");
+
+    assert_eq!(retried.status, RunStatus::Queued);
+    assert_eq!(
+        retried.failure_class.as_deref(),
+        Some("blocked_by_downstream")
+    );
+    assert_eq!(retried.waiting_for_provider_slug.as_deref(), Some("openai"));
+    assert!(retried.retry_after_epoch_ms.is_some());
+
+    let lease_attempt = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work");
+    assert!(
+        lease_attempt.is_none(),
+        "blocked retries should not lease immediately"
+    );
+}
+
+#[test]
+fn user_code_failures_do_not_consume_retry_budget_as_requeues() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 5,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: Some(5),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+
+    let run = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({"event_id": "evt_123"}),
+        },
+    )
+    .expect("enqueue should work");
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("run should be leased");
+
+    let failed = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Failed,
+            failure_reason: Some("invalid payload".to_string()),
+            failure_class: Some("user_code_error".to_string()),
+        },
+    )
+    .expect("completion should work");
+
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.failure_class.as_deref(), Some("user_code_error"));
+    assert!(failed.retry_after_epoch_ms.is_none());
+
+    let lease_attempt = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work");
+    assert!(
+        lease_attempt.is_none(),
+        "terminal failures should not requeue"
+    );
+    let reloaded = service::get_run(&store, &run.id)
+        .expect("run lookup should work")
+        .expect("run should exist");
+    assert_eq!(reloaded.status, RunStatus::Failed);
 }
 
 #[test]
@@ -441,6 +667,7 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
             runner_id: "runner_1".to_string(),
             status: AttemptStatus::Failed,
             failure_reason: Some("should not be allowed".to_string()),
+            failure_class: Some("user_code_error".to_string()),
         },
     );
     assert!(failure
@@ -454,6 +681,7 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
             runner_id: "runner_1".to_string(),
             status: AttemptStatus::Canceled,
             failure_reason: Some("job canceled".to_string()),
+            failure_class: None,
         },
     )
     .expect("canceled completion should work");
@@ -542,6 +770,69 @@ fn admin_views_expose_runs_runners_and_leases() {
     assert_eq!(leases.leases[0].lease_id, leased.lease_id);
     assert_eq!(leases.leases[0].runner_id, "runner_1");
     assert!(!leases.leases[0].cancel_requested);
+}
+
+#[test]
+fn provider_health_can_be_recorded_and_listed() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    let target = store
+        .upsert_provider_target(UpsertProviderTargetParams {
+            id: "provider_openai".to_string(),
+            name: "OpenAI".to_string(),
+            slug: "openai".to_string(),
+            probe_kind: "http".to_string(),
+            probe_config_json: json!({
+                "method": "POST",
+                "path": "/v1/chat/completions"
+            }),
+            enabled: true,
+        })
+        .expect("provider target should upsert");
+    assert_eq!(target.slug, "openai");
+
+    let check = store
+        .record_provider_check(RecordProviderCheckParams {
+            provider_target_id: target.id.clone(),
+            status: ProviderCheckStatus::Failure,
+            latency_ms: Some(1_200),
+            error_class: Some("provider_timeout".to_string()),
+            status_code: None,
+            checked_at_epoch_ms: 1_710_000_000_000,
+        })
+        .expect("provider check should record");
+    assert_eq!(check.error_class.as_deref(), Some("provider_timeout"));
+
+    store
+        .set_provider_health(SetProviderHealthParams {
+            provider_target_id: target.id.clone(),
+            state: ProviderHealthState::Degraded,
+            reason: Some("probe timeout rate elevated".to_string()),
+            last_changed_at_epoch_ms: 1_710_000_000_000,
+            last_success_at_epoch_ms: Some(1_709_999_940_000),
+            last_failure_at_epoch_ms: Some(1_710_000_000_000),
+            degraded_score: 3,
+            down_score: 0,
+        })
+        .expect("provider health should set");
+
+    let listed = service::list_provider_health(&store).expect("provider health should list");
+    assert_eq!(listed.providers.len(), 1);
+    let provider = &listed.providers[0];
+    assert_eq!(provider.provider_slug, "openai");
+    assert_eq!(provider.state, "degraded");
+    assert_eq!(
+        provider.reason.as_deref(),
+        Some("probe timeout rate elevated")
+    );
 }
 
 #[test]
@@ -742,6 +1033,7 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
             runner_id: "runner_1".to_string(),
             status: AttemptStatus::Succeeded,
             failure_reason: None,
+            failure_class: None,
         },
     )
     .expect_err("recovered attempts should not be completable");

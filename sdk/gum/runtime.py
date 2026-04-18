@@ -33,8 +33,18 @@ def main(argv: list[str] | None = None) -> int:
         if inspect.isawaitable(result):
             asyncio.run(_await_result(result))
         return 0
-    except Exception:
+    except Exception as exc:
         traceback.print_exc()
+        print(
+            "__gum_failure__="
+            + json.dumps(
+                {
+                    "failure_class": _classify_exception(exc),
+                    "message": str(exc) or exc.__class__.__name__,
+                }
+            ),
+            file=sys.stderr,
+        )
         return 1
 
 
@@ -49,6 +59,46 @@ def _parse_handler(handler: str) -> tuple[str, str]:
     if not module_name or not fn_name:
         raise RuntimeError("Handler ref must include both module and function name.")
     return module_name, fn_name
+
+
+def _classify_exception(exc: Exception) -> str:
+    status_code = _extract_status_code(exc)
+    if status_code is not None:
+        if status_code == 429:
+            return "provider_429"
+        if status_code in {401, 403}:
+            return "provider_auth_error"
+        if 500 <= status_code <= 599:
+            return "provider_5xx"
+        if status_code == 408:
+            return "provider_timeout"
+        if 400 <= status_code <= 499:
+            return "user_code_error"
+
+    if isinstance(exc, TimeoutError):
+        return "provider_timeout"
+    if isinstance(exc, ConnectionError):
+        return "provider_connect_error"
+
+    exception_name = exc.__class__.__name__.lower()
+    module_name = exc.__class__.__module__.lower()
+    if "timeout" in exception_name or "timeout" in module_name:
+        return "provider_timeout"
+    if "connect" in exception_name or "connection" in exception_name:
+        return "provider_connect_error"
+    return "user_code_error"
+
+
+def _extract_status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+    return None
 
 
 if __name__ == "__main__":

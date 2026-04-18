@@ -13,10 +13,13 @@ use crate::runner_loop::LeasedRun;
 pub struct ExecutionOutcome {
     pub status: AttemptStatus,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
     pub stdout: String,
     pub stderr: String,
     pub app_message: Option<String>,
 }
+
+const FAILURE_MARKER_PREFIX: &str = "__gum_failure__=";
 
 pub async fn execute_leased_run(leased: &LeasedRun) -> ExecutionOutcome {
     let (_, cancel_rx) = watch::channel(false);
@@ -32,6 +35,7 @@ pub async fn execute_leased_run_with_cancel(
         Err(message) => ExecutionOutcome {
             status: AttemptStatus::Failed,
             failure_reason: Some(message.clone()),
+            failure_class: Some("gum_internal_error".to_string()),
             stdout: String::new(),
             stderr: String::new(),
             app_message: Some(message),
@@ -113,11 +117,13 @@ async fn execute_leased_run_inner(
 
     let stdout = join_output(stdout_task, "stdout").await?;
     let stderr = join_output(stderr_task, "stderr").await?;
+    let (stderr, failure_metadata) = extract_failure_metadata(&stderr);
 
     match wait_result {
         WaitResult::TimedOut => Ok(ExecutionOutcome {
             status: AttemptStatus::TimedOut,
             failure_reason: Some(format!("job timed out after {}s", leased.timeout_secs)),
+            failure_class: Some("job_timeout".to_string()),
             stdout,
             stderr,
             app_message: None,
@@ -125,6 +131,7 @@ async fn execute_leased_run_inner(
         WaitResult::Canceled => Ok(ExecutionOutcome {
             status: AttemptStatus::Canceled,
             failure_reason: Some("job canceled".to_string()),
+            failure_class: None,
             stdout,
             stderr,
             app_message: None,
@@ -132,21 +139,56 @@ async fn execute_leased_run_inner(
         WaitResult::Exited(status) if status.success() => Ok(ExecutionOutcome {
             status: AttemptStatus::Succeeded,
             failure_reason: None,
+            failure_class: None,
             stdout,
             stderr,
             app_message: None,
         }),
         WaitResult::Exited(status) => Ok(ExecutionOutcome {
             status: AttemptStatus::Failed,
-            failure_reason: Some(match status.code() {
-                Some(code) => format!("python handler exited with status code {code}"),
-                None => "python handler exited without a status code".to_string(),
-            }),
+            failure_reason: failure_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.message.clone())
+                .or_else(|| {
+                    Some(match status.code() {
+                        Some(code) => format!("python handler exited with status code {code}"),
+                        None => "python handler exited without a status code".to_string(),
+                    })
+                }),
+            failure_class: Some(
+                failure_metadata
+                    .map(|metadata| metadata.failure_class)
+                    .unwrap_or_else(|| "user_code_error".to_string()),
+            ),
             stdout,
             stderr,
             app_message: None,
         }),
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FailureMetadata {
+    failure_class: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn extract_failure_metadata(stderr: &str) -> (String, Option<FailureMetadata>) {
+    let mut lines = Vec::new();
+    let mut metadata = None;
+
+    for line in stderr.lines() {
+        if let Some(payload) = line.strip_prefix(FAILURE_MARKER_PREFIX) {
+            if let Ok(parsed) = serde_json::from_str::<FailureMetadata>(payload) {
+                metadata = Some(parsed);
+                continue;
+            }
+        }
+        lines.push(line);
+    }
+
+    (lines.join("\n"), metadata)
 }
 
 async fn read_output<T>(mut stream: T) -> Result<String, String>

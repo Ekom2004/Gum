@@ -1,4 +1,5 @@
 use gum_store::models::LogRecord;
+use gum_store::models::ProviderHealthState;
 use gum_store::queries::{
     CancelRunParams, CompleteAttemptParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams,
     LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams, RegisterRunnerParams,
@@ -9,9 +10,9 @@ use gum_types::AttemptStatus;
 use crate::routes::{
     AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
     LeaseRunResponse, LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
-    RegisterDeployRequest, RegisterDeployResponse, RegisterRunnerRequest, ReplayRunResponse,
-    RunResponse, RunnerHeartbeatRequest, RunnerStatusResponse, RunnersListResponse,
-    RunsListResponse,
+    ProviderHealthListResponse, ProviderHealthResponse, RegisterDeployRequest,
+    RegisterDeployResponse, RegisterRunnerRequest, ReplayRunResponse, RunResponse,
+    RunnerHeartbeatRequest, RunnerStatusResponse, RunnersListResponse, RunsListResponse,
 };
 
 pub fn register_deploy<S: GumStore>(
@@ -142,6 +143,27 @@ pub fn list_leases<S: GumStore>(store: &S) -> Result<LeasesListResponse, String>
     })
 }
 
+pub fn list_provider_health<S: GumStore>(store: &S) -> Result<ProviderHealthListResponse, String> {
+    Ok(ProviderHealthListResponse {
+        providers: store
+            .list_provider_health()?
+            .into_iter()
+            .map(|provider| ProviderHealthResponse {
+                provider_target_id: provider.provider_target_id,
+                provider_name: provider.provider_name,
+                provider_slug: provider.provider_slug,
+                state: provider_health_state_to_str(provider.state).to_string(),
+                reason: provider.reason,
+                last_changed_at_epoch_ms: provider.last_changed_at_epoch_ms,
+                last_success_at_epoch_ms: provider.last_success_at_epoch_ms,
+                last_failure_at_epoch_ms: provider.last_failure_at_epoch_ms,
+                degraded_score: provider.degraded_score,
+                down_score: provider.down_score,
+            })
+            .collect(),
+    })
+}
+
 pub fn tick_schedules<S: GumStore>(
     store: &S,
     now_epoch_ms: i64,
@@ -239,6 +261,7 @@ pub fn complete_attempt<S: GumStore>(
         runner_id: request.runner_id,
         status: request.status,
         failure_reason: request.failure_reason,
+        failure_class: request.failure_class,
     })?;
     Ok(run_response(run))
 }
@@ -281,7 +304,18 @@ fn run_response(run: gum_store::models::RunRecord) -> RunResponse {
         status: run.status,
         attempt: run.attempt_count,
         failure_reason: run.failure_reason,
+        failure_class: run.failure_class,
+        retry_after_epoch_ms: run.retry_after_epoch_ms,
+        waiting_for_provider_slug: run.waiting_for_provider_slug,
         replay_of: run.replay_of_run_id,
+    }
+}
+
+fn provider_health_state_to_str(state: ProviderHealthState) -> &'static str {
+    match state {
+        ProviderHealthState::Healthy => "healthy",
+        ProviderHealthState::Degraded => "degraded",
+        ProviderHealthState::Down => "down",
     }
 }
 

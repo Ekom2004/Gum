@@ -7,12 +7,16 @@ use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 
 use crate::models::{
     AttemptRecord, ControlLeaseRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord,
-    LeaseStatusRecord, LogRecord, ProjectRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
+    LeaseStatusRecord, LogRecord, ProjectRecord, ProviderCheckRecord, ProviderCheckStatus,
+    ProviderHealthRecord, ProviderHealthState, ProviderTargetRecord, RunRecord, RunnerRecord,
+    RunnerStatusRecord,
 };
 use crate::queries::{
-    parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
+    compute_retry_disposition, is_provider_failure_class, parse_rate_limit_spec,
+    parse_schedule_interval_ms, provider_slug_from_job, CancelRunParams, CompleteAttemptParams,
     ControlLeaseParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
-    RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
+    RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
+    SetProviderHealthParams, UpsertProviderTargetParams,
 };
 
 #[derive(Default)]
@@ -25,6 +29,9 @@ struct MemoryState {
     leases: HashMap<String, LeaseRecord>,
     runners: HashMap<String, RunnerRecord>,
     control_leases: HashMap<String, ControlLeaseRecord>,
+    provider_targets: HashMap<String, ProviderTargetRecord>,
+    provider_health: HashMap<String, ProviderHealthRecord>,
+    provider_checks: Vec<ProviderCheckRecord>,
     logs: Vec<LogRecord>,
 }
 
@@ -112,6 +119,7 @@ impl MemoryStore {
 
             attempt.status = AttemptStatus::Failed;
             attempt.failure_reason = Some("runner lost lease".to_string());
+            attempt.failure_class = Some("gum_internal_error".to_string());
             attempt.finished_at_epoch_ms = Some(now_epoch_ms);
             let attempt_snapshot = attempt.clone();
 
@@ -128,15 +136,147 @@ impl MemoryStore {
             if run.attempt_count < run.max_attempts {
                 run.status = RunStatus::Queued;
                 run.failure_reason = None;
+                run.failure_class = None;
+                run.retry_after_epoch_ms = None;
+                run.waiting_for_provider_slug = None;
             } else {
                 run.status = RunStatus::Failed;
                 run.failure_reason = Some("runner lost lease".to_string());
+                run.failure_class = Some("gum_internal_error".to_string());
+                run.retry_after_epoch_ms = None;
+                run.waiting_for_provider_slug = None;
             }
 
             recovered_runs.push(run.clone());
         }
 
         recovered_runs
+    }
+
+    fn provider_health_by_slug(
+        state: &MemoryState,
+        provider_slug: &str,
+    ) -> Option<ProviderHealthRecord> {
+        state.provider_health.values().find_map(|record| {
+            if record.provider_slug == provider_slug {
+                Some(record.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn apply_provider_signal_locked(
+        &self,
+        state: &mut MemoryState,
+        provider_slug: &str,
+        signal_status: ProviderCheckStatus,
+        error_class: Option<&str>,
+        now_epoch_ms: i64,
+    ) {
+        let Some(target) = state
+            .provider_targets
+            .values()
+            .find(|candidate| candidate.slug == provider_slug)
+            .cloned()
+        else {
+            return;
+        };
+
+        let check = ProviderCheckRecord {
+            id: self.next_id("pcheck"),
+            provider_target_id: target.id.clone(),
+            status: signal_status,
+            latency_ms: None,
+            error_class: error_class.map(ToString::to_string),
+            status_code: None,
+            checked_at_epoch_ms: now_epoch_ms,
+        };
+        state.provider_checks.push(check);
+
+        let previous = state.provider_health.get(&target.id).cloned();
+        let (
+            state_name,
+            reason,
+            last_success_at_epoch_ms,
+            last_failure_at_epoch_ms,
+            degraded_score,
+            down_score,
+        ) = match signal_status {
+            ProviderCheckStatus::Success => (
+                ProviderHealthState::Healthy,
+                None,
+                Some(now_epoch_ms),
+                previous
+                    .as_ref()
+                    .and_then(|record| record.last_failure_at_epoch_ms),
+                previous
+                    .as_ref()
+                    .map(|record| record.degraded_score.saturating_sub(2))
+                    .unwrap_or(0),
+                0,
+            ),
+            ProviderCheckStatus::Failure => {
+                let previous_down = previous
+                    .as_ref()
+                    .map(|record| record.down_score)
+                    .unwrap_or(0);
+                let next_down = (previous_down + 1).clamp(0, 10);
+                let next_state = if next_down >= 3 {
+                    ProviderHealthState::Down
+                } else {
+                    ProviderHealthState::Degraded
+                };
+                (
+                    next_state,
+                    Some(
+                        error_class
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "provider request failed".to_string()),
+                    ),
+                    previous
+                        .as_ref()
+                        .and_then(|record| record.last_success_at_epoch_ms),
+                    Some(now_epoch_ms),
+                    (previous
+                        .as_ref()
+                        .map(|record| record.degraded_score)
+                        .unwrap_or(0)
+                        + 1)
+                    .clamp(0, 10),
+                    next_down,
+                )
+            }
+        };
+
+        let last_changed_at_epoch_ms = if previous
+            .as_ref()
+            .map(|record| record.state == state_name)
+            .unwrap_or(false)
+        {
+            previous
+                .as_ref()
+                .map(|record| record.last_changed_at_epoch_ms)
+                .unwrap_or(now_epoch_ms)
+        } else {
+            now_epoch_ms
+        };
+
+        state.provider_health.insert(
+            target.id.clone(),
+            ProviderHealthRecord {
+                provider_target_id: target.id,
+                provider_name: target.name,
+                provider_slug: target.slug,
+                state: state_name,
+                reason,
+                last_changed_at_epoch_ms,
+                last_success_at_epoch_ms,
+                last_failure_at_epoch_ms,
+                degraded_score,
+                down_score,
+            },
+        );
     }
 }
 
@@ -189,6 +329,111 @@ impl GumStore for MemoryStore {
 
         state.deploys.insert(deploy.id.clone(), deploy.clone());
         Ok((deploy, jobs))
+    }
+
+    fn upsert_provider_target(
+        &self,
+        params: UpsertProviderTargetParams,
+    ) -> Result<ProviderTargetRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let created_at_epoch_ms = state
+            .provider_targets
+            .get(&params.id)
+            .map(|record| record.created_at_epoch_ms)
+            .unwrap_or_else(now_epoch_ms);
+        let record = ProviderTargetRecord {
+            id: params.id,
+            name: params.name,
+            slug: params.slug,
+            probe_kind: params.probe_kind,
+            probe_config_json: params.probe_config_json,
+            enabled: params.enabled,
+            created_at_epoch_ms,
+        };
+        state
+            .provider_targets
+            .insert(record.id.clone(), record.clone());
+        Ok(record)
+    }
+
+    fn record_provider_check(
+        &self,
+        params: RecordProviderCheckParams,
+    ) -> Result<ProviderCheckRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        if !state
+            .provider_targets
+            .contains_key(&params.provider_target_id)
+        {
+            return Err("provider target not found".to_string());
+        }
+        let record = ProviderCheckRecord {
+            id: self.next_id("pch"),
+            provider_target_id: params.provider_target_id,
+            status: params.status,
+            latency_ms: params.latency_ms,
+            error_class: params.error_class,
+            status_code: params.status_code,
+            checked_at_epoch_ms: params.checked_at_epoch_ms,
+        };
+        state.provider_checks.push(record.clone());
+        Ok(record)
+    }
+
+    fn set_provider_health(
+        &self,
+        params: SetProviderHealthParams,
+    ) -> Result<ProviderHealthRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let target = state
+            .provider_targets
+            .get(&params.provider_target_id)
+            .ok_or_else(|| "provider target not found".to_string())?;
+        let record = ProviderHealthRecord {
+            provider_target_id: params.provider_target_id,
+            provider_name: target.name.clone(),
+            provider_slug: target.slug.clone(),
+            state: params.state,
+            reason: params.reason,
+            last_changed_at_epoch_ms: params.last_changed_at_epoch_ms,
+            last_success_at_epoch_ms: params.last_success_at_epoch_ms,
+            last_failure_at_epoch_ms: params.last_failure_at_epoch_ms,
+            degraded_score: params.degraded_score,
+            down_score: params.down_score,
+        };
+        state
+            .provider_health
+            .insert(record.provider_target_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    fn list_provider_targets(&self) -> Result<Vec<ProviderTargetRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut records = state.provider_targets.values().cloned().collect::<Vec<_>>();
+        records.sort_by(|left, right| left.slug.cmp(&right.slug));
+        Ok(records)
+    }
+
+    fn list_provider_health(&self) -> Result<Vec<ProviderHealthRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut records = state.provider_health.values().cloned().collect::<Vec<_>>();
+        records.sort_by(|left, right| left.provider_slug.cmp(&right.provider_slug));
+        Ok(records)
     }
 
     fn register_runner(&self, params: RegisterRunnerParams) -> Result<RunnerRecord, String> {
@@ -418,6 +663,9 @@ impl GumStore for MemoryStore {
             max_attempts: job.retries + 1,
             scheduled_at_epoch_ms: now_epoch_ms(),
             failure_reason: None,
+            failure_class: None,
+            retry_after_epoch_ms: None,
+            waiting_for_provider_slug: None,
             replay_of_run_id: None,
         };
         state.runs.insert(run.id.clone(), run.clone());
@@ -447,6 +695,9 @@ impl GumStore for MemoryStore {
             max_attempts: source.max_attempts,
             scheduled_at_epoch_ms: now_epoch_ms(),
             failure_reason: None,
+            failure_class: None,
+            retry_after_epoch_ms: None,
+            waiting_for_provider_slug: None,
             replay_of_run_id: Some(source.id),
         };
         state.runs.insert(replay.id.clone(), replay.clone());
@@ -480,6 +731,13 @@ impl GumStore for MemoryStore {
         let mut selected: Option<RunRecord> = None;
         for run in state.runs.values() {
             if run.status != RunStatus::Queued {
+                continue;
+            }
+            if run
+                .retry_after_epoch_ms
+                .map(|retry_after| retry_after > now_epoch_ms())
+                .unwrap_or(false)
+            {
                 continue;
             }
             let job = match state.jobs.get(&run.job_id) {
@@ -558,6 +816,7 @@ impl GumStore for MemoryStore {
             started_at_epoch_ms: now_epoch_ms(),
             finished_at_epoch_ms: None,
             failure_reason: None,
+            failure_class: None,
             cancel_requested_at_epoch_ms: None,
         };
 
@@ -578,6 +837,10 @@ impl GumStore for MemoryStore {
             Some(record) => {
                 record.status = RunStatus::Running;
                 record.attempt_count += 1;
+                record.failure_reason = None;
+                record.failure_class = None;
+                record.retry_after_epoch_ms = None;
+                record.waiting_for_provider_slug = None;
                 record.clone()
             }
             None => return Err("selected run disappeared before lease".to_string()),
@@ -600,34 +863,86 @@ impl GumStore for MemoryStore {
             .lock()
             .map_err(|_| "memory store lock poisoned".to_string())?;
 
-        let attempt = state
-            .attempts
-            .get_mut(&params.attempt_id)
-            .ok_or_else(|| "attempt not found".to_string())?;
+        let now_epoch_ms = now_epoch_ms();
+        let attempt_snapshot = {
+            let attempt = state
+                .attempts
+                .get_mut(&params.attempt_id)
+                .ok_or_else(|| "attempt not found".to_string())?;
 
-        if attempt.finished_at_epoch_ms.is_some() || is_terminal_attempt(attempt.status) {
-            return Err("attempt already finished".to_string());
-        }
-        if attempt.cancel_requested_at_epoch_ms.is_some()
-            && params.status != AttemptStatus::Canceled
-        {
-            return Err("attempt cancel requested".to_string());
-        }
+            if attempt.finished_at_epoch_ms.is_some() || is_terminal_attempt(attempt.status) {
+                return Err("attempt already finished".to_string());
+            }
+            if attempt.cancel_requested_at_epoch_ms.is_some()
+                && params.status != AttemptStatus::Canceled
+            {
+                return Err("attempt cancel requested".to_string());
+            }
 
-        if attempt.runner_id.as_deref() != Some(params.runner_id.as_str()) {
-            return Err("runner mismatch".to_string());
-        }
+            if attempt.runner_id.as_deref() != Some(params.runner_id.as_str()) {
+                return Err("runner mismatch".to_string());
+            }
 
-        attempt.status = params.status;
-        attempt.failure_reason = params.failure_reason.clone();
-        attempt.finished_at_epoch_ms = Some(now_epoch_ms());
-        let attempt_snapshot = attempt.clone();
+            attempt.status = params.status;
+            attempt.failure_reason = params.failure_reason.clone();
+            attempt.failure_class = params.failure_class.clone();
+            attempt.finished_at_epoch_ms = Some(now_epoch_ms);
+            attempt.clone()
+        };
 
         if let Some(lease_id) = &attempt_snapshot.lease_id {
             if let Some(lease) = state.leases.get_mut(lease_id) {
-                lease.acked_at_epoch_ms = Some(now_epoch_ms());
+                lease.acked_at_epoch_ms = Some(now_epoch_ms);
             }
         }
+
+        let run_snapshot = state
+            .runs
+            .get(&attempt_snapshot.run_id)
+            .cloned()
+            .ok_or_else(|| "run not found".to_string())?;
+        let job = state
+            .jobs
+            .get(&run_snapshot.job_id)
+            .cloned()
+            .ok_or_else(|| "job not found".to_string())?;
+        let provider_slug = provider_slug_from_job(&job)?;
+
+        if let Some(provider_slug) = provider_slug.as_deref() {
+            if params.status == AttemptStatus::Succeeded {
+                self.apply_provider_signal_locked(
+                    &mut state,
+                    provider_slug,
+                    ProviderCheckStatus::Success,
+                    None,
+                    now_epoch_ms,
+                );
+            } else if is_provider_failure_class(params.failure_class.as_deref()) {
+                self.apply_provider_signal_locked(
+                    &mut state,
+                    provider_slug,
+                    ProviderCheckStatus::Failure,
+                    params.failure_class.as_deref(),
+                    now_epoch_ms,
+                );
+            }
+        }
+
+        let provider_health = provider_slug
+            .as_deref()
+            .and_then(|slug| Self::provider_health_by_slug(&state, slug));
+
+        let disposition = compute_retry_disposition(
+            &run_snapshot.id,
+            run_snapshot.attempt_count,
+            run_snapshot.max_attempts,
+            params.status,
+            params.failure_reason.clone(),
+            params.failure_class.clone(),
+            provider_slug.as_deref(),
+            provider_health.as_ref().map(|record| record.state),
+            now_epoch_ms,
+        );
 
         let run = state
             .runs
@@ -635,32 +950,15 @@ impl GumStore for MemoryStore {
             .ok_or_else(|| "run not found".to_string())?;
 
         match params.status {
-            AttemptStatus::Succeeded => {
-                run.status = RunStatus::Succeeded;
-                run.failure_reason = None;
-            }
-            AttemptStatus::TimedOut => {
-                if run.attempt_count < run.max_attempts {
-                    run.status = RunStatus::Queued;
-                } else {
-                    run.status = RunStatus::TimedOut;
-                    run.failure_reason = params.failure_reason;
-                }
-            }
-            AttemptStatus::Failed => {
-                if run.attempt_count < run.max_attempts {
-                    run.status = RunStatus::Queued;
-                } else {
-                    run.status = RunStatus::Failed;
-                    run.failure_reason = params.failure_reason;
-                }
-            }
-            AttemptStatus::Canceled => {
-                run.status = RunStatus::Canceled;
-                run.failure_reason = params.failure_reason;
-            }
             AttemptStatus::Queued | AttemptStatus::Leased | AttemptStatus::Running => {
                 return Err("attempt completion requires terminal status".to_string())
+            }
+            _ => {
+                run.status = disposition.next_status;
+                run.failure_reason = disposition.failure_reason;
+                run.failure_class = disposition.failure_class;
+                run.retry_after_epoch_ms = disposition.retry_after_epoch_ms;
+                run.waiting_for_provider_slug = disposition.waiting_for_provider_slug;
             }
         }
 
@@ -687,6 +985,9 @@ impl GumStore for MemoryStore {
                     .ok_or_else(|| "run disappeared".to_string())?;
                 run.status = RunStatus::Canceled;
                 run.failure_reason = Some("canceled".to_string());
+                run.failure_class = None;
+                run.retry_after_epoch_ms = None;
+                run.waiting_for_provider_slug = None;
                 Ok(run.clone())
             }
             RunStatus::Running => {
@@ -717,6 +1018,7 @@ impl GumStore for MemoryStore {
                     .get_mut(&params.run_id)
                     .ok_or_else(|| "run disappeared".to_string())?;
                 run.failure_reason = Some("cancel requested".to_string());
+                run.failure_class = None;
                 Ok(run.clone())
             }
             RunStatus::Succeeded
@@ -788,6 +1090,9 @@ impl GumStore for MemoryStore {
                         max_attempts: job.retries + 1,
                         scheduled_at_epoch_ms: next_due_ms,
                         failure_reason: None,
+                        failure_class: None,
+                        retry_after_epoch_ms: None,
+                        waiting_for_provider_slug: None,
                         replay_of_run_id: None,
                     };
                     state.runs.insert(run.id.clone(), run.clone());

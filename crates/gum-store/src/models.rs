@@ -54,6 +54,9 @@ pub struct RunRecord {
     pub max_attempts: u32,
     pub scheduled_at_epoch_ms: i64,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
+    pub retry_after_epoch_ms: Option<i64>,
+    pub waiting_for_provider_slug: Option<String>,
     pub replay_of_run_id: Option<String>,
 }
 
@@ -68,6 +71,7 @@ pub struct AttemptRecord {
     pub started_at_epoch_ms: i64,
     pub finished_at_epoch_ms: Option<i64>,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
     pub cancel_requested_at_epoch_ms: Option<i64>,
 }
 
@@ -96,6 +100,55 @@ pub struct ControlLeaseRecord {
     pub name: String,
     pub holder_id: String,
     pub expires_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderCheckStatus {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderHealthState {
+    Healthy,
+    Degraded,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTargetRecord {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub probe_kind: String,
+    pub probe_config_json: Value,
+    pub enabled: bool,
+    pub created_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCheckRecord {
+    pub id: String,
+    pub provider_target_id: String,
+    pub status: ProviderCheckStatus,
+    pub latency_ms: Option<u32>,
+    pub error_class: Option<String>,
+    pub status_code: Option<u16>,
+    pub checked_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderHealthRecord {
+    pub provider_target_id: String,
+    pub provider_name: String,
+    pub provider_slug: String,
+    pub state: ProviderHealthState,
+    pub reason: Option<String>,
+    pub last_changed_at_epoch_ms: i64,
+    pub last_success_at_epoch_ms: Option<i64>,
+    pub last_failure_at_epoch_ms: Option<i64>,
+    pub degraded_score: i32,
+    pub down_score: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

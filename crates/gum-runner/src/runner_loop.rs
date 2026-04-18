@@ -31,6 +31,7 @@ pub struct CompleteAttemptRequest {
     pub runner_id: String,
     pub status: AttemptStatus,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

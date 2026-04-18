@@ -501,6 +501,10 @@ name = "gum-scheduler"
 version = "0.1.0"
 dependencies = [
  "gum-api",
+ "gum-store",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

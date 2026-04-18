@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gum_api::{app_state::AppState, service};
 use gum_store::queries::{ControlLeaseParams, GumStore};
 
+mod probes;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
@@ -27,6 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tick_interval = std::time::Duration::from_secs(5);
         let leader_ttl_secs = 15;
         let leader_id = format!("scheduler-{}", std::process::id());
+        let probe_client = reqwest::Client::builder().build().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to build probe client: {error}"),
+            )
+        })?;
 
         tracing::info!(leader_id = %leader_id, "gum-scheduler started");
         loop {
@@ -72,6 +80,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if !recovered.is_empty() {
                 tracing::info!("recovered {} lost run(s)", recovered.len());
+            }
+
+            let provider_updates =
+                probes::run_provider_probes(&state.store, &probe_client, now_epoch_ms)
+                    .await
+                    .map_err(|message| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("provider probe loop failed: {message}"),
+                        )
+                    })?;
+            for update in provider_updates {
+                tracing::info!(
+                    provider = %update.provider_slug,
+                    state = ?update.state,
+                    reason = update.reason.as_deref().unwrap_or(""),
+                    "provider health updated"
+                );
             }
 
             tokio::time::sleep(tick_interval).await;

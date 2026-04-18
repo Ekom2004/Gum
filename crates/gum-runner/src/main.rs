@@ -77,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &leased,
                     outcome.status,
                     outcome.failure_reason,
+                    outcome.failure_class,
                 )
                 .await?;
             }
@@ -347,6 +348,7 @@ async fn complete_once(
     leased: &LeasedRun,
     status: AttemptStatus,
     failure_reason: Option<String>,
+    failure_class: Option<String>,
 ) -> Result<(), String> {
     let response = client
         .post(format!(
@@ -358,6 +360,7 @@ async fn complete_once(
             runner_id: config.runner_id.clone(),
             status,
             failure_reason,
+            failure_class,
         })
         .send()
         .await

@@ -21,6 +21,7 @@ pub struct AttemptOutcome {
     pub attempt_id: String,
     pub status: AttemptStatus,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 pub const EXECUTION_FLOW: &[&str] = &[

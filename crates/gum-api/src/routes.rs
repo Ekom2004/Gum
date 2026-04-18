@@ -46,6 +46,9 @@ pub struct RunResponse {
     pub status: RunStatus,
     pub attempt: u32,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
+    pub retry_after_epoch_ms: Option<i64>,
+    pub waiting_for_provider_slug: Option<String>,
     pub replay_of: Option<String>,
 }
 
@@ -145,10 +148,30 @@ pub struct LeasesListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderHealthResponse {
+    pub provider_target_id: String,
+    pub provider_name: String,
+    pub provider_slug: String,
+    pub state: String,
+    pub reason: Option<String>,
+    pub last_changed_at_epoch_ms: i64,
+    pub last_success_at_epoch_ms: Option<i64>,
+    pub last_failure_at_epoch_ms: Option<i64>,
+    pub degraded_score: i32,
+    pub down_score: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderHealthListResponse {
+    pub providers: Vec<ProviderHealthResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteAttemptRequest {
     pub runner_id: String,
     pub status: AttemptStatus,
     pub failure_reason: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
