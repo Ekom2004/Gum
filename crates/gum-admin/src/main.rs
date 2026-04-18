@@ -518,12 +518,13 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         View::Leases => 2,
     };
     let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::BOTTOM))
+        .block(panel_block(" VIEWS ").borders(Borders::BOTTOM))
         .select(selected)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
-                .fg(Color::White)
+                .fg(Color::Black)
+                .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
         .divider("  ");
@@ -567,26 +568,29 @@ fn render_runs_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let runs = app.filtered_runs();
     let rows = runs.iter().map(|run| {
         Row::new(vec![
-            Cell::from(status_span(&run.status)),
-            Cell::from(run.job_id.clone()),
-            Cell::from(run.id.clone()),
+            Cell::from(status_cell(&run.status)),
+            Cell::from(truncate_text(&run.job_id, 18)),
+            Cell::from(truncate_text(&run.id, 18)),
             Cell::from(run.attempt.to_string()),
-            Cell::from(run.trigger_type.clone().unwrap_or_else(|| "--".to_string())),
+            Cell::from(truncate_text(
+                run.trigger_type.as_deref().unwrap_or("--"),
+                10,
+            )),
         ])
     });
     let table = Table::new(
         rows,
         [
-            Constraint::Length(4),
+            Constraint::Length(11),
             Constraint::Length(20),
             Constraint::Length(20),
-            Constraint::Length(8),
+            Constraint::Length(7),
             Constraint::Length(10),
         ],
     )
-    .block(Block::default().title(" RUNS ").borders(Borders::ALL))
+    .block(panel_block(" RUNS "))
     .header(
-        Row::new(vec!["", "job", "run id", "attempt", "trigger"])
+        Row::new(vec!["status", "job", "run id", "try", "trigger"])
             .style(Style::default().fg(Color::DarkGray)),
     )
     .highlight_style(Style::default().bg(Color::DarkGray))
@@ -601,13 +605,16 @@ fn render_runs_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_runners_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = app.snapshot.runners.iter().map(|runner| {
         Row::new(vec![
-            Cell::from(runner.id.clone()),
-            Cell::from(runner.compute_class.clone()),
+            Cell::from(truncate_text(&runner.id, 18)),
+            Cell::from(truncate_text(&runner.compute_class, 10)),
             Cell::from(format!(
                 "{}/{}",
                 runner.active_lease_count, runner.max_concurrent_leases
             )),
-            Cell::from(runner.last_heartbeat_at_epoch_ms.to_string()),
+            Cell::from(truncate_text(
+                &runner.last_heartbeat_at_epoch_ms.to_string(),
+                12,
+            )),
         ])
     });
     let table = Table::new(
@@ -619,7 +626,7 @@ fn render_runners_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(14),
         ],
     )
-    .block(Block::default().title(" RUNNERS ").borders(Borders::ALL))
+    .block(panel_block(" RUNNERS "))
     .header(
         Row::new(vec!["id", "class", "active/max", "heartbeat"])
             .style(Style::default().fg(Color::DarkGray)),
@@ -636,9 +643,9 @@ fn render_runners_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_leases_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = app.snapshot.leases.iter().map(|lease| {
         Row::new(vec![
-            Cell::from(lease.lease_id.clone()),
-            Cell::from(lease.run_id.clone()),
-            Cell::from(lease.runner_id.clone()),
+            Cell::from(truncate_text(&lease.lease_id, 18)),
+            Cell::from(truncate_text(&lease.run_id, 18)),
+            Cell::from(truncate_text(&lease.runner_id, 18)),
             Cell::from(if lease.cancel_requested { "yes" } else { "no" }),
         ])
     });
@@ -651,7 +658,7 @@ fn render_leases_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(8),
         ],
     )
-    .block(Block::default().title(" LEASES ").borders(Borders::ALL))
+    .block(panel_block(" LEASES "))
     .header(
         Row::new(vec!["lease id", "run id", "runner", "cancel"])
             .style(Style::default().fg(Color::DarkGray)),
@@ -669,54 +676,51 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = match app.view {
         View::Runs => match app.selected_run() {
             Some(run) => vec![
-                Line::from(format!("run:      {}", run.id)),
-                Line::from(format!("job:      {}", run.job_id)),
-                Line::from(vec![Span::raw("status:   "), status_span(&run.status)]),
-                Line::from(format!("attempt:  {}", run.attempt)),
-                Line::from(format!(
-                    "trigger:  {}",
-                    run.trigger_type.unwrap_or_else(|| "--".to_string())
-                )),
-                Line::from(format!(
-                    "replay:   {}",
-                    run.replay_of.unwrap_or_else(|| "--".to_string())
-                )),
-                Line::from(format!(
-                    "failure:  {}",
-                    run.failure_reason.unwrap_or_else(|| "--".to_string())
-                )),
+                detail_line("run", &run.id),
+                detail_line("job", &run.job_id),
+                Line::from(vec![
+                    detail_key("status"),
+                    Span::raw(" "),
+                    status_span(&run.status),
+                    Span::raw(" "),
+                    Span::styled(run.status.clone(), Style::default().fg(Color::White)),
+                ]),
+                detail_line("attempt", &run.attempt.to_string()),
+                detail_line("trigger", run.trigger_type.as_deref().unwrap_or("--")),
+                detail_line("replay", run.replay_of.as_deref().unwrap_or("--")),
+                detail_line("failure", run.failure_reason.as_deref().unwrap_or("--")),
             ],
             None => vec![Line::from("No run selected.")],
         },
         View::Runners => match select_item(&app.snapshot.runners, app.selected_index) {
             Some(runner) => vec![
-                Line::from(format!("runner:   {}", runner.id)),
-                Line::from(format!("class:    {}", runner.compute_class)),
-                Line::from(format!(
-                    "active:   {}/{}",
-                    runner.active_lease_count, runner.max_concurrent_leases
-                )),
-                Line::from(format!("seen:     {}", runner.last_heartbeat_at_epoch_ms)),
+                detail_line("runner", &runner.id),
+                detail_line("class", &runner.compute_class),
+                detail_line(
+                    "active",
+                    &format!(
+                        "{}/{}",
+                        runner.active_lease_count, runner.max_concurrent_leases
+                    ),
+                ),
+                detail_line("seen", &runner.last_heartbeat_at_epoch_ms.to_string()),
             ],
             None => vec![Line::from("No runner selected.")],
         },
         View::Leases => match select_item(&app.snapshot.leases, app.selected_index) {
             Some(lease) => vec![
-                Line::from(format!("lease:    {}", lease.lease_id)),
-                Line::from(format!("run:      {}", lease.run_id)),
-                Line::from(format!("attempt:  {}", lease.attempt_id)),
-                Line::from(format!("runner:   {}", lease.runner_id)),
-                Line::from(format!("expires:  {}", lease.expires_at_epoch_ms)),
-                Line::from(format!(
-                    "cancel:   {}",
-                    if lease.cancel_requested { "yes" } else { "no" }
-                )),
+                detail_line("lease", &lease.lease_id),
+                detail_line("run", &lease.run_id),
+                detail_line("attempt", &lease.attempt_id),
+                detail_line("runner", &lease.runner_id),
+                detail_line("expires", &lease.expires_at_epoch_ms.to_string()),
+                detail_line("cancel", if lease.cancel_requested { "yes" } else { "no" }),
             ],
             None => vec![Line::from("No lease selected.")],
         },
     };
     let widget = Paragraph::new(lines)
-        .block(Block::default().title(" DETAIL ").borders(Borders::ALL))
+        .block(panel_block(" DETAIL "))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, area);
 }
@@ -733,16 +737,11 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .map(|log| {
-                Line::from(format!(
-                    "[{}:{}] {}",
-                    log.attempt_id, log.stream, log.message
-                ))
-            })
+            .map(render_log_line)
             .collect()
     };
     let widget = Paragraph::new(lines)
-        .block(Block::default().title(" LOGS ").borders(Borders::ALL))
+        .block(panel_block(" LOGS "))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -796,6 +795,64 @@ fn status_span(status: &str) -> Span<'static> {
         symbol,
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
+}
+
+fn status_cell(status: &str) -> Line<'static> {
+    Line::from(vec![
+        status_span(status),
+        Span::raw(" "),
+        Span::styled(truncate_text(status, 8), Style::default().fg(Color::White)),
+    ])
+}
+
+fn render_log_line(log: &LogLineRecord) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("[{}]", truncate_text(&log.stream, 6)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{} ", truncate_text(&log.attempt_id, 10)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(truncate_text(&log.message, 120)),
+    ])
+}
+
+fn detail_key(label: &str) -> Span<'static> {
+    Span::styled(format!("{label:8}:"), Style::default().fg(Color::DarkGray))
+}
+
+fn detail_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        detail_key(label),
+        Span::raw(" "),
+        Span::raw(value.to_string()),
+    ])
+}
+
+fn panel_block(title: &'static str) -> Block<'static> {
+    Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    chars[..max_chars - 1].iter().collect::<String>() + "…"
 }
 
 fn filter_runs(runs: &[RunRecord], query: &str) -> Vec<RunRecord> {
