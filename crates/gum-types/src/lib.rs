@@ -43,6 +43,7 @@ pub struct JobPolicy {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub key_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -19,6 +19,7 @@ class JobPolicy:
     timeout: str = "5m"
     rate_limit: str | None = None
     concurrency: int | None = None
+    key: str | None = None
     compute_class: str | None = None
 
 
@@ -32,6 +33,7 @@ class GumJob(Generic[P, R]):
         timeout: str,
         rate_limit: str | None,
         concurrency: int | None,
+        key: str | None,
         compute: str | None,
         client: GumClient | None,
     ) -> None:
@@ -48,6 +50,7 @@ class GumJob(Generic[P, R]):
             timeout=timeout,
             rate_limit=rate_limit,
             concurrency=concurrency,
+            key=key,
             compute_class=compute,
         )
         self.__name__ = func.__name__
@@ -77,6 +80,7 @@ def job(
     timeout: str = "5m",
     rate_limit: str | None = None,
     concurrency: int | None = None,
+    key: str | None = None,
     compute: str | None = None,
     client: GumClient | None = None,
 ) -> Callable[[Callable[P, R]], GumJob[P, R]]:
@@ -88,6 +92,7 @@ def job(
             timeout=timeout,
             rate_limit=rate_limit,
             concurrency=concurrency,
+            key=key,
             compute=compute,
             client=client,
         )

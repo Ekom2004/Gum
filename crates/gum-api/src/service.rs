@@ -7,11 +7,12 @@ use gum_store::queries::{
     ReplayRunParams,
 };
 use gum_types::AttemptStatus;
+use serde_json::Value;
 
 use crate::routes::{
     AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, ConcurrencyListResponse,
-    ConcurrencyStatusResponse, EnqueueRunRequest, LeaseRunRequest, LeaseRunResponse,
-    LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
+    ConcurrencyStatusResponse, EnqueueRunRequest, EnqueueRunResponse, LeaseRunRequest,
+    LeaseRunResponse, LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
     ProviderHealthListResponse, ProviderHealthResponse, RegisterDeployRequest,
     RegisterDeployResponse, RegisterRunnerRequest, ReplayRunResponse, RunResponse,
     RunnerHeartbeatRequest, RunnerStatusResponse, RunnersListResponse, RunsListResponse,
@@ -41,6 +42,7 @@ pub fn register_deploy<S: GumStore>(
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                key_field: job.key_field,
                 compute_class: job.compute_class,
             })
             .collect(),
@@ -58,18 +60,23 @@ pub fn enqueue_run<S: GumStore>(
     project_id: &str,
     job_id: &str,
     request: EnqueueRunRequest,
-) -> Result<RunResponse, String> {
+) -> Result<EnqueueRunResponse, String> {
     let job = store
         .get_job(job_id)?
         .ok_or_else(|| "job not found".to_string())?;
-    let run = store.enqueue_run(EnqueueRunParams {
+    let dedupe_key_value = resolve_key_value(job.key_field.as_deref(), &request.input)?;
+    let enqueued = store.enqueue_run(EnqueueRunParams {
         project_id: project_id.to_string(),
         job_id: job_id.to_string(),
         deploy_id: job.deploy_id,
         input_json: request.input,
+        dedupe_key_value,
     })?;
-    let concurrency = concurrency_status_map(store)?;
-    Ok(run_response(run, concurrency.get(job_id)))
+    Ok(EnqueueRunResponse {
+        id: enqueued.run.id,
+        status: enqueued.run.status,
+        deduped: enqueued.deduped,
+    })
 }
 
 pub fn get_run<S: GumStore>(store: &S, run_id: &str) -> Result<Option<RunResponse>, String> {
@@ -403,4 +410,25 @@ fn now_epoch_ms() -> i64 {
         Ok(duration) => duration.as_millis() as i64,
         Err(_) => 0,
     }
+}
+
+fn resolve_key_value(key_field: Option<&str>, input: &Value) -> Result<Option<String>, String> {
+    let Some(key_field) = key_field else {
+        return Ok(None);
+    };
+    let value = input
+        .get(key_field)
+        .ok_or_else(|| format!("key field \"{key_field}\" missing from input"))?;
+    let resolved = match value {
+        Value::String(inner) => inner.clone(),
+        Value::Number(inner) => inner.to_string(),
+        Value::Bool(inner) => inner.to_string(),
+        Value::Null => return Err(format!("key field \"{key_field}\" must not be null")),
+        Value::Array(_) | Value::Object(_) => {
+            return Err(format!(
+                "key field \"{key_field}\" must resolve to a scalar value"
+            ));
+        }
+    };
+    Ok(Some(resolved))
 }

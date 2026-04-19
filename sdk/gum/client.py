@@ -15,6 +15,7 @@ class GumAPIError(RuntimeError):
 class RunRef:
     id: str
     status: str
+    deduped: bool = False
 
 
 @dataclass(slots=True)
@@ -200,6 +201,7 @@ def _run_ref_from_payload(payload: dict[str, Any]) -> RunRef:
     return RunRef(
         id=payload["id"],
         status=payload.get("status", "queued"),
+        deduped=payload.get("deduped", False),
     )
 
 

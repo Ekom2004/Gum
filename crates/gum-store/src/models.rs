@@ -36,6 +36,7 @@ pub struct JobRecord {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub key_field: Option<String>,
     pub compute_class: Option<String>,
     pub enabled: bool,
     pub created_at_epoch_ms: i64,
@@ -204,6 +205,16 @@ pub struct ConcurrencyStatusRecord {
     pub concurrency_limit: u32,
     pub active_run_ids: Vec<String>,
     pub queued_run_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunKeyRecord {
+    pub project_id: String,
+    pub job_id: String,
+    pub key_value: String,
+    pub run_id: String,
+    pub created_at_epoch_ms: i64,
+    pub expires_at_epoch_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

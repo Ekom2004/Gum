@@ -44,6 +44,7 @@ fn enqueue_lease_complete_replay_flow_works() {
                 timeout_secs: 300,
                 rate_limit_spec: Some("20/m".to_string()),
                 concurrency_limit: Some(5),
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -148,6 +149,7 @@ fn failed_attempt_requeues_when_retries_remain() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -237,6 +239,7 @@ fn function_health_blocks_retry_without_provider_config() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: Some(5),
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -393,6 +396,7 @@ fn user_code_failures_do_not_consume_retry_budget_as_requeues() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: Some(5),
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -493,6 +497,7 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
                 timeout_secs: 300,
                 rate_limit_spec: Some("1/h".to_string()),
                 concurrency_limit: None,
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -594,6 +599,7 @@ fn canceling_a_queued_run_marks_it_canceled() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -648,6 +654,7 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -757,6 +764,7 @@ fn admin_views_expose_runs_runners_leases_and_concurrency() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: Some(1),
+                key_field: None,
                 compute_class: Some("high-mem".to_string()),
             }],
         },
@@ -940,6 +948,7 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                key_field: None,
                 compute_class: None,
             }],
         },
@@ -1018,6 +1027,7 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
                 timeout_secs: 7_200,
                 rate_limit_spec: None,
                 concurrency_limit: Some(1),
+                key_field: None,
                 compute_class: Some("high-mem".to_string()),
             }],
         },
@@ -1161,6 +1171,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
                     timeout_secs: 7_200,
                     rate_limit_spec: None,
                     concurrency_limit: None,
+                    key_field: None,
                     compute_class: Some("high-mem".to_string()),
                 },
                 RegisteredJob {
@@ -1173,6 +1184,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
                     timeout_secs: 300,
                     rate_limit_spec: None,
                     concurrency_limit: None,
+                    key_field: None,
                     compute_class: None,
                 },
             ],
@@ -1329,6 +1341,248 @@ fn control_lease_fences_scheduler_work() {
         })
         .expect("expired control lease should be re-acquirable");
     assert!(takeover, "leadership should transfer after expiry");
+}
+
+#[test]
+fn keyed_enqueue_returns_existing_run_for_duplicate_payload() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 3,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: Some(1),
+                key_field: Some("event_id".to_string()),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123", "payload": { "ok": true } }),
+        },
+    )
+    .expect("first enqueue should work");
+    assert!(!first.deduped);
+
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123", "payload": { "ok": true } }),
+        },
+    )
+    .expect("second enqueue should work");
+    assert!(second.deduped);
+    assert_eq!(second.id, first.id);
+}
+
+#[test]
+fn keyed_enqueue_does_not_collide_across_functions() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![
+                RegisteredJob {
+                    id: "job_process_webhook".to_string(),
+                    name: "process_webhook".to_string(),
+                    handler_ref: "jobs:process_webhook".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 3,
+                    timeout_secs: 300,
+                    rate_limit_spec: None,
+                    concurrency_limit: None,
+                    key_field: Some("event_id".to_string()),
+                    compute_class: None,
+                },
+                RegisteredJob {
+                    id: "job_sync_webhook".to_string(),
+                    name: "sync_webhook".to_string(),
+                    handler_ref: "jobs:sync_webhook".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 3,
+                    timeout_secs: 300,
+                    rate_limit_spec: None,
+                    concurrency_limit: None,
+                    key_field: Some("event_id".to_string()),
+                    compute_class: None,
+                },
+            ],
+        },
+    )
+    .expect("register deploy should work");
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123" }),
+        },
+    )
+    .expect("first enqueue should work");
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_sync_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123" }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    assert_ne!(first.id, second.id);
+    assert!(!first.deduped);
+    assert!(!second.deduped);
+}
+
+#[test]
+fn replay_bypasses_key_dedupe() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 3,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                key_field: Some("event_id".to_string()),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123" }),
+        },
+    )
+    .expect("enqueue should work");
+
+    let replay = service::replay_run(&store, &first.id).expect("replay should work");
+    assert_ne!(replay.id, first.id);
+    assert_eq!(replay.replay_of, first.id);
+}
+
+#[test]
+fn keyed_enqueue_requires_the_configured_field() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 3,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                key_field: Some("event_id".to_string()),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let error = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "payload": true }),
+        },
+    )
+    .expect_err("missing key field should fail");
+    assert!(error.contains("key field \"event_id\" missing from input"));
 }
 
 fn now_epoch_ms() -> i64 {

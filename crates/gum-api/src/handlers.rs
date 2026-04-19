@@ -106,7 +106,7 @@ pub async fn enqueue_run(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
     Json(payload): Json<EnqueueRunRequest>,
-) -> Result<Json<crate::routes::RunResponse>, ApiError> {
+) -> Result<Json<crate::routes::EnqueueRunResponse>, ApiError> {
     let store = state.store.clone();
     let project_id = state.project_id.clone();
     let result = tokio::task::spawn_blocking(move || {

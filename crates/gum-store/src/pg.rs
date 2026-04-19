@@ -13,9 +13,9 @@ use crate::models::{
 };
 use crate::queries::{
     compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
-    is_provider_failure_class, parse_rate_limit_spec, parse_schedule_interval_ms,
+    is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, parse_schedule_interval_ms,
     provider_slug_from_job, CancelRunParams, CompleteAttemptParams, ControlLeaseParams,
-    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
     RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
     SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
@@ -29,6 +29,7 @@ const MIGRATION_0005: &str = include_str!("../migrations/0005_cancel_revoke.sql"
 const MIGRATION_0006: &str = include_str!("../migrations/0006_provider_health.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_retry_policy.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_function_health.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0009_run_keys.sql");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -74,6 +75,9 @@ impl PostgresStore {
             .batch_execute(MIGRATION_0008)
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
+            .batch_execute(MIGRATION_0009)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
             .execute(
                 "INSERT INTO projects (id, name, slug, api_key_hash)
                  VALUES ($1, $2, $3, $4)
@@ -101,6 +105,23 @@ impl PostgresStore {
     fn next_id(&self, prefix: &str) -> String {
         let counter = self.ids.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{prefix}_{}_{}", now_epoch_ms(), counter)
+    }
+
+    fn run_key_lock_id(project_id: &str, job_id: &str, key_value: &str) -> i64 {
+        let mut hash = 1469598103934665603_u64;
+        for byte in project_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        for byte in job_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        for byte in key_value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        (hash & 0x7fff_ffff_ffff_ffff) as i64
     }
 
     fn provider_health_by_slug_tx(
@@ -508,6 +529,7 @@ impl GumStore for PostgresStore {
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                key_field: job.key_field,
                 compute_class: job.compute_class,
                 enabled: true,
                 created_at_epoch_ms,
@@ -516,8 +538,8 @@ impl GumStore for PostgresStore {
             tx.execute(
                 "INSERT INTO jobs (
                     id, project_id, deploy_id, name, handler_ref, trigger_mode, schedule_expr,
-                    retries, timeout_secs, rate_limit_spec, concurrency_limit, compute_class, enabled
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    retries, timeout_secs, rate_limit_spec, concurrency_limit, key_field, compute_class, enabled
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                  ON CONFLICT (id) DO UPDATE
                  SET project_id = EXCLUDED.project_id,
                      deploy_id = EXCLUDED.deploy_id,
@@ -529,6 +551,7 @@ impl GumStore for PostgresStore {
                      timeout_secs = EXCLUDED.timeout_secs,
                      rate_limit_spec = EXCLUDED.rate_limit_spec,
                      concurrency_limit = EXCLUDED.concurrency_limit,
+                     key_field = EXCLUDED.key_field,
                      compute_class = EXCLUDED.compute_class,
                      enabled = EXCLUDED.enabled,
                      updated_at = NOW()",
@@ -544,6 +567,7 @@ impl GumStore for PostgresStore {
                     &(record.timeout_secs as i32),
                     &record.rate_limit_spec,
                     &record.concurrency_limit.map(|value| value as i32),
+                    &record.key_field,
                     &record.compute_class,
                     &record.enabled,
                 ],
@@ -1134,9 +1158,12 @@ impl GumStore for PostgresStore {
             .collect()
     }
 
-    fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {
+    fn enqueue_run(&self, params: EnqueueRunParams) -> Result<EnqueueRunResult, String> {
         let mut client = self.connect_client()?;
-        let row = client
+        let mut tx = client
+            .transaction()
+            .map_err(|error| format!("failed to start enqueue transaction: {error}"))?;
+        let row = tx
             .query_opt(
                 "SELECT enabled, project_id, deploy_id, retries FROM jobs WHERE id = $1",
                 &[&params.job_id],
@@ -1155,9 +1182,46 @@ impl GumStore for PostgresStore {
         }
         let retries: i32 = row.get("retries");
 
+        if let Some(key_value) = params.dedupe_key_value.as_deref() {
+            let lock_id = Self::run_key_lock_id(&params.project_id, &params.job_id, key_value);
+            tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&lock_id])
+                .map_err(|error| format!("failed to acquire run key lock: {error}"))?;
+            tx.execute(
+                "DELETE FROM run_keys
+                 WHERE project_id = $1
+                   AND job_id = $2
+                   AND key_value = $3
+                   AND expires_at <= NOW()",
+                &[&params.project_id, &params.job_id, &key_value],
+            )
+            .map_err(|error| format!("failed to clear expired run key: {error}"))?;
+
+            if let Some(existing) = tx
+                .query_opt(
+                    "SELECT runs.*,
+                            (EXTRACT(EPOCH FROM runs.scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms
+                     FROM run_keys
+                     JOIN runs ON runs.id = run_keys.run_id
+                     WHERE run_keys.project_id = $1
+                       AND run_keys.job_id = $2
+                       AND run_keys.key_value = $3
+                       AND run_keys.expires_at > NOW()",
+                    &[&params.project_id, &params.job_id, &key_value],
+                )
+                .map_err(|error| format!("failed to load existing keyed run: {error}"))?
+            {
+                tx.commit()
+                    .map_err(|error| format!("failed to commit keyed enqueue transaction: {error}"))?;
+                return Ok(EnqueueRunResult {
+                    run: run_from_row(existing)?,
+                    deduped: true,
+                });
+            }
+        }
+
         let run_id = self.next_id("run");
         let max_attempts = retries + 1;
-        let inserted = client
+        let inserted = tx
             .query_one(
                 "INSERT INTO runs (
                     id, project_id, job_id, deploy_id, trigger_type, status,
@@ -1176,8 +1240,29 @@ impl GumStore for PostgresStore {
                 ],
             )
             .map_err(|error| format!("failed to enqueue run: {error}"))?;
-
-        run_from_row(inserted)
+        let run = run_from_row(inserted)?;
+        if let Some(key_value) = params.dedupe_key_value {
+            let expires_at_epoch_ms = now_epoch_ms() + key_retention_ms();
+            tx.execute(
+                "INSERT INTO run_keys (
+                    project_id, job_id, key_value, run_id, expires_at
+                 ) VALUES ($1, $2, $3, $4, TO_TIMESTAMP($5 / 1000.0))",
+                &[
+                    &run.project_id,
+                    &run.job_id,
+                    &key_value,
+                    &run.id,
+                    &(expires_at_epoch_ms as f64),
+                ],
+            )
+            .map_err(|error| format!("failed to insert run key: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("failed to commit enqueue transaction: {error}"))?;
+        Ok(EnqueueRunResult {
+            run,
+            deduped: false,
+        })
     }
 
     fn replay_run(&self, params: ReplayRunParams) -> Result<RunRecord, String> {
@@ -1938,6 +2023,7 @@ fn job_from_row(row: Row) -> Result<JobRecord, String> {
         timeout_secs: timeout_secs as u32,
         rate_limit_spec: row.get("rate_limit_spec"),
         concurrency_limit: concurrency_limit.map(|value| value as u32),
+        key_field: row.get("key_field"),
         compute_class: row.get("compute_class"),
         enabled: row.get("enabled"),
         created_at_epoch_ms,

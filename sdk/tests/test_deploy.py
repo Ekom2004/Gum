@@ -36,7 +36,7 @@ class DeployDiscoveryTests(unittest.TestCase):
                     """
                     import gum
 
-                    @gum.job(every="20d", retries=5, timeout="5m", rate_limit="20/m", concurrency=5, compute="high-mem")
+                    @gum.job(every="20d", retries=5, timeout="5m", rate_limit="20/m", concurrency=5, key="event_id", compute="high-mem")
                     def send_followup():
                         return None
                     """
@@ -52,6 +52,7 @@ class DeployDiscoveryTests(unittest.TestCase):
         self.assertEqual(jobs[0].handler_ref, "jobs:send_followup")
         self.assertEqual(jobs[0].schedule_expr, "20d")
         self.assertEqual(jobs[0].timeout_secs, 300)
+        self.assertEqual(jobs[0].key_field, "event_id")
         self.assertEqual(jobs[0].compute_class, "high-mem")
 
     def test_package_project_creates_bundle(self) -> None:
@@ -81,7 +82,7 @@ class DeployDiscoveryTests(unittest.TestCase):
                     """
                     import gum
 
-                    @gum.job(retries=3, timeout="30s", rate_limit="10/m", concurrency=2, compute="gpu")
+                    @gum.job(retries=3, timeout="30s", rate_limit="10/m", concurrency=2, key="customer_id", compute="gpu")
                     def sync_signup(user_id: str):
                         return user_id
                     """
@@ -100,6 +101,7 @@ class DeployDiscoveryTests(unittest.TestCase):
         assert client.payload is not None
         self.assertEqual(client.payload["project_id"], "proj_dev")
         self.assertEqual(client.payload["jobs"][0]["id"], "job_sync_signup")
+        self.assertEqual(client.payload["jobs"][0]["key_field"], "customer_id")
         self.assertEqual(client.payload["jobs"][0]["compute_class"], "gpu")
 
 

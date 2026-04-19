@@ -27,6 +27,7 @@ class DiscoveredJob:
     timeout_secs: int
     rate_limit_spec: str | None
     concurrency_limit: int | None
+    key_field: str | None
     compute_class: str | None
     module_path: str
 
@@ -46,6 +47,7 @@ class _AstJobConfig:
     timeout: str = "5m"
     rate_limit: str | None = None
     concurrency: int | None = None
+    key: str | None = None
     compute: str | None = None
 
 
@@ -76,6 +78,7 @@ def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
                     timeout_secs=_parse_timeout_secs(config.timeout),
                     rate_limit_spec=config.rate_limit,
                     concurrency_limit=config.concurrency,
+                    key_field=config.key,
                     compute_class=config.compute,
                     module_path=module_path,
                 )
@@ -134,6 +137,7 @@ def deploy_project(
                 "timeout_secs": job.timeout_secs,
                 "rate_limit_spec": job.rate_limit_spec,
                 "concurrency_limit": job.concurrency_limit,
+                "key_field": job.key_field,
                 "compute_class": job.compute_class,
             }
             for job in jobs
@@ -171,6 +175,8 @@ def _parse_decorator_keywords(node: ast.Call) -> _AstJobConfig:
             config.rate_limit = value
         elif keyword.arg == "concurrency":
             config.concurrency = int(value)
+        elif keyword.arg == "key":
+            config.key = str(value)
         elif keyword.arg == "compute":
             config.compute = value
     return config

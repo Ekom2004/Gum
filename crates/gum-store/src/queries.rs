@@ -29,6 +29,7 @@ pub struct RegisterJobParams {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub key_field: Option<String>,
     pub compute_class: Option<String>,
 }
 
@@ -38,6 +39,13 @@ pub struct EnqueueRunParams {
     pub job_id: String,
     pub deploy_id: String,
     pub input_json: Value,
+    pub dedupe_key_value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnqueueRunResult {
+    pub run: RunRecord,
+    pub deduped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +271,10 @@ pub fn function_health_hold_delay_ms() -> i64 {
     30_000
 }
 
+pub fn key_retention_ms() -> i64 {
+    86_400_000
+}
+
 pub fn compute_retry_disposition(
     run_id: &str,
     attempt_count: u32,
@@ -430,7 +442,7 @@ pub trait GumStore {
     fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String>;
     fn list_active_leases(&self) -> Result<Vec<LeaseStatusRecord>, String>;
     fn list_concurrency_status(&self) -> Result<Vec<ConcurrencyStatusRecord>, String>;
-    fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String>;
+    fn enqueue_run(&self, params: EnqueueRunParams) -> Result<EnqueueRunResult, String>;
     fn replay_run(&self, params: ReplayRunParams) -> Result<RunRecord, String>;
     fn lease_next_attempt(
         &self,

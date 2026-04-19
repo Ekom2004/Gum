@@ -25,6 +25,7 @@ pub struct RegisteredJob {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub key_field: Option<String>,
     pub compute_class: Option<String>,
 }
 
@@ -37,6 +38,13 @@ pub struct RegisterDeployResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnqueueRunRequest {
     pub input: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnqueueRunResponse {
+    pub id: String,
+    pub status: RunStatus,
+    pub deduped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

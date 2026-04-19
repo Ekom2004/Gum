@@ -29,7 +29,14 @@ class _FakeClient:
 
 class GumJobTests(unittest.TestCase):
     def test_decorator_wraps_function_and_exposes_policy(self) -> None:
-        @gum.job(every="20d", retries=5, timeout="5m", rate_limit="resend:500/h", concurrency=20)
+        @gum.job(
+            every="20d",
+            retries=5,
+            timeout="5m",
+            rate_limit="resend:500/h",
+            concurrency=20,
+            key="event_id",
+        )
         def send_followup() -> str:
             return "ok"
 
@@ -42,6 +49,7 @@ class GumJobTests(unittest.TestCase):
         self.assertEqual(send_followup.policy.timeout, "5m")
         self.assertEqual(send_followup.policy.rate_limit, "resend:500/h")
         self.assertEqual(send_followup.policy.concurrency, 20)
+        self.assertEqual(send_followup.policy.key, "event_id")
 
     def test_enqueue_uses_keyword_payload_and_client(self) -> None:
         client = _FakeClient()
@@ -53,6 +61,7 @@ class GumJobTests(unittest.TestCase):
         run = sync_customer.enqueue(customer_id="cus_123")
 
         self.assertEqual(run.id, "run_123")
+        self.assertFalse(run.deduped)
         self.assertEqual(client.enqueued, [("job_sync_customer", {"customer_id": "cus_123"})])
 
     def test_backfill_passes_items_through(self) -> None:

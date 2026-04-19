@@ -9,13 +9,14 @@ use crate::models::{
     AttemptRecord, ConcurrencyStatusRecord, ControlLeaseRecord, DeployRecord, FunctionHealthRecord,
     FunctionHealthState, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord, LogRecord,
     ProjectRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord,
-    ProviderHealthState, ProviderTargetRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
+    ProviderHealthState, ProviderTargetRecord, RunKeyRecord, RunRecord, RunnerRecord,
+    RunnerStatusRecord,
 };
 use crate::queries::{
     compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
-    is_provider_failure_class, parse_rate_limit_spec, parse_schedule_interval_ms,
+    is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, parse_schedule_interval_ms,
     provider_slug_from_job, CancelRunParams, CompleteAttemptParams, ControlLeaseParams,
-    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
     RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
     SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
@@ -34,6 +35,7 @@ struct MemoryState {
     provider_health: HashMap<String, ProviderHealthRecord>,
     provider_checks: Vec<ProviderCheckRecord>,
     function_health: HashMap<String, FunctionHealthRecord>,
+    run_keys: HashMap<String, RunKeyRecord>,
     logs: Vec<LogRecord>,
 }
 
@@ -56,6 +58,10 @@ impl MemoryStore {
     fn next_id(&self, prefix: &str) -> String {
         let id = self.ids.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{prefix}_{id}")
+    }
+
+    fn run_key_scope(project_id: &str, job_id: &str, key_value: &str) -> String {
+        format!("{project_id}:{job_id}:{key_value}")
     }
 
     fn upsert_runner_locked(
@@ -409,6 +415,7 @@ impl GumStore for MemoryStore {
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                key_field: job.key_field,
                 compute_class: job.compute_class,
                 enabled: true,
                 created_at_epoch_ms,
@@ -803,11 +810,12 @@ impl GumStore for MemoryStore {
         Ok(statuses)
     }
 
-    fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {
+    fn enqueue_run(&self, params: EnqueueRunParams) -> Result<EnqueueRunResult, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "memory store lock poisoned".to_string())?;
+        let now_epoch_ms = now_epoch_ms();
         let job = state
             .jobs
             .get(&params.job_id)
@@ -820,6 +828,19 @@ impl GumStore for MemoryStore {
             return Err("job/project/deploy mismatch".to_string());
         }
 
+        if let Some(key_value) = params.dedupe_key_value.as_deref() {
+            let scope = Self::run_key_scope(&params.project_id, &params.job_id, key_value);
+            let existing = state.run_keys.get(&scope).cloned();
+            if let Some(existing) = existing {
+                if existing.expires_at_epoch_ms > now_epoch_ms {
+                    if let Some(run) = state.runs.get(&existing.run_id).cloned() {
+                        return Ok(EnqueueRunResult { run, deduped: true });
+                    }
+                }
+                state.run_keys.remove(&scope);
+            }
+        }
+
         let run = RunRecord {
             id: self.next_id("run"),
             project_id: params.project_id,
@@ -830,15 +851,32 @@ impl GumStore for MemoryStore {
             input_json: params.input_json,
             attempt_count: 0,
             max_attempts: job.retries + 1,
-            scheduled_at_epoch_ms: now_epoch_ms(),
+            scheduled_at_epoch_ms: now_epoch_ms,
             failure_reason: None,
             failure_class: None,
             retry_after_epoch_ms: None,
             waiting_for_provider_slug: None,
             replay_of_run_id: None,
         };
+        if let Some(key_value) = params.dedupe_key_value {
+            let scope = Self::run_key_scope(&run.project_id, &run.job_id, &key_value);
+            state.run_keys.insert(
+                scope,
+                RunKeyRecord {
+                    project_id: run.project_id.clone(),
+                    job_id: run.job_id.clone(),
+                    key_value,
+                    run_id: run.id.clone(),
+                    created_at_epoch_ms: now_epoch_ms,
+                    expires_at_epoch_ms: now_epoch_ms + key_retention_ms(),
+                },
+            );
+        }
         state.runs.insert(run.id.clone(), run.clone());
-        Ok(run)
+        Ok(EnqueueRunResult {
+            run,
+            deduped: false,
+        })
     }
 
     fn replay_run(&self, params: ReplayRunParams) -> Result<RunRecord, String> {
