@@ -566,6 +566,161 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
         second_leased.is_none(),
         "second run should stay queued inside the same rate-limit window"
     );
+
+    let runs = service::list_runs(&store, 50).expect("runs should list");
+    let waiting_run = runs
+        .runs
+        .iter()
+        .find(|run| run.status == RunStatus::Queued)
+        .expect("queued run should still be visible");
+    assert_eq!(
+        waiting_run.waiting_reason.as_deref(),
+        Some("waiting_on_rate_limit")
+    );
+
+    let rate_limits = service::list_rate_limits(&store).expect("rate limits should list");
+    assert_eq!(rate_limits.rate_limits.len(), 1);
+    assert_eq!(rate_limits.rate_limits[0].scope_kind, "job");
+    assert_eq!(rate_limits.rate_limits[0].recent_start_count, 1);
+    assert_eq!(rate_limits.rate_limits[0].waiting_count, 1);
+}
+
+#[test]
+fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![
+                RegisteredJob {
+                    id: "job_summarize".to_string(),
+                    name: "summarize".to_string(),
+                    handler_ref: "jobs:summarize".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 1,
+                    timeout_secs: 300,
+                    rate_limit_spec: Some("openai:1/h".to_string()),
+                    concurrency_limit: None,
+                    key_field: None,
+                    compute_class: None,
+                },
+                RegisteredJob {
+                    id: "job_embed".to_string(),
+                    name: "embed".to_string(),
+                    handler_ref: "jobs:embed".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 1,
+                    timeout_secs: 300,
+                    rate_limit_spec: Some("openai:1/h".to_string()),
+                    concurrency_limit: None,
+                    key_field: None,
+                    compute_class: None,
+                },
+            ],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner 1 should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_2".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner 2 should work");
+
+    service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_summarize",
+        EnqueueRunRequest {
+            input: json!({ "doc_id": "doc_1" }),
+        },
+    )
+    .expect("first enqueue should work");
+    service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_embed",
+        EnqueueRunRequest {
+            input: json!({ "doc_id": "doc_2" }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    let first_leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("first lease should work");
+    assert!(first_leased.is_some(), "first pooled run should lease");
+
+    let second_leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_2".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("second lease should work");
+    assert!(
+        second_leased.is_none(),
+        "second job should be blocked by the shared pool budget"
+    );
+
+    let runs = service::list_runs(&store, 50).expect("runs should list");
+    let waiting_run = runs
+        .runs
+        .iter()
+        .find(|run| run.status == RunStatus::Queued)
+        .expect("queued pooled run should still exist");
+    assert_eq!(
+        waiting_run.waiting_reason.as_deref(),
+        Some("waiting_on_rate_limit")
+    );
+
+    let rate_limits = service::list_rate_limits(&store).expect("rate limits should list");
+    assert_eq!(rate_limits.rate_limits.len(), 1);
+    assert_eq!(rate_limits.rate_limits[0].scope_kind, "pool");
+    assert_eq!(
+        rate_limits.rate_limits[0].pool_name.as_deref(),
+        Some("openai")
+    );
+    assert_eq!(rate_limits.rate_limits[0].recent_start_count, 1);
+    assert_eq!(rate_limits.rate_limits[0].waiting_count, 1);
+    assert_eq!(rate_limits.rate_limits[0].job_ids.len(), 2);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gum_store::models::{ConcurrencyStatusRecord, LogRecord, ProviderHealthState, RunRecord};
 use gum_store::queries::{
@@ -13,9 +13,10 @@ use crate::routes::{
     AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, ConcurrencyListResponse,
     ConcurrencyStatusResponse, EnqueueRunRequest, EnqueueRunResponse, LeaseRunRequest,
     LeaseRunResponse, LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
-    ProviderHealthListResponse, ProviderHealthResponse, RegisterDeployRequest,
-    RegisterDeployResponse, RegisterRunnerRequest, ReplayRunResponse, RunResponse,
-    RunnerHeartbeatRequest, RunnerStatusResponse, RunnersListResponse, RunsListResponse,
+    ProviderHealthListResponse, ProviderHealthResponse, RateLimitListResponse,
+    RateLimitStatusResponse, RegisterDeployRequest, RegisterDeployResponse, RegisterRunnerRequest,
+    ReplayRunResponse, RunResponse, RunnerHeartbeatRequest, RunnerStatusResponse,
+    RunnersListResponse, RunsListResponse,
 };
 
 pub fn register_deploy<S: GumStore>(
@@ -81,9 +82,14 @@ pub fn enqueue_run<S: GumStore>(
 
 pub fn get_run<S: GumStore>(store: &S, run_id: &str) -> Result<Option<RunResponse>, String> {
     let concurrency = concurrency_status_map(store)?;
-    Ok(store
-        .get_run(run_id)?
-        .map(|run| run_response(run.clone(), concurrency.get(&run.job_id))))
+    let rate_limit_waiting = rate_limit_waiting_run_ids(store)?;
+    Ok(store.get_run(run_id)?.map(|run| {
+        run_response(
+            run.clone(),
+            concurrency.get(&run.job_id),
+            rate_limit_waiting.contains(&run.id),
+        )
+    }))
 }
 
 pub fn replay_run<S: GumStore>(store: &S, run_id: &str) -> Result<ReplayRunResponse, String> {
@@ -115,11 +121,18 @@ pub fn get_logs<S: GumStore>(store: &S, run_id: &str) -> Result<Vec<LogLine>, St
 
 pub fn list_runs<S: GumStore>(store: &S, limit: usize) -> Result<RunsListResponse, String> {
     let concurrency = concurrency_status_map(store)?;
+    let rate_limit_waiting = rate_limit_waiting_run_ids(store)?;
     Ok(RunsListResponse {
         runs: store
             .list_recent_runs(limit)?
             .into_iter()
-            .map(|run| run_response(run.clone(), concurrency.get(&run.job_id)))
+            .map(|run| {
+                run_response(
+                    run.clone(),
+                    concurrency.get(&run.job_id),
+                    rate_limit_waiting.contains(&run.id),
+                )
+            })
             .collect(),
     })
 }
@@ -175,6 +188,27 @@ pub fn list_concurrency<S: GumStore>(store: &S) -> Result<ConcurrencyListRespons
     })
 }
 
+pub fn list_rate_limits<S: GumStore>(store: &S) -> Result<RateLimitListResponse, String> {
+    Ok(RateLimitListResponse {
+        rate_limits: store
+            .list_rate_limit_status()?
+            .into_iter()
+            .map(|status| RateLimitStatusResponse {
+                scope_key: status.scope_key,
+                scope_kind: status.scope_kind,
+                pool_name: status.pool_name,
+                limit: status.limit,
+                window_ms: status.window_ms,
+                recent_start_count: status.recent_start_count,
+                waiting_count: status.waiting_run_ids.len() as u32,
+                job_ids: status.job_ids,
+                job_names: status.job_names,
+                waiting_run_ids: status.waiting_run_ids,
+            })
+            .collect(),
+    })
+}
+
 pub fn list_provider_health<S: GumStore>(store: &S) -> Result<ProviderHealthListResponse, String> {
     Ok(ProviderHealthListResponse {
         providers: store
@@ -201,10 +235,17 @@ pub fn tick_schedules<S: GumStore>(
     now_epoch_ms: i64,
 ) -> Result<Vec<RunResponse>, String> {
     let concurrency = concurrency_status_map(store)?;
+    let rate_limit_waiting = rate_limit_waiting_run_ids(store)?;
     Ok(store
         .tick_schedules(now_epoch_ms)?
         .into_iter()
-        .map(|run| run_response(run.clone(), concurrency.get(&run.job_id)))
+        .map(|run| {
+            run_response(
+                run.clone(),
+                concurrency.get(&run.job_id),
+                rate_limit_waiting.contains(&run.id),
+            )
+        })
         .collect())
 }
 
@@ -297,7 +338,12 @@ pub fn complete_attempt<S: GumStore>(
         failure_class: request.failure_class,
     })?;
     let concurrency = concurrency_status_map(store)?;
-    Ok(run_response(run.clone(), concurrency.get(&run.job_id)))
+    let rate_limit_waiting = rate_limit_waiting_run_ids(store)?;
+    Ok(run_response(
+        run.clone(),
+        concurrency.get(&run.job_id),
+        rate_limit_waiting.contains(&run.id),
+    ))
 }
 
 pub fn append_log<S: GumStore>(
@@ -329,11 +375,20 @@ pub fn cancel_run<S: GumStore>(
         requested_at_epoch_ms: now_epoch_ms(),
     })?;
     let concurrency = concurrency_status_map(store)?;
-    Ok(run_response(run.clone(), concurrency.get(&run.job_id)))
+    let rate_limit_waiting = rate_limit_waiting_run_ids(store)?;
+    Ok(run_response(
+        run.clone(),
+        concurrency.get(&run.job_id),
+        rate_limit_waiting.contains(&run.id),
+    ))
 }
 
-fn run_response(run: RunRecord, concurrency: Option<&ConcurrencyStatusRecord>) -> RunResponse {
-    let waiting_reason = derive_waiting_reason(&run, concurrency);
+fn run_response(
+    run: RunRecord,
+    concurrency: Option<&ConcurrencyStatusRecord>,
+    waiting_on_rate_limit: bool,
+) -> RunResponse {
+    let waiting_reason = derive_waiting_reason(&run, concurrency, waiting_on_rate_limit);
     RunResponse {
         id: run.id,
         job_id: run.job_id,
@@ -358,9 +413,18 @@ fn concurrency_status_map<S: GumStore>(
         .collect())
 }
 
+fn rate_limit_waiting_run_ids<S: GumStore>(store: &S) -> Result<HashSet<String>, String> {
+    Ok(store
+        .list_rate_limit_status()?
+        .into_iter()
+        .flat_map(|status| status.waiting_run_ids.into_iter())
+        .collect())
+}
+
 fn derive_waiting_reason(
     run: &RunRecord,
     concurrency: Option<&ConcurrencyStatusRecord>,
+    waiting_on_rate_limit: bool,
 ) -> Option<String> {
     if run.status != gum_types::RunStatus::Queued {
         return None;
@@ -371,9 +435,13 @@ fn derive_waiting_reason(
     if run.retry_after_epoch_ms.is_some() {
         return None;
     }
-    let concurrency = concurrency?;
-    if concurrency.active_run_ids.len() as u32 >= concurrency.concurrency_limit {
-        return Some("waiting_on_concurrency".to_string());
+    if let Some(concurrency) = concurrency {
+        if concurrency.active_run_ids.len() as u32 >= concurrency.concurrency_limit {
+            return Some("waiting_on_concurrency".to_string());
+        }
+    }
+    if waiting_on_rate_limit {
+        return Some("waiting_on_rate_limit".to_string());
     }
     None
 }

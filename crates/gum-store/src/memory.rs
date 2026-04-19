@@ -9,16 +9,16 @@ use crate::models::{
     AttemptRecord, ConcurrencyStatusRecord, ControlLeaseRecord, DeployRecord, FunctionHealthRecord,
     FunctionHealthState, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord, LogRecord,
     ProjectRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord,
-    ProviderHealthState, ProviderTargetRecord, RunKeyRecord, RunRecord, RunnerRecord,
-    RunnerStatusRecord,
+    ProviderHealthState, ProviderTargetRecord, RateLimitStatusRecord, RunKeyRecord, RunRecord,
+    RunnerRecord, RunnerStatusRecord,
 };
 use crate::queries::{
     compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
     is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, parse_schedule_interval_ms,
-    provider_slug_from_job, CancelRunParams, CompleteAttemptParams, ControlLeaseParams,
-    EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
-    RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
-    SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
+    provider_slug_from_job, rate_limit_scope_key, CancelRunParams, CompleteAttemptParams,
+    ControlLeaseParams, EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams,
+    LeaseNextAttemptParams, RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams,
+    ReplayRunParams, SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
 
 #[derive(Default)]
@@ -62,6 +62,43 @@ impl MemoryStore {
 
     fn run_key_scope(project_id: &str, job_id: &str, key_value: &str) -> String {
         format!("{project_id}:{job_id}:{key_value}")
+    }
+
+    fn active_run_ids_for_job(state: &MemoryState, job_id: &str) -> Vec<String> {
+        let mut active_run_ids: Vec<String> = state
+            .attempts
+            .values()
+            .filter(|attempt| attempt.status == AttemptStatus::Running)
+            .filter_map(|attempt| state.runs.get(&attempt.run_id))
+            .filter(|run| run.job_id == job_id)
+            .map(|run| run.id.clone())
+            .collect();
+        active_run_ids.sort();
+        active_run_ids.dedup();
+        active_run_ids
+    }
+
+    fn job_matches_rate_limit_scope(
+        candidate: &JobRecord,
+        target_project_id: &str,
+        target_job_id: &str,
+        spec: &crate::queries::RateLimitSpec,
+    ) -> bool {
+        match spec.pool.as_deref() {
+            Some(pool_name) => {
+                if candidate.project_id != target_project_id {
+                    return false;
+                }
+                candidate
+                    .rate_limit_spec
+                    .as_deref()
+                    .and_then(|raw| parse_rate_limit_spec(raw).ok())
+                    .and_then(|parsed| parsed.pool)
+                    .as_deref()
+                    == Some(pool_name)
+            }
+            None => candidate.id == target_job_id,
+        }
     }
 
     fn upsert_runner_locked(
@@ -774,16 +811,7 @@ impl GumStore for MemoryStore {
             .filter_map(|job| {
                 let concurrency_limit = job.concurrency_limit?;
 
-                let mut active_run_ids: Vec<String> = state
-                    .attempts
-                    .values()
-                    .filter(|attempt| attempt.status == AttemptStatus::Running)
-                    .filter_map(|attempt| state.runs.get(&attempt.run_id))
-                    .filter(|run| run.job_id == job.id)
-                    .map(|run| run.id.clone())
-                    .collect();
-                active_run_ids.sort();
-                active_run_ids.dedup();
+                let active_run_ids = Self::active_run_ids_for_job(&state, &job.id);
 
                 let mut queued_run_ids: Vec<String> = state
                     .runs
@@ -806,6 +834,115 @@ impl GumStore for MemoryStore {
             left.job_name
                 .cmp(&right.job_name)
                 .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        Ok(statuses)
+    }
+
+    fn list_rate_limit_status(&self) -> Result<Vec<RateLimitStatusRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let now_ms = now_epoch_ms();
+        let mut statuses = Vec::new();
+
+        for job in state.jobs.values() {
+            let Some(rate_limit_spec) = job.rate_limit_spec.as_deref() else {
+                continue;
+            };
+            let spec = parse_rate_limit_spec(rate_limit_spec)?;
+            let scope_key = rate_limit_scope_key(&job.project_id, &job.id, &spec);
+
+            if statuses
+                .iter()
+                .any(|status: &RateLimitStatusRecord| status.scope_key == scope_key)
+            {
+                continue;
+            }
+
+            let scope_jobs: Vec<&JobRecord> = state
+                .jobs
+                .values()
+                .filter(|candidate| {
+                    Self::job_matches_rate_limit_scope(candidate, &job.project_id, &job.id, &spec)
+                })
+                .collect();
+            let scope_job_ids: Vec<String> = scope_jobs
+                .iter()
+                .map(|scope_job| scope_job.id.clone())
+                .collect();
+
+            let window_start_ms = now_ms.saturating_sub(spec.window_ms);
+            let recent_start_count = state
+                .attempts
+                .values()
+                .filter(|attempt| attempt.started_at_epoch_ms >= window_start_ms)
+                .filter_map(|attempt| state.runs.get(&attempt.run_id))
+                .filter(|run| scope_job_ids.contains(&run.job_id))
+                .count() as u32;
+
+            let waiting_run_ids: Vec<String> = if recent_start_count >= spec.limit {
+                let mut runs: Vec<&RunRecord> = state
+                    .runs
+                    .values()
+                    .filter(|run| scope_job_ids.contains(&run.job_id))
+                    .filter(|run| run.status == RunStatus::Queued)
+                    .filter(|run| {
+                        !run.retry_after_epoch_ms
+                            .map(|retry_after| retry_after > now_ms)
+                            .unwrap_or(false)
+                    })
+                    .filter(|run| run.failure_class.as_deref() != Some("blocked_by_downstream"))
+                    .filter(|run| {
+                        let Some(run_job) = state.jobs.get(&run.job_id) else {
+                            return false;
+                        };
+                        let Some(limit) = run_job.concurrency_limit else {
+                            return true;
+                        };
+                        Self::active_run_ids_for_job(&state, &run.job_id).len() < limit as usize
+                    })
+                    .collect();
+                runs.sort_by(|left, right| {
+                    left.scheduled_at_epoch_ms
+                        .cmp(&right.scheduled_at_epoch_ms)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                runs.into_iter().map(|run| run.id.clone()).collect()
+            } else {
+                Vec::new()
+            };
+
+            let mut job_names: Vec<String> = scope_jobs
+                .iter()
+                .map(|scope_job| scope_job.name.clone())
+                .collect();
+            job_names.sort();
+            let mut job_ids = scope_job_ids;
+            job_ids.sort();
+
+            statuses.push(RateLimitStatusRecord {
+                scope_key,
+                scope_kind: if spec.pool.is_some() {
+                    "pool".to_string()
+                } else {
+                    "job".to_string()
+                },
+                project_id: job.project_id.clone(),
+                pool_name: spec.pool.clone(),
+                limit: spec.limit,
+                window_ms: spec.window_ms,
+                recent_start_count,
+                job_ids,
+                job_names,
+                waiting_run_ids,
+            });
+        }
+
+        statuses.sort_by(|left, right| {
+            left.scope_kind
+                .cmp(&right.scope_kind)
+                .then_with(|| left.scope_key.cmp(&right.scope_key))
         });
         Ok(statuses)
     }
@@ -996,17 +1133,10 @@ impl GumStore for MemoryStore {
                         let Some(run) = state.runs.get(&attempt.run_id) else {
                             return false;
                         };
-
-                        if spec.pool.is_some() {
-                            let Some(run_job) = state.jobs.get(&run.job_id) else {
-                                return false;
-                            };
-                            run_job.project_id == job.project_id
-                                && run_job.rate_limit_spec.as_deref()
-                                    == Some(rate_limit_spec.as_str())
-                        } else {
-                            run.job_id == job.id
-                        }
+                        let Some(run_job) = state.jobs.get(&run.job_id) else {
+                            return false;
+                        };
+                        Self::job_matches_rate_limit_scope(run_job, &job.project_id, &job.id, &spec)
                     })
                     .count() as u32;
                 if recent_starts >= spec.limit {

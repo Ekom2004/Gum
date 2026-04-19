@@ -51,6 +51,11 @@ class _AstJobConfig:
     compute: str | None = None
 
 
+@dataclass(slots=True)
+class _ModuleBindings:
+    values: dict[str, object]
+
+
 def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
     project_root = project_root.resolve()
     jobs: list[DiscoveredJob] = []
@@ -61,10 +66,11 @@ def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
         module_name = module_path[:-3].replace("/", ".")
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
+        bindings = _collect_module_bindings(tree)
         for node in tree.body:
             if not isinstance(node, ast.FunctionDef):
                 continue
-            config = _extract_job_config(node)
+            config = _extract_job_config(node, bindings)
             if config is None:
                 continue
             jobs.append(
@@ -147,24 +153,27 @@ def deploy_project(
     return DeployResult(project_root=root, bundle_path=bundle_path, jobs=jobs, deploy=deploy)
 
 
-def _extract_job_config(node: ast.FunctionDef) -> _AstJobConfig | None:
+def _extract_job_config(
+    node: ast.FunctionDef,
+    bindings: _ModuleBindings,
+) -> _AstJobConfig | None:
     for decorator in node.decorator_list:
         if isinstance(decorator, ast.Call):
             target = decorator.func
             if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
                 if target.value.id == "gum" and target.attr == "job":
-                    return _parse_decorator_keywords(decorator)
+                    return _parse_decorator_keywords(decorator, bindings)
             if isinstance(target, ast.Name) and target.id == "job":
-                return _parse_decorator_keywords(decorator)
+                return _parse_decorator_keywords(decorator, bindings)
     return None
 
 
-def _parse_decorator_keywords(node: ast.Call) -> _AstJobConfig:
+def _parse_decorator_keywords(node: ast.Call, bindings: _ModuleBindings) -> _AstJobConfig:
     config = _AstJobConfig()
     for keyword in node.keywords:
         if keyword.arg is None:
             continue
-        value = _literal_value(keyword.value)
+        value = _literal_value(keyword.value, bindings)
         if keyword.arg == "every":
             config.every = value
         elif keyword.arg == "retries":
@@ -182,7 +191,38 @@ def _parse_decorator_keywords(node: ast.Call) -> _AstJobConfig:
     return config
 
 
-def _literal_value(node: ast.AST):
+def _collect_module_bindings(tree: ast.Module) -> _ModuleBindings:
+    values: dict[str, object] = {}
+    bindings = _ModuleBindings(values=values)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        try:
+            values[target.id] = _literal_value(node.value, bindings)
+        except Exception:
+            continue
+    return bindings
+
+
+def _literal_value(node: ast.AST, bindings: _ModuleBindings):
+    if isinstance(node, ast.Name):
+        if node.id in bindings.values:
+            return bindings.values[node.id]
+        raise ValueError(f"unknown name: {node.id}")
+    if isinstance(node, ast.Call):
+        target = node.func
+        is_rate_limit_call = False
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+            is_rate_limit_call = target.value.id == "gum" and target.attr == "rate_limit"
+        elif isinstance(target, ast.Name):
+            is_rate_limit_call = target.id == "rate_limit"
+        if is_rate_limit_call:
+            if len(node.args) != 1 or node.keywords:
+                raise ValueError("rate_limit() expects exactly one positional spec")
+            return str(_literal_value(node.args[0], bindings))
     return ast.literal_eval(node)
 
 

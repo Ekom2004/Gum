@@ -9,6 +9,11 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
+@dataclass(frozen=True, slots=True)
+class RateLimit:
+    spec: str
+
+
 @dataclass(slots=True)
 class JobPolicy:
     id: str
@@ -31,7 +36,7 @@ class GumJob(Generic[P, R]):
         every: str | None,
         retries: int,
         timeout: str,
-        rate_limit: str | None,
+        rate_limit: str | RateLimit | None,
         concurrency: int | None,
         key: str | None,
         compute: str | None,
@@ -48,7 +53,7 @@ class GumJob(Generic[P, R]):
             every=every,
             retries=retries,
             timeout=timeout,
-            rate_limit=rate_limit,
+            rate_limit=_normalize_rate_limit(rate_limit),
             concurrency=concurrency,
             key=key,
             compute_class=compute,
@@ -78,7 +83,7 @@ def job(
     every: str | None = None,
     retries: int = 0,
     timeout: str = "5m",
-    rate_limit: str | None = None,
+    rate_limit: str | RateLimit | None = None,
     concurrency: int | None = None,
     key: str | None = None,
     compute: str | None = None,
@@ -98,3 +103,15 @@ def job(
         )
 
     return decorator
+
+
+def rate_limit(spec: str) -> RateLimit:
+    return RateLimit(spec=spec)
+
+
+def _normalize_rate_limit(value: str | RateLimit | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, RateLimit):
+        return value.spec
+    return value

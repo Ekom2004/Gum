@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,15 +10,16 @@ use crate::models::{
     AttemptRecord, ConcurrencyStatusRecord, DeployRecord, FunctionHealthRecord,
     FunctionHealthState, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord, LogRecord,
     ProjectRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord,
-    ProviderHealthState, ProviderTargetRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
+    ProviderHealthState, ProviderTargetRecord, RateLimitStatusRecord, RunRecord, RunnerRecord,
+    RunnerStatusRecord,
 };
 use crate::queries::{
     compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
     is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, parse_schedule_interval_ms,
-    provider_slug_from_job, CancelRunParams, CompleteAttemptParams, ControlLeaseParams,
-    EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
-    RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
-    SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
+    provider_slug_from_job, rate_limit_scope_key, CancelRunParams, CompleteAttemptParams,
+    ControlLeaseParams, EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams,
+    LeaseNextAttemptParams, RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams,
+    ReplayRunParams, SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_slice1.sql");
@@ -1158,6 +1160,190 @@ impl GumStore for PostgresStore {
             .collect()
     }
 
+    fn list_rate_limit_status(&self) -> Result<Vec<RateLimitStatusRecord>, String> {
+        let mut client = self.connect_client()?;
+        let job_rows = client
+            .query(
+                "SELECT id, project_id, name, rate_limit_spec
+                 FROM jobs
+                 WHERE enabled = TRUE
+                   AND rate_limit_spec IS NOT NULL
+                 ORDER BY name ASC, id ASC",
+                &[],
+            )
+            .map_err(|error| format!("failed to load jobs for rate-limit status: {error}"))?;
+
+        #[derive(Clone)]
+        struct ScopeSeed {
+            project_id: String,
+            job_id: String,
+            scope_key: String,
+            scope_kind: String,
+            pool_name: Option<String>,
+            limit: u32,
+            window_ms: i64,
+            job_ids: Vec<String>,
+            job_names: Vec<String>,
+        }
+
+        let mut scopes = HashMap::<String, ScopeSeed>::new();
+        for row in job_rows {
+            let job_id: String = row.get("id");
+            let project_id: String = row.get("project_id");
+            let job_name: String = row.get("name");
+            let rate_limit_spec: String = row.get("rate_limit_spec");
+            let spec = parse_rate_limit_spec(&rate_limit_spec)?;
+            let scope_key = rate_limit_scope_key(&project_id, &job_id, &spec);
+            let entry = scopes
+                .entry(scope_key.clone())
+                .or_insert_with(|| ScopeSeed {
+                    project_id: project_id.clone(),
+                    job_id: job_id.clone(),
+                    scope_key: scope_key.clone(),
+                    scope_kind: if spec.pool.is_some() {
+                        "pool".to_string()
+                    } else {
+                        "job".to_string()
+                    },
+                    pool_name: spec.pool.clone(),
+                    limit: spec.limit,
+                    window_ms: spec.window_ms,
+                    job_ids: Vec::new(),
+                    job_names: Vec::new(),
+                });
+            entry.job_ids.push(job_id);
+            entry.job_names.push(job_name);
+        }
+
+        let now_ms = now_epoch_ms();
+        let mut statuses = Vec::new();
+        for mut scope in scopes.into_values() {
+            scope.job_ids.sort();
+            scope.job_names.sort();
+
+            let window_start_ms = now_ms.saturating_sub(scope.window_ms);
+            let recent_count: i64 = if let Some(pool_name) = scope.pool_name.as_deref() {
+                client
+                    .query_one(
+                        "SELECT COUNT(*) AS count
+                         FROM attempts
+                         JOIN runs ON runs.id = attempts.run_id
+                         JOIN jobs ON jobs.id = runs.job_id
+                         WHERE attempts.started_at >= TO_TIMESTAMP($1::double precision / 1000.0)
+                           AND jobs.project_id = $2
+                           AND jobs.rate_limit_spec IS NOT NULL
+                           AND POSITION(':' IN jobs.rate_limit_spec) > 0
+                           AND split_part(jobs.rate_limit_spec, ':', 1) = $3",
+                        &[&(window_start_ms as f64), &scope.project_id, &pool_name],
+                    )
+                    .map_err(|error| format!("failed to count pooled rate-limit usage: {error}"))?
+                    .get("count")
+            } else {
+                client
+                    .query_one(
+                        "SELECT COUNT(*) AS count
+                         FROM attempts
+                         JOIN runs ON runs.id = attempts.run_id
+                         WHERE attempts.started_at >= TO_TIMESTAMP($1::double precision / 1000.0)
+                           AND runs.job_id = $2",
+                        &[&(window_start_ms as f64), &scope.job_id],
+                    )
+                    .map_err(|error| format!("failed to count job rate-limit usage: {error}"))?
+                    .get("count")
+            };
+
+            let waiting_run_ids = if recent_count >= i64::from(scope.limit) {
+                let rows = if let Some(pool_name) = scope.pool_name.as_deref() {
+                    client
+                        .query(
+                            "SELECT runs.id,
+                                    runs.scheduled_at,
+                                    jobs.concurrency_limit,
+                                    COALESCE(active.active_count, 0) AS active_count
+                             FROM runs
+                             JOIN jobs ON jobs.id = runs.job_id
+                             LEFT JOIN LATERAL (
+                                 SELECT COUNT(DISTINCT attempts.run_id) AS active_count
+                                 FROM attempts
+                                 JOIN runs active_runs ON active_runs.id = attempts.run_id
+                                 WHERE attempts.status = 'running'
+                                   AND active_runs.job_id = jobs.id
+                             ) active ON TRUE
+                             WHERE runs.status = 'queued'
+                               AND (runs.retry_after_epoch_ms IS NULL OR runs.retry_after_epoch_ms <= $1)
+                               AND COALESCE(runs.failure_class, '') <> 'blocked_by_downstream'
+                               AND jobs.project_id = $2
+                               AND jobs.rate_limit_spec IS NOT NULL
+                               AND POSITION(':' IN jobs.rate_limit_spec) > 0
+                               AND split_part(jobs.rate_limit_spec, ':', 1) = $3
+                             ORDER BY runs.scheduled_at ASC, runs.id ASC",
+                            &[&now_ms, &scope.project_id, &pool_name],
+                        )
+                        .map_err(|error| {
+                            format!("failed to list pooled rate-limit waiting runs: {error}")
+                        })?
+                } else {
+                    client
+                        .query(
+                            "SELECT runs.id,
+                                    runs.scheduled_at,
+                                    jobs.concurrency_limit,
+                                    COALESCE(active.active_count, 0) AS active_count
+                             FROM runs
+                             JOIN jobs ON jobs.id = runs.job_id
+                             LEFT JOIN LATERAL (
+                                 SELECT COUNT(DISTINCT attempts.run_id) AS active_count
+                                 FROM attempts
+                                 JOIN runs active_runs ON active_runs.id = attempts.run_id
+                                 WHERE attempts.status = 'running'
+                                   AND active_runs.job_id = jobs.id
+                             ) active ON TRUE
+                             WHERE runs.status = 'queued'
+                               AND (runs.retry_after_epoch_ms IS NULL OR runs.retry_after_epoch_ms <= $1)
+                               AND COALESCE(runs.failure_class, '') <> 'blocked_by_downstream'
+                               AND runs.job_id = $2
+                             ORDER BY runs.scheduled_at ASC, runs.id ASC",
+                            &[&now_ms, &scope.job_id],
+                        )
+                        .map_err(|error| {
+                            format!("failed to list job rate-limit waiting runs: {error}")
+                        })?
+                };
+
+                rows.into_iter()
+                    .filter(|row| {
+                        let concurrency_limit: Option<i32> = row.get("concurrency_limit");
+                        let active_count: i64 = row.get("active_count");
+                        concurrency_limit.map_or(true, |limit| active_count < i64::from(limit))
+                    })
+                    .map(|row| row.get("id"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            statuses.push(RateLimitStatusRecord {
+                scope_key: scope.scope_key,
+                scope_kind: scope.scope_kind,
+                project_id: scope.project_id,
+                pool_name: scope.pool_name,
+                limit: scope.limit,
+                window_ms: scope.window_ms,
+                recent_start_count: recent_count as u32,
+                job_ids: scope.job_ids,
+                job_names: scope.job_names,
+                waiting_run_ids,
+            });
+        }
+
+        statuses.sort_by(|left, right| {
+            left.scope_kind
+                .cmp(&right.scope_kind)
+                .then_with(|| left.scope_key.cmp(&right.scope_key))
+        });
+        Ok(statuses)
+    }
+
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<EnqueueRunResult, String> {
         let mut client = self.connect_client()?;
         let mut tx = client
@@ -1398,7 +1584,7 @@ impl GumStore for PostgresStore {
             let allowed = if let Some(rate_limit_spec) = rate_limit_spec {
                 let spec = parse_rate_limit_spec(&rate_limit_spec)?;
                 let window_start_ms = now_epoch_ms().saturating_sub(spec.window_ms);
-                let recent_count_row = if spec.pool.is_some() {
+                let recent_count_row = if let Some(pool_name) = spec.pool.as_deref() {
                     tx.query_one(
                         "SELECT COUNT(*) AS count
                          FROM attempts
@@ -1406,8 +1592,10 @@ impl GumStore for PostgresStore {
                          JOIN jobs ON jobs.id = runs.job_id
                          WHERE attempts.started_at >= TO_TIMESTAMP($1::double precision / 1000.0)
                            AND jobs.project_id = $2
-                           AND jobs.rate_limit_spec = $3",
-                        &[&(window_start_ms as f64), &project_id, &rate_limit_spec],
+                           AND jobs.rate_limit_spec IS NOT NULL
+                           AND POSITION(':' IN jobs.rate_limit_spec) > 0
+                           AND split_part(jobs.rate_limit_spec, ':', 1) = $3",
+                        &[&(window_start_ms as f64), &project_id, &pool_name],
                     )
                     .map_err(|error| format!("failed to count pooled rate-limit usage: {error}"))?
                 } else {

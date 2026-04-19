@@ -29,11 +29,13 @@ class _FakeClient:
 
 class GumJobTests(unittest.TestCase):
     def test_decorator_wraps_function_and_exposes_policy(self) -> None:
+        resend_limit = gum.rate_limit("resend:500/h")
+
         @gum.job(
             every="20d",
             retries=5,
             timeout="5m",
-            rate_limit="resend:500/h",
+            rate_limit=resend_limit,
             concurrency=20,
             key="event_id",
         )

@@ -173,6 +173,25 @@ pub struct ConcurrencyListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitStatusResponse {
+    pub scope_key: String,
+    pub scope_kind: String,
+    pub pool_name: Option<String>,
+    pub limit: u32,
+    pub window_ms: i64,
+    pub recent_start_count: u32,
+    pub waiting_count: u32,
+    pub job_ids: Vec<String>,
+    pub job_names: Vec<String>,
+    pub waiting_run_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitListResponse {
+    pub rate_limits: Vec<RateLimitStatusResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderHealthResponse {
     pub provider_target_id: String,
     pub provider_name: String,

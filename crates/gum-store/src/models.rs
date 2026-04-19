@@ -208,6 +208,20 @@ pub struct ConcurrencyStatusRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitStatusRecord {
+    pub scope_key: String,
+    pub scope_kind: String,
+    pub project_id: String,
+    pub pool_name: Option<String>,
+    pub limit: u32,
+    pub window_ms: i64,
+    pub recent_start_count: u32,
+    pub job_ids: Vec<String>,
+    pub job_names: Vec<String>,
+    pub waiting_run_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunKeyRecord {
     pub project_id: String,
     pub job_id: String,

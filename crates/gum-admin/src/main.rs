@@ -25,6 +25,7 @@ enum View {
     Runners,
     Leases,
     Concurrency,
+    RateLimits,
 }
 
 impl View {
@@ -33,16 +34,18 @@ impl View {
             View::Runs => View::Runners,
             View::Runners => View::Leases,
             View::Leases => View::Concurrency,
-            View::Concurrency => View::Runs,
+            View::Concurrency => View::RateLimits,
+            View::RateLimits => View::Runs,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            View::Runs => View::Concurrency,
+            View::Runs => View::RateLimits,
             View::Runners => View::Runs,
             View::Leases => View::Runners,
             View::Concurrency => View::Leases,
+            View::RateLimits => View::Concurrency,
         }
     }
 }
@@ -110,6 +113,25 @@ struct ConcurrencyResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct RateLimitStatusRecord {
+    scope_key: String,
+    scope_kind: String,
+    pool_name: Option<String>,
+    limit: u32,
+    window_ms: i64,
+    recent_start_count: u32,
+    waiting_count: u32,
+    job_ids: Vec<String>,
+    job_names: Vec<String>,
+    waiting_run_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RateLimitResponse {
+    rate_limits: Vec<RateLimitStatusRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct LogLineRecord {
     attempt_id: String,
     stream: String,
@@ -122,6 +144,7 @@ struct Snapshot {
     runners: Vec<RunnerStatusRecord>,
     leases: Vec<LeaseStatusRecord>,
     concurrency: Vec<ConcurrencyStatusRecord>,
+    rate_limits: Vec<RateLimitStatusRecord>,
     logs: Vec<LogLineRecord>,
 }
 
@@ -132,6 +155,7 @@ impl Snapshot {
             runners: Vec::new(),
             leases: Vec::new(),
             concurrency: Vec::new(),
+            rate_limits: Vec::new(),
             logs: Vec::new(),
         }
     }
@@ -174,6 +198,13 @@ impl ApiClient {
             .get::<ConcurrencyResponse>("/internal/admin/concurrency")
             .await?;
         Ok(response.concurrency)
+    }
+
+    async fn list_rate_limits(&self) -> Result<Vec<RateLimitStatusRecord>, String> {
+        let response = self
+            .get::<RateLimitResponse>("/internal/admin/rate-limits")
+            .await?;
+        Ok(response.rate_limits)
     }
 
     async fn run_logs(&self, run_id: &str) -> Result<Vec<LogLineRecord>, String> {
@@ -283,6 +314,7 @@ impl App {
             View::Runners => self.snapshot.runners.len(),
             View::Leases => self.snapshot.leases.len(),
             View::Concurrency => self.snapshot.concurrency.len(),
+            View::RateLimits => self.snapshot.rate_limits.len(),
         }
     }
 
@@ -412,12 +444,14 @@ async fn refresh_snapshot(app: &mut App, client: &ApiClient) {
     let runners = client.list_runners().await;
     let leases = client.list_leases().await;
     let concurrency = client.list_concurrency().await;
-    match (runs, runners, leases, concurrency) {
-        (Ok(runs), Ok(runners), Ok(leases), Ok(concurrency)) => {
+    let rate_limits = client.list_rate_limits().await;
+    match (runs, runners, leases, concurrency, rate_limits) {
+        (Ok(runs), Ok(runners), Ok(leases), Ok(concurrency), Ok(rate_limits)) => {
             app.snapshot.runs = runs;
             app.snapshot.runners = runners;
             app.snapshot.leases = leases;
             app.snapshot.concurrency = concurrency;
+            app.snapshot.rate_limits = rate_limits;
             let selected_run_id = if matches!(app.view, View::Runs) {
                 app.selected_run().map(|run| run.id)
             } else {
@@ -435,10 +469,11 @@ async fn refresh_snapshot(app: &mut App, client: &ApiClient) {
             };
             app.clamp_selection();
         }
-        (Err(error), _, _, _)
-        | (_, Err(error), _, _)
-        | (_, _, Err(error), _)
-        | (_, _, _, Err(error)) => {
+        (Err(error), _, _, _, _)
+        | (_, Err(error), _, _, _)
+        | (_, _, Err(error), _, _)
+        | (_, _, _, Err(error), _)
+        | (_, _, _, _, Err(error)) => {
             app.set_error(error);
         }
     }
@@ -487,6 +522,10 @@ async fn handle_key(app: &mut App, client: &ApiClient, code: KeyCode) -> Result<
         }
         KeyCode::Char('4') => {
             app.view = View::Concurrency;
+            app.selected_index = 0;
+        }
+        KeyCode::Char('5') => {
+            app.view = View::RateLimits;
             app.selected_index = 0;
         }
         KeyCode::Left => {
@@ -587,7 +626,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let titles = ["1:runs", "2:runners", "3:leases", "4:concurrency"]
+    let titles = ["1:runs", "2:runners", "3:leases", "4:concurrency", "5:rate"]
         .into_iter()
         .map(Line::from)
         .collect::<Vec<_>>();
@@ -596,6 +635,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         View::Runners => 1,
         View::Leases => 2,
         View::Concurrency => 3,
+        View::RateLimits => 4,
     };
     let tabs = Tabs::new(titles)
         .block(panel_block(" VIEWS ").borders(Borders::BOTTOM))
@@ -633,6 +673,7 @@ fn render_primary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         View::Runners => render_runners_table(frame, area, app),
         View::Leases => render_leases_table(frame, area, app),
         View::Concurrency => render_concurrency_table(frame, area, app),
+        View::RateLimits => render_rate_limits_table(frame, area, app),
     }
 }
 
@@ -781,6 +822,46 @@ fn render_concurrency_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+fn render_rate_limits_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rows = app.snapshot.rate_limits.iter().map(|status| {
+        let scope = status
+            .pool_name
+            .clone()
+            .unwrap_or_else(|| truncate_text(&status.job_ids.join(","), 18));
+        Row::new(vec![
+            Cell::from(status.scope_kind.clone()),
+            Cell::from(truncate_text(&scope, 18)),
+            Cell::from(format!("{}/{}", status.recent_start_count, status.limit)),
+            Cell::from(window_label(status.window_ms)),
+            Cell::from(status.waiting_count.to_string()),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(20),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(8),
+        ],
+    )
+    .block(panel_block(" RATE LIMITS "))
+    .header(
+        Row::new(vec!["scope", "name", "usage", "window", "waiting"])
+            .style(Style::default().fg(Color::DarkGray)),
+    )
+    .highlight_style(Style::default().bg(Color::DarkGray))
+    .highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    if !app.snapshot.rate_limits.is_empty() {
+        state.select(Some(
+            app.selected_index.min(app.snapshot.rate_limits.len() - 1),
+        ));
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = match app.view {
         View::Runs => match app.selected_run() {
@@ -853,6 +934,37 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             None => vec![Line::from("No concurrency-limited job selected.")],
         },
+        View::RateLimits => match select_item(&app.snapshot.rate_limits, app.selected_index) {
+            Some(status) => {
+                let scope_name = status
+                    .pool_name
+                    .clone()
+                    .unwrap_or_else(|| status.job_names.join(", "));
+                let waiting_runs = if status.waiting_run_ids.is_empty() {
+                    "--".to_string()
+                } else {
+                    status.waiting_run_ids.join(", ")
+                };
+                let job_names = if status.job_names.is_empty() {
+                    "--".to_string()
+                } else {
+                    status.job_names.join(", ")
+                };
+                vec![
+                    detail_line("scope", &status.scope_kind),
+                    detail_line("scope key", &status.scope_key),
+                    detail_line("name", &scope_name),
+                    detail_line(
+                        "usage",
+                        &format!("{}/{}", status.recent_start_count, status.limit),
+                    ),
+                    detail_line("window", &window_label(status.window_ms)),
+                    detail_line("jobs", &job_names),
+                    detail_line("waiting", &waiting_runs),
+                ]
+            }
+            None => vec![Line::from("No rate-limit scope selected.")],
+        },
     };
     let widget = Paragraph::new(lines)
         .block(panel_block(" DETAIL "))
@@ -882,8 +994,7 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect) {
-    let footer =
-        "j/k move  / filter  c cancel  r replay  1 runs  2 runners  3 leases  4 concurrency  q quit";
+    let footer = "j/k move  / filter  c cancel  r replay  1 runs  2 runners  3 leases  4 concurrency  5 rate  q quit";
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         area,
@@ -991,6 +1102,16 @@ fn panel_block(title: &'static str) -> Block<'static> {
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
+}
+
+fn window_label(window_ms: i64) -> String {
+    match window_ms {
+        1_000 => "1s".to_string(),
+        60_000 => "1m".to_string(),
+        3_600_000 => "1h".to_string(),
+        86_400_000 => "1d".to_string(),
+        _ => format!("{}ms", window_ms),
+    }
 }
 
 fn truncate_text(value: &str, max_chars: usize) -> String {

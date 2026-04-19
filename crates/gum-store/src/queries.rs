@@ -4,7 +4,7 @@ use crate::models::{
     AttemptRecord, ConcurrencyStatusRecord, DeployRecord, FunctionHealthRecord,
     FunctionHealthState, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord, LogRecord,
     ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord, ProviderHealthState,
-    ProviderTargetRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
+    ProviderTargetRecord, RateLimitStatusRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +183,13 @@ pub struct RateLimitSpec {
     pub pool: Option<String>,
     pub limit: u32,
     pub window_ms: i64,
+}
+
+pub fn rate_limit_scope_key(project_id: &str, job_id: &str, spec: &RateLimitSpec) -> String {
+    match spec.pool.as_deref() {
+        Some(pool_name) => format!("pool:{project_id}:{pool_name}"),
+        None => format!("job:{job_id}"),
+    }
 }
 
 pub fn parse_rate_limit_spec(spec: &str) -> Result<RateLimitSpec, String> {
@@ -442,6 +449,7 @@ pub trait GumStore {
     fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String>;
     fn list_active_leases(&self) -> Result<Vec<LeaseStatusRecord>, String>;
     fn list_concurrency_status(&self) -> Result<Vec<ConcurrencyStatusRecord>, String>;
+    fn list_rate_limit_status(&self) -> Result<Vec<RateLimitStatusRecord>, String>;
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<EnqueueRunResult, String>;
     fn replay_run(&self, params: ReplayRunParams) -> Result<RunRecord, String>;
     fn lease_next_attempt(
