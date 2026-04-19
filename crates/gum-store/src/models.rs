@@ -115,6 +115,13 @@ pub enum ProviderHealthState {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FunctionHealthState {
+    Healthy,
+    Degraded,
+    Down,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderTargetRecord {
     pub id: String,
@@ -152,6 +159,18 @@ pub struct ProviderHealthRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionHealthRecord {
+    pub job_id: String,
+    pub state: FunctionHealthState,
+    pub consecutive_infra_failures: u32,
+    pub reason: Option<String>,
+    pub hold_until_epoch_ms: Option<i64>,
+    pub last_changed_at_epoch_ms: i64,
+    pub last_success_at_epoch_ms: Option<i64>,
+    pub last_failure_at_epoch_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseStateRecord {
     pub lease_id: String,
     pub run_id: String,
@@ -176,6 +195,15 @@ pub struct LeaseStatusRecord {
     pub runner_id: String,
     pub expires_at_epoch_ms: i64,
     pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrencyStatusRecord {
+    pub job_id: String,
+    pub job_name: String,
+    pub concurrency_limit: u32,
+    pub active_run_ids: Vec<String>,
+    pub queued_run_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

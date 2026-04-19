@@ -32,6 +32,9 @@ class RunRecord:
     attempt: int
     trigger_type: str | None = None
     failure_reason: str | None = None
+    failure_class: str | None = None
+    retry_after_epoch_ms: int | None = None
+    waiting_reason: str | None = None
     replay_of: str | None = None
 
 
@@ -65,6 +68,17 @@ class LeaseStatus:
     runner_id: str
     expires_at_epoch_ms: int
     cancel_requested: bool
+
+
+@dataclass(slots=True)
+class ConcurrencyStatus:
+    job_id: str
+    job_name: str
+    concurrency_limit: int
+    active_count: int
+    queued_count: int
+    active_run_ids: list[str]
+    queued_run_ids: list[str]
 
 
 class RunsAPI:
@@ -103,6 +117,10 @@ class AdminAPI:
     def leases(self) -> list[LeaseStatus]:
         body = self._client._request("GET", "/internal/admin/leases", use_admin_auth=True)
         return [_lease_status_from_payload(item) for item in body.get("leases", [])]
+
+    def concurrency(self) -> list[ConcurrencyStatus]:
+        body = self._client._request("GET", "/internal/admin/concurrency", use_admin_auth=True)
+        return [_concurrency_status_from_payload(item) for item in body.get("concurrency", [])]
 
 
 @dataclass(slots=True)
@@ -193,6 +211,9 @@ def _run_record_from_payload(payload: dict[str, Any]) -> RunRecord:
         attempt=payload.get("attempt", 1),
         trigger_type=payload.get("trigger_type"),
         failure_reason=payload.get("failure_reason"),
+        failure_class=payload.get("failure_class"),
+        retry_after_epoch_ms=payload.get("retry_after_epoch_ms"),
+        waiting_reason=payload.get("waiting_reason"),
         replay_of=payload.get("replay_of"),
     )
 
@@ -223,4 +244,16 @@ def _lease_status_from_payload(payload: dict[str, Any]) -> LeaseStatus:
         runner_id=payload["runner_id"],
         expires_at_epoch_ms=payload["expires_at_epoch_ms"],
         cancel_requested=payload["cancel_requested"],
+    )
+
+
+def _concurrency_status_from_payload(payload: dict[str, Any]) -> ConcurrencyStatus:
+    return ConcurrencyStatus(
+        job_id=payload["job_id"],
+        job_name=payload["job_name"],
+        concurrency_limit=payload["concurrency_limit"],
+        active_count=payload["active_count"],
+        queued_count=payload["queued_count"],
+        active_run_ids=list(payload.get("active_run_ids", [])),
+        queued_run_ids=list(payload.get("queued_run_ids", [])),
     )

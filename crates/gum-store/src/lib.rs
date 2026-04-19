@@ -17,6 +17,7 @@ pub const TABLES: &[&str] = &[
     "provider_targets",
     "provider_checks",
     "provider_health",
+    "function_health",
     "logs",
 ];
 

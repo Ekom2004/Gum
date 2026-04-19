@@ -6,16 +6,18 @@ use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 use postgres::{Client, NoTls, Row};
 
 use crate::models::{
-    AttemptRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord,
-    LogRecord, ProjectRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord,
+    AttemptRecord, ConcurrencyStatusRecord, DeployRecord, FunctionHealthRecord,
+    FunctionHealthState, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord, LogRecord,
+    ProjectRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord,
     ProviderHealthState, ProviderTargetRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 use crate::queries::{
-    compute_retry_disposition, is_provider_failure_class, parse_rate_limit_spec,
-    parse_schedule_interval_ms, provider_slug_from_job, CancelRunParams, CompleteAttemptParams,
-    ControlLeaseParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
+    is_provider_failure_class, parse_rate_limit_spec, parse_schedule_interval_ms,
+    provider_slug_from_job, CancelRunParams, CompleteAttemptParams, ControlLeaseParams,
+    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
     RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
-    SetProviderHealthParams, UpsertProviderTargetParams,
+    SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_slice1.sql");
@@ -26,6 +28,7 @@ const MIGRATION_0004: &str =
 const MIGRATION_0005: &str = include_str!("../migrations/0005_cancel_revoke.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_provider_health.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_retry_policy.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_function_health.sql");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -66,6 +69,9 @@ impl PostgresStore {
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .batch_execute(MIGRATION_0007)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
+            .batch_execute(MIGRATION_0008)
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .execute(
@@ -268,6 +274,172 @@ impl PostgresStore {
             ],
         )
         .map_err(|error| format!("failed to update provider health from request signal: {error}"))?;
+
+        Ok(())
+    }
+
+    fn function_health_for_job_tx(
+        tx: &mut postgres::Transaction<'_>,
+        job_id: &str,
+    ) -> Result<Option<FunctionHealthRecord>, String> {
+        let row = tx
+            .query_opt(
+                "SELECT job_id,
+                        state,
+                        consecutive_infra_failures,
+                        reason,
+                        CASE
+                            WHEN hold_until IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM hold_until) * 1000)::bigint
+                        END AS hold_until_epoch_ms,
+                        (EXTRACT(EPOCH FROM last_changed_at) * 1000)::bigint AS last_changed_at_epoch_ms,
+                        CASE
+                            WHEN last_success_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM last_success_at) * 1000)::bigint
+                        END AS last_success_at_epoch_ms,
+                        CASE
+                            WHEN last_failure_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM last_failure_at) * 1000)::bigint
+                        END AS last_failure_at_epoch_ms
+                 FROM function_health
+                 WHERE job_id = $1",
+                &[&job_id],
+            )
+            .map_err(|error| format!("failed to load function health: {error}"))?;
+        row.map(function_health_from_row).transpose()
+    }
+
+    fn apply_function_signal_tx(
+        tx: &mut postgres::Transaction<'_>,
+        job_id: &str,
+        failure_class: Option<&str>,
+        attempt_status: AttemptStatus,
+        now_epoch_ms: i64,
+    ) -> Result<(), String> {
+        let previous = Self::function_health_for_job_tx(tx, job_id)?;
+        let is_success = attempt_status == AttemptStatus::Succeeded;
+        let is_infra_failure = !is_success && is_infrastructure_failure_class(failure_class);
+
+        let next = if is_success {
+            FunctionHealthRecord {
+                job_id: job_id.to_string(),
+                state: FunctionHealthState::Healthy,
+                consecutive_infra_failures: 0,
+                reason: None,
+                hold_until_epoch_ms: None,
+                last_changed_at_epoch_ms: if previous
+                    .as_ref()
+                    .map(|record| record.state == FunctionHealthState::Healthy)
+                    .unwrap_or(false)
+                {
+                    previous
+                        .as_ref()
+                        .map(|record| record.last_changed_at_epoch_ms)
+                        .unwrap_or(now_epoch_ms)
+                } else {
+                    now_epoch_ms
+                },
+                last_success_at_epoch_ms: Some(now_epoch_ms),
+                last_failure_at_epoch_ms: previous
+                    .as_ref()
+                    .and_then(|record| record.last_failure_at_epoch_ms),
+            }
+        } else if is_infra_failure {
+            let consecutive_infra_failures = previous
+                .as_ref()
+                .map(|record| record.consecutive_infra_failures)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let state = if consecutive_infra_failures >= 5 {
+                FunctionHealthState::Down
+            } else if consecutive_infra_failures >= 3 {
+                FunctionHealthState::Degraded
+            } else {
+                FunctionHealthState::Healthy
+            };
+            FunctionHealthRecord {
+                job_id: job_id.to_string(),
+                state,
+                consecutive_infra_failures,
+                reason: Some(
+                    failure_class
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "infrastructure failure".to_string()),
+                ),
+                hold_until_epoch_ms: if matches!(
+                    state,
+                    FunctionHealthState::Degraded | FunctionHealthState::Down
+                ) {
+                    Some(now_epoch_ms + function_health_hold_delay_ms())
+                } else {
+                    None
+                },
+                last_changed_at_epoch_ms: if previous
+                    .as_ref()
+                    .map(|record| record.state == state)
+                    .unwrap_or(false)
+                {
+                    previous
+                        .as_ref()
+                        .map(|record| record.last_changed_at_epoch_ms)
+                        .unwrap_or(now_epoch_ms)
+                } else {
+                    now_epoch_ms
+                },
+                last_success_at_epoch_ms: previous
+                    .as_ref()
+                    .and_then(|record| record.last_success_at_epoch_ms),
+                last_failure_at_epoch_ms: Some(now_epoch_ms),
+            }
+        } else {
+            previous.unwrap_or(FunctionHealthRecord {
+                job_id: job_id.to_string(),
+                state: FunctionHealthState::Healthy,
+                consecutive_infra_failures: 0,
+                reason: None,
+                hold_until_epoch_ms: None,
+                last_changed_at_epoch_ms: now_epoch_ms,
+                last_success_at_epoch_ms: None,
+                last_failure_at_epoch_ms: None,
+            })
+        };
+
+        tx.execute(
+            "INSERT INTO function_health (
+                job_id, state, consecutive_infra_failures, reason, hold_until, last_changed_at,
+                last_success_at, last_failure_at, updated_at
+             ) VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                CASE WHEN $5::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($5::double precision / 1000.0) END,
+                TO_TIMESTAMP($6::double precision / 1000.0),
+                CASE WHEN $7::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($7::double precision / 1000.0) END,
+                CASE WHEN $8::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($8::double precision / 1000.0) END,
+                NOW()
+             )
+             ON CONFLICT (job_id) DO UPDATE
+             SET state = EXCLUDED.state,
+                 consecutive_infra_failures = EXCLUDED.consecutive_infra_failures,
+                 reason = EXCLUDED.reason,
+                 hold_until = EXCLUDED.hold_until,
+                 last_changed_at = EXCLUDED.last_changed_at,
+                 last_success_at = EXCLUDED.last_success_at,
+                 last_failure_at = EXCLUDED.last_failure_at,
+                 updated_at = NOW()",
+            &[
+                &next.job_id,
+                &function_health_state_to_str(next.state),
+                &(next.consecutive_infra_failures as i32),
+                &next.reason,
+                &next.hold_until_epoch_ms.map(|value| value as f64),
+                &(next.last_changed_at_epoch_ms as f64),
+                &next.last_success_at_epoch_ms.map(|value| value as f64),
+                &next.last_failure_at_epoch_ms.map(|value| value as f64),
+            ],
+        )
+        .map_err(|error| format!("failed to update function health: {error}"))?;
 
         Ok(())
     }
@@ -522,6 +694,97 @@ impl GumStore for PostgresStore {
         tx.commit()
             .map_err(|error| format!("failed to commit provider health transaction: {error}"))?;
         provider_health_from_row(row)
+    }
+
+    fn set_function_health(
+        &self,
+        params: SetFunctionHealthParams,
+    ) -> Result<FunctionHealthRecord, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_one(
+                "INSERT INTO function_health (
+                    job_id, state, consecutive_infra_failures, reason, hold_until, last_changed_at,
+                    last_success_at, last_failure_at, updated_at
+                 ) VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    CASE WHEN $5::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($5::double precision / 1000.0) END,
+                    TO_TIMESTAMP($6::double precision / 1000.0),
+                    CASE WHEN $7::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($7::double precision / 1000.0) END,
+                    CASE WHEN $8::double precision IS NULL THEN NULL ELSE TO_TIMESTAMP($8::double precision / 1000.0) END,
+                    NOW()
+                 )
+                 ON CONFLICT (job_id) DO UPDATE
+                 SET state = EXCLUDED.state,
+                     consecutive_infra_failures = EXCLUDED.consecutive_infra_failures,
+                     reason = EXCLUDED.reason,
+                     hold_until = EXCLUDED.hold_until,
+                     last_changed_at = EXCLUDED.last_changed_at,
+                     last_success_at = EXCLUDED.last_success_at,
+                     last_failure_at = EXCLUDED.last_failure_at,
+                     updated_at = NOW()
+                 RETURNING job_id,
+                           state,
+                           consecutive_infra_failures,
+                           reason,
+                           CASE
+                               WHEN hold_until IS NULL THEN NULL
+                               ELSE (EXTRACT(EPOCH FROM hold_until) * 1000)::bigint
+                           END AS hold_until_epoch_ms,
+                           (EXTRACT(EPOCH FROM last_changed_at) * 1000)::bigint AS last_changed_at_epoch_ms,
+                           CASE
+                               WHEN last_success_at IS NULL THEN NULL
+                               ELSE (EXTRACT(EPOCH FROM last_success_at) * 1000)::bigint
+                           END AS last_success_at_epoch_ms,
+                           CASE
+                               WHEN last_failure_at IS NULL THEN NULL
+                               ELSE (EXTRACT(EPOCH FROM last_failure_at) * 1000)::bigint
+                           END AS last_failure_at_epoch_ms",
+                &[
+                    &params.job_id,
+                    &function_health_state_to_str(params.state),
+                    &(params.consecutive_infra_failures as i32),
+                    &params.reason,
+                    &params.hold_until_epoch_ms.map(|value| value as f64),
+                    &(params.last_changed_at_epoch_ms as f64),
+                    &params.last_success_at_epoch_ms.map(|value| value as f64),
+                    &params.last_failure_at_epoch_ms.map(|value| value as f64),
+                ],
+            )
+            .map_err(|error| format!("failed to set function health: {error}"))?;
+        function_health_from_row(row)
+    }
+
+    fn get_function_health(&self, job_id: &str) -> Result<Option<FunctionHealthRecord>, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_opt(
+                "SELECT job_id,
+                        state,
+                        consecutive_infra_failures,
+                        reason,
+                        CASE
+                            WHEN hold_until IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM hold_until) * 1000)::bigint
+                        END AS hold_until_epoch_ms,
+                        (EXTRACT(EPOCH FROM last_changed_at) * 1000)::bigint AS last_changed_at_epoch_ms,
+                        CASE
+                            WHEN last_success_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM last_success_at) * 1000)::bigint
+                        END AS last_success_at_epoch_ms,
+                        CASE
+                            WHEN last_failure_at IS NULL THEN NULL
+                            ELSE (EXTRACT(EPOCH FROM last_failure_at) * 1000)::bigint
+                        END AS last_failure_at_epoch_ms
+                 FROM function_health
+                 WHERE job_id = $1",
+                &[&job_id],
+            )
+            .map_err(|error| format!("failed to get function health: {error}"))?;
+        row.map(function_health_from_row).transpose()
     }
 
     fn list_provider_targets(&self) -> Result<Vec<ProviderTargetRecord>, String> {
@@ -828,6 +1091,49 @@ impl GumStore for PostgresStore {
             .collect()
     }
 
+    fn list_concurrency_status(&self) -> Result<Vec<ConcurrencyStatusRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT jobs.id AS job_id,
+                        jobs.name AS job_name,
+                        jobs.concurrency_limit AS concurrency_limit,
+                        COALESCE(active.active_run_ids, ARRAY[]::text[]) AS active_run_ids,
+                        COALESCE(queued.queued_run_ids, ARRAY[]::text[]) AS queued_run_ids
+                 FROM jobs
+                 LEFT JOIN LATERAL (
+                     SELECT ARRAY_AGG(DISTINCT runs.id ORDER BY runs.id) AS active_run_ids
+                     FROM runs
+                     JOIN attempts ON attempts.run_id = runs.id
+                     WHERE runs.job_id = jobs.id
+                       AND attempts.status = 'running'
+                 ) active ON TRUE
+                 LEFT JOIN LATERAL (
+                     SELECT ARRAY_AGG(runs.id ORDER BY runs.scheduled_at ASC, runs.id ASC) AS queued_run_ids
+                     FROM runs
+                     WHERE runs.job_id = jobs.id
+                       AND runs.status = 'queued'
+                 ) queued ON TRUE
+                 WHERE jobs.enabled = TRUE
+                   AND jobs.concurrency_limit IS NOT NULL
+                 ORDER BY jobs.name ASC, jobs.id ASC",
+                &[],
+            )
+            .map_err(|error| format!("failed to list concurrency status: {error}"))?;
+        rows.into_iter()
+            .map(|row| {
+                let concurrency_limit: i32 = row.get("concurrency_limit");
+                Ok(ConcurrencyStatusRecord {
+                    job_id: row.get("job_id"),
+                    job_name: row.get("job_name"),
+                    concurrency_limit: concurrency_limit as u32,
+                    active_run_ids: row.get("active_run_ids"),
+                    queued_run_ids: row.get("queued_run_ids"),
+                })
+            })
+            .collect()
+    }
+
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {
         let mut client = self.connect_client()?;
         let row = client
@@ -960,8 +1266,13 @@ impl GumStore for PostgresStore {
                 "SELECT runs.*, (EXTRACT(EPOCH FROM runs.scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms
                  FROM runs
                  JOIN jobs ON jobs.id = runs.job_id
+                 LEFT JOIN function_health ON function_health.job_id = jobs.id
                  WHERE runs.status = 'queued'
                    AND (runs.retry_after_epoch_ms IS NULL OR runs.retry_after_epoch_ms <= $1)
+                   AND (
+                     function_health.hold_until IS NULL
+                     OR function_health.hold_until <= TO_TIMESTAMP($1::double precision / 1000.0)
+                   )
                    AND jobs.enabled = TRUE
                    AND (
                      jobs.concurrency_limit IS NULL OR (
@@ -1199,6 +1510,13 @@ impl GumStore for PostgresStore {
             .map_err(|error| format!("failed to load job for completion: {error}"))?;
         let job = job_from_row(job_row)?;
         let provider_slug = provider_slug_from_job(&job)?;
+        Self::apply_function_signal_tx(
+            &mut tx,
+            &job.id,
+            params.failure_class.as_deref(),
+            params.status,
+            now_epoch_ms(),
+        )?;
 
         if let Some(provider_slug) = provider_slug.as_deref() {
             if params.status == AttemptStatus::Succeeded {
@@ -1220,11 +1538,7 @@ impl GumStore for PostgresStore {
             }
         }
 
-        let provider_health = if let Some(provider_slug) = provider_slug.as_deref() {
-            Self::provider_health_by_slug_tx(&mut tx, provider_slug)?
-        } else {
-            None
-        };
+        let function_health = Self::function_health_for_job_tx(&mut tx, &job.id)?;
         let disposition = compute_retry_disposition(
             &run.id,
             run.attempt_count,
@@ -1232,8 +1546,7 @@ impl GumStore for PostgresStore {
             params.status,
             params.failure_reason.clone(),
             params.failure_class.clone(),
-            provider_slug.as_deref(),
-            provider_health.as_ref().map(|record| record.state),
+            function_health.as_ref(),
             now_epoch_ms(),
         );
 
@@ -1273,7 +1586,7 @@ impl GumStore for PostgresStore {
                     &disposition.failure_reason,
                     &disposition.failure_class,
                     &disposition.retry_after_epoch_ms,
-                    &disposition.waiting_for_provider_slug,
+                    &disposition.waiting_for_scope_key,
                     &run.id,
                 ],
             )
@@ -1757,6 +2070,20 @@ fn provider_health_from_row(row: Row) -> Result<ProviderHealthRecord, String> {
     })
 }
 
+fn function_health_from_row(row: Row) -> Result<FunctionHealthRecord, String> {
+    let consecutive_infra_failures: i32 = row.get("consecutive_infra_failures");
+    Ok(FunctionHealthRecord {
+        job_id: row.get("job_id"),
+        state: function_health_state_from_str(row.get("state"))?,
+        consecutive_infra_failures: consecutive_infra_failures as u32,
+        reason: row.get("reason"),
+        hold_until_epoch_ms: row.get("hold_until_epoch_ms"),
+        last_changed_at_epoch_ms: row.get("last_changed_at_epoch_ms"),
+        last_success_at_epoch_ms: row.get("last_success_at_epoch_ms"),
+        last_failure_at_epoch_ms: row.get("last_failure_at_epoch_ms"),
+    })
+}
+
 fn log_from_row(row: Row) -> Result<LogRecord, String> {
     Ok(LogRecord {
         id: row.get("id"),
@@ -1880,6 +2207,23 @@ fn provider_health_state_from_str(value: String) -> Result<ProviderHealthState, 
         "degraded" => Ok(ProviderHealthState::Degraded),
         "down" => Ok(ProviderHealthState::Down),
         _ => Err(format!("unknown provider health state: {value}")),
+    }
+}
+
+fn function_health_state_to_str(value: FunctionHealthState) -> &'static str {
+    match value {
+        FunctionHealthState::Healthy => "healthy",
+        FunctionHealthState::Degraded => "degraded",
+        FunctionHealthState::Down => "down",
+    }
+}
+
+fn function_health_state_from_str(value: String) -> Result<FunctionHealthState, String> {
+    match value.as_str() {
+        "healthy" => Ok(FunctionHealthState::Healthy),
+        "degraded" => Ok(FunctionHealthState::Degraded),
+        "down" => Ok(FunctionHealthState::Down),
+        _ => Err(format!("unknown function health state: {value}")),
     }
 }
 

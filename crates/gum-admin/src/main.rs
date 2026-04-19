@@ -24,6 +24,7 @@ enum View {
     Runs,
     Runners,
     Leases,
+    Concurrency,
 }
 
 impl View {
@@ -31,15 +32,17 @@ impl View {
         match self {
             View::Runs => View::Runners,
             View::Runners => View::Leases,
-            View::Leases => View::Runs,
+            View::Leases => View::Concurrency,
+            View::Concurrency => View::Runs,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            View::Runs => View::Leases,
+            View::Runs => View::Concurrency,
             View::Runners => View::Runs,
             View::Leases => View::Runners,
+            View::Concurrency => View::Leases,
         }
     }
 }
@@ -52,6 +55,7 @@ struct RunRecord {
     attempt: u32,
     trigger_type: Option<String>,
     failure_reason: Option<String>,
+    waiting_reason: Option<String>,
     replay_of: Option<String>,
 }
 
@@ -90,6 +94,22 @@ struct LeasesResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ConcurrencyStatusRecord {
+    job_id: String,
+    job_name: String,
+    concurrency_limit: u32,
+    active_count: u32,
+    queued_count: u32,
+    active_run_ids: Vec<String>,
+    queued_run_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ConcurrencyResponse {
+    concurrency: Vec<ConcurrencyStatusRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct LogLineRecord {
     attempt_id: String,
     stream: String,
@@ -101,6 +121,7 @@ struct Snapshot {
     runs: Vec<RunRecord>,
     runners: Vec<RunnerStatusRecord>,
     leases: Vec<LeaseStatusRecord>,
+    concurrency: Vec<ConcurrencyStatusRecord>,
     logs: Vec<LogLineRecord>,
 }
 
@@ -110,6 +131,7 @@ impl Snapshot {
             runs: Vec::new(),
             runners: Vec::new(),
             leases: Vec::new(),
+            concurrency: Vec::new(),
             logs: Vec::new(),
         }
     }
@@ -145,6 +167,13 @@ impl ApiClient {
     async fn list_leases(&self) -> Result<Vec<LeaseStatusRecord>, String> {
         let response = self.get::<LeasesResponse>("/internal/admin/leases").await?;
         Ok(response.leases)
+    }
+
+    async fn list_concurrency(&self) -> Result<Vec<ConcurrencyStatusRecord>, String> {
+        let response = self
+            .get::<ConcurrencyResponse>("/internal/admin/concurrency")
+            .await?;
+        Ok(response.concurrency)
     }
 
     async fn run_logs(&self, run_id: &str) -> Result<Vec<LogLineRecord>, String> {
@@ -253,6 +282,7 @@ impl App {
             View::Runs => self.filtered_runs().len(),
             View::Runners => self.snapshot.runners.len(),
             View::Leases => self.snapshot.leases.len(),
+            View::Concurrency => self.snapshot.concurrency.len(),
         }
     }
 
@@ -381,12 +411,18 @@ async fn refresh_snapshot(app: &mut App, client: &ApiClient) {
     let runs = client.list_runs().await;
     let runners = client.list_runners().await;
     let leases = client.list_leases().await;
-    match (runs, runners, leases) {
-        (Ok(runs), Ok(runners), Ok(leases)) => {
+    let concurrency = client.list_concurrency().await;
+    match (runs, runners, leases, concurrency) {
+        (Ok(runs), Ok(runners), Ok(leases), Ok(concurrency)) => {
             app.snapshot.runs = runs;
             app.snapshot.runners = runners;
             app.snapshot.leases = leases;
-            let selected_run_id = app.selected_run().map(|run| run.id);
+            app.snapshot.concurrency = concurrency;
+            let selected_run_id = if matches!(app.view, View::Runs) {
+                app.selected_run().map(|run| run.id)
+            } else {
+                None
+            };
             app.snapshot.logs = match selected_run_id {
                 Some(run_id) => match client.run_logs(&run_id).await {
                     Ok(logs) => logs,
@@ -399,7 +435,10 @@ async fn refresh_snapshot(app: &mut App, client: &ApiClient) {
             };
             app.clamp_selection();
         }
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+        (Err(error), _, _, _)
+        | (_, Err(error), _, _)
+        | (_, _, Err(error), _)
+        | (_, _, _, Err(error)) => {
             app.set_error(error);
         }
     }
@@ -444,6 +483,10 @@ async fn handle_key(app: &mut App, client: &ApiClient, code: KeyCode) -> Result<
         }
         KeyCode::Char('3') => {
             app.view = View::Leases;
+            app.selected_index = 0;
+        }
+        KeyCode::Char('4') => {
+            app.view = View::Concurrency;
             app.selected_index = 0;
         }
         KeyCode::Left => {
@@ -544,7 +587,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let titles = ["1:runs", "2:runners", "3:leases"]
+    let titles = ["1:runs", "2:runners", "3:leases", "4:concurrency"]
         .into_iter()
         .map(Line::from)
         .collect::<Vec<_>>();
@@ -552,6 +595,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         View::Runs => 0,
         View::Runners => 1,
         View::Leases => 2,
+        View::Concurrency => 3,
     };
     let tabs = Tabs::new(titles)
         .block(panel_block(" VIEWS ").borders(Borders::BOTTOM))
@@ -588,6 +632,7 @@ fn render_primary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         View::Runs => render_runs_table(frame, area, app),
         View::Runners => render_runners_table(frame, area, app),
         View::Leases => render_leases_table(frame, area, app),
+        View::Concurrency => render_concurrency_table(frame, area, app),
     }
 }
 
@@ -699,6 +744,43 @@ fn render_leases_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+fn render_concurrency_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rows = app.snapshot.concurrency.iter().map(|status| {
+        Row::new(vec![
+            Cell::from(truncate_text(&status.job_name, 18)),
+            Cell::from(truncate_text(&status.job_id, 18)),
+            Cell::from(format!(
+                "{}/{}",
+                status.active_count, status.concurrency_limit
+            )),
+            Cell::from(status.queued_count.to_string()),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(20),
+            Constraint::Length(20),
+            Constraint::Length(12),
+            Constraint::Length(8),
+        ],
+    )
+    .block(panel_block(" CONCURRENCY "))
+    .header(
+        Row::new(vec!["job", "job id", "active/max", "queued"])
+            .style(Style::default().fg(Color::DarkGray)),
+    )
+    .highlight_style(Style::default().bg(Color::DarkGray))
+    .highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    if !app.snapshot.concurrency.is_empty() {
+        state.select(Some(
+            app.selected_index.min(app.snapshot.concurrency.len() - 1),
+        ));
+    }
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = match app.view {
         View::Runs => match app.selected_run() {
@@ -715,6 +797,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 detail_line("attempt", &run.attempt.to_string()),
                 detail_line("trigger", run.trigger_type.as_deref().unwrap_or("--")),
                 detail_line("replay", run.replay_of.as_deref().unwrap_or("--")),
+                detail_line("waiting", run.waiting_reason.as_deref().unwrap_or("--")),
                 detail_line("failure", run.failure_reason.as_deref().unwrap_or("--")),
             ],
             None => vec![Line::from("No run selected.")],
@@ -745,6 +828,31 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ],
             None => vec![Line::from("No lease selected.")],
         },
+        View::Concurrency => match select_item(&app.snapshot.concurrency, app.selected_index) {
+            Some(status) => {
+                let slots = format!("{}/{}", status.active_count, status.concurrency_limit);
+                let queued = status.queued_count.to_string();
+                let active_runs = if status.active_run_ids.is_empty() {
+                    "--".to_string()
+                } else {
+                    status.active_run_ids.join(", ")
+                };
+                let queued_runs = if status.queued_run_ids.is_empty() {
+                    "--".to_string()
+                } else {
+                    status.queued_run_ids.join(", ")
+                };
+                vec![
+                    detail_line("job", &status.job_name),
+                    detail_line("job id", &status.job_id),
+                    detail_line("slots", &slots),
+                    detail_line("queued", &queued),
+                    detail_line("active runs", &active_runs),
+                    detail_line("queued runs", &queued_runs),
+                ]
+            }
+            None => vec![Line::from("No concurrency-limited job selected.")],
+        },
     };
     let widget = Paragraph::new(lines)
         .block(panel_block(" DETAIL "))
@@ -774,7 +882,8 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect) {
-    let footer = "j/k move  / filter  c cancel  r replay  1 runs  2 runners  3 leases  q quit";
+    let footer =
+        "j/k move  / filter  c cancel  r replay  1 runs  2 runners  3 leases  4 concurrency  q quit";
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         area,
@@ -946,6 +1055,7 @@ mod tests {
             attempt: 1,
             trigger_type: Some("enqueue".to_string()),
             failure_reason: None,
+            waiting_reason: None,
             replay_of: None,
         }
     }

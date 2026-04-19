@@ -306,6 +306,7 @@ def render_run_record(run: RunRecord) -> str:
         f"Trigger:  {run.trigger_type or '--'}",
         f"Replay:   {run.replay_of or '--'}",
         f"Failure:  {run.failure_reason or '--'}",
+        f"Waiting:  {run.waiting_reason or '--'}",
     ]
     return "\n".join(lines)
 

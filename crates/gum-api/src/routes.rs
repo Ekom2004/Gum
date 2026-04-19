@@ -48,6 +48,7 @@ pub struct RunResponse {
     pub failure_reason: Option<String>,
     pub failure_class: Option<String>,
     pub retry_after_epoch_ms: Option<i64>,
+    pub waiting_reason: Option<String>,
     pub waiting_for_provider_slug: Option<String>,
     pub replay_of: Option<String>,
 }
@@ -145,6 +146,22 @@ pub struct LeaseStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeasesListResponse {
     pub leases: Vec<LeaseStatusResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrencyStatusResponse {
+    pub job_id: String,
+    pub job_name: String,
+    pub concurrency_limit: u32,
+    pub active_count: u32,
+    pub queued_count: u32,
+    pub active_run_ids: Vec<String>,
+    pub queued_run_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrencyListResponse {
+    pub concurrency: Vec<ConcurrencyStatusResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

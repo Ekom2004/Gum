@@ -4,7 +4,9 @@ use gum_api::routes::{
 };
 use gum_api::service;
 use gum_store::memory::MemoryStore;
-use gum_store::models::{ProjectRecord, ProviderCheckStatus, ProviderHealthState};
+use gum_store::models::{
+    FunctionHealthState, ProjectRecord, ProviderCheckStatus, ProviderHealthState,
+};
 use gum_store::queries::{
     GumStore, RecordProviderCheckParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
@@ -206,7 +208,7 @@ fn failed_attempt_requeues_when_retries_remain() {
 }
 
 #[test]
-fn provider_down_blocks_retry_until_recovery() {
+fn function_health_blocks_retry_without_provider_config() {
     let store = MemoryStore::default();
     store
         .insert_project(ProjectRecord {
@@ -233,7 +235,7 @@ fn provider_down_blocks_retry_until_recovery() {
                 schedule_expr: None,
                 retries: 5,
                 timeout_secs: 300,
-                rate_limit_spec: Some("openai:60/m".to_string()),
+                rate_limit_spec: None,
                 concurrency_limit: Some(5),
                 compute_class: None,
             }],
@@ -250,39 +252,20 @@ fn provider_down_blocks_retry_until_recovery() {
         },
     )
     .expect("register runner should work");
-    store
-        .upsert_provider_target(UpsertProviderTargetParams {
-            id: "provider_openai".to_string(),
-            name: "OpenAI".to_string(),
-            slug: "openai".to_string(),
-            probe_kind: "http".to_string(),
-            probe_config_json: json!({"url": "https://api.openai.com/v1/models"}),
-            enabled: true,
-        })
-        .expect("provider target should be stored");
-    store
-        .set_provider_health(SetProviderHealthParams {
-            provider_target_id: "provider_openai".to_string(),
-            state: ProviderHealthState::Down,
-            reason: Some("probe failures".to_string()),
-            last_changed_at_epoch_ms: 1_000,
-            last_success_at_epoch_ms: None,
-            last_failure_at_epoch_ms: Some(1_000),
-            degraded_score: 3,
-            down_score: 3,
-        })
-        .expect("provider health should be stored");
 
-    let _run = service::enqueue_run(
-        &store,
-        "proj_1",
-        "job_generate_summary",
-        EnqueueRunRequest {
-            input: json!({"doc_id": "doc_123"}),
-        },
-    )
-    .expect("enqueue should work");
-    let leased = service::lease_run(
+    for idx in 0..4 {
+        service::enqueue_run(
+            &store,
+            "proj_1",
+            "job_generate_summary",
+            EnqueueRunRequest {
+                input: json!({"doc_id": format!("doc_{idx}")}),
+            },
+        )
+        .expect("enqueue should work");
+    }
+
+    let first = service::lease_run(
         &store,
         LeaseRunRequest {
             runner_id: "runner_1".to_string(),
@@ -290,11 +273,10 @@ fn provider_down_blocks_retry_until_recovery() {
         },
     )
     .expect("lease should work")
-    .expect("run should be leased");
-
-    let retried = service::complete_attempt(
+    .expect("first run should be leased");
+    let first_retried = service::complete_attempt(
         &store,
-        &leased.attempt_id,
+        &first.attempt_id,
         CompleteAttemptRequest {
             runner_id: "runner_1".to_string(),
             status: AttemptStatus::Failed,
@@ -302,15 +284,70 @@ fn provider_down_blocks_retry_until_recovery() {
             failure_class: Some("provider_5xx".to_string()),
         },
     )
-    .expect("completion should work");
+    .expect("first completion should work");
+    assert_eq!(first_retried.status, RunStatus::Queued);
+    assert_eq!(first_retried.failure_class.as_deref(), Some("provider_5xx"));
 
-    assert_eq!(retried.status, RunStatus::Queued);
+    let second = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("second run should be leased");
+    service::complete_attempt(
+        &store,
+        &second.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Failed,
+            failure_reason: Some("upstream unavailable".to_string()),
+            failure_class: Some("provider_5xx".to_string()),
+        },
+    )
+    .expect("second completion should work");
+
+    let third = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("third run should be leased");
+    let blocked = service::complete_attempt(
+        &store,
+        &third.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Failed,
+            failure_reason: Some("upstream unavailable".to_string()),
+            failure_class: Some("provider_5xx".to_string()),
+        },
+    )
+    .expect("third completion should work");
+
+    assert_eq!(blocked.status, RunStatus::Queued);
     assert_eq!(
-        retried.failure_class.as_deref(),
+        blocked.failure_class.as_deref(),
         Some("blocked_by_downstream")
     );
-    assert_eq!(retried.waiting_for_provider_slug.as_deref(), Some("openai"));
-    assert!(retried.retry_after_epoch_ms.is_some());
+    assert_eq!(
+        blocked.waiting_reason.as_deref(),
+        Some("waiting_for_function_health")
+    );
+    assert!(blocked.retry_after_epoch_ms.is_some());
+
+    let function_health = store
+        .get_function_health("job_generate_summary")
+        .expect("function health lookup should work")
+        .expect("function health should exist");
+    assert_eq!(function_health.state, FunctionHealthState::Degraded);
+    assert_eq!(function_health.consecutive_infra_failures, 3);
+    assert!(function_health.hold_until_epoch_ms.is_some());
 
     let lease_attempt = service::lease_run(
         &store,
@@ -690,7 +727,7 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
 }
 
 #[test]
-fn admin_views_expose_runs_runners_and_leases() {
+fn admin_views_expose_runs_runners_leases_and_concurrency() {
     let store = MemoryStore::default();
     store
         .insert_project(ProjectRecord {
@@ -719,7 +756,7 @@ fn admin_views_expose_runs_runners_and_leases() {
                 retries: 0,
                 timeout_secs: 300,
                 rate_limit_spec: None,
-                concurrency_limit: None,
+                concurrency_limit: Some(1),
                 compute_class: Some("high-mem".to_string()),
             }],
         },
@@ -736,7 +773,7 @@ fn admin_views_expose_runs_runners_and_leases() {
     )
     .expect("register runner should work");
 
-    let run = service::enqueue_run(
+    service::enqueue_run(
         &store,
         "proj_1",
         "job_export",
@@ -745,6 +782,15 @@ fn admin_views_expose_runs_runners_and_leases() {
         },
     )
     .expect("enqueue should work");
+    service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_456" }),
+        },
+    )
+    .expect("second enqueue should work");
 
     let leased = service::lease_run(
         &store,
@@ -757,8 +803,22 @@ fn admin_views_expose_runs_runners_and_leases() {
     .expect("run should be leased");
 
     let runs = service::list_runs(&store, 50).expect("runs should list");
-    assert_eq!(runs.runs.len(), 1);
-    assert_eq!(runs.runs[0].id, run.id);
+    assert_eq!(runs.runs.len(), 2);
+    let leased_run = runs
+        .runs
+        .iter()
+        .find(|run| run.id == leased.run_id)
+        .expect("leased run should be listed");
+    assert_eq!(leased_run.waiting_reason, None);
+    let waiting_run = runs
+        .runs
+        .iter()
+        .find(|run| run.id != leased.run_id)
+        .expect("waiting run should be listed");
+    assert_eq!(
+        waiting_run.waiting_reason.as_deref(),
+        Some("waiting_on_concurrency")
+    );
 
     let runners = service::list_runners(&store).expect("runners should list");
     assert_eq!(runners.runners.len(), 1);
@@ -770,6 +830,20 @@ fn admin_views_expose_runs_runners_and_leases() {
     assert_eq!(leases.leases[0].lease_id, leased.lease_id);
     assert_eq!(leases.leases[0].runner_id, "runner_1");
     assert!(!leases.leases[0].cancel_requested);
+
+    let concurrency = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(concurrency.concurrency.len(), 1);
+    assert_eq!(concurrency.concurrency[0].job_id, "job_export");
+    assert_eq!(concurrency.concurrency[0].active_count, 1);
+    assert_eq!(concurrency.concurrency[0].queued_count, 1);
+    assert_eq!(
+        concurrency.concurrency[0].active_run_ids,
+        vec![leased.run_id.clone()]
+    );
+    assert_eq!(
+        concurrency.concurrency[0].queued_run_ids,
+        vec![waiting_run.id.clone()]
+    );
 }
 
 #[test]

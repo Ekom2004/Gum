@@ -23,6 +23,7 @@ pub fn router(state: AppState) -> Router {
         .route("/internal/admin/runs", get(list_runs))
         .route("/internal/admin/runners", get(list_runners))
         .route("/internal/admin/leases", get(list_leases))
+        .route("/internal/admin/concurrency", get(list_concurrency))
         .route("/internal/admin/providers", get(list_provider_health))
         .route("/internal/runners/register", post(register_runner))
         .route("/internal/runners/heartbeat", post(heartbeat_runner))
@@ -201,6 +202,18 @@ pub async fn list_leases(
     let result = tokio::task::spawn_blocking(move || service::list_leases(&store))
         .await
         .map_err(|error| ApiError::internal(format!("list leases task failed: {error}")))?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
+pub async fn list_concurrency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::routes::ConcurrencyListResponse>, ApiError> {
+    require_admin(&state.admin_key, &headers)?;
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || service::list_concurrency(&store))
+        .await
+        .map_err(|error| ApiError::internal(format!("list concurrency task failed: {error}")))?;
     result.map(Json).map_err(ApiError::from_message)
 }
 

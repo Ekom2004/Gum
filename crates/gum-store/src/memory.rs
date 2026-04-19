@@ -6,17 +6,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 
 use crate::models::{
-    AttemptRecord, ControlLeaseRecord, DeployRecord, JobRecord, LeaseRecord, LeaseStateRecord,
-    LeaseStatusRecord, LogRecord, ProjectRecord, ProviderCheckRecord, ProviderCheckStatus,
-    ProviderHealthRecord, ProviderHealthState, ProviderTargetRecord, RunRecord, RunnerRecord,
-    RunnerStatusRecord,
+    AttemptRecord, ConcurrencyStatusRecord, ControlLeaseRecord, DeployRecord, FunctionHealthRecord,
+    FunctionHealthState, JobRecord, LeaseRecord, LeaseStateRecord, LeaseStatusRecord, LogRecord,
+    ProjectRecord, ProviderCheckRecord, ProviderCheckStatus, ProviderHealthRecord,
+    ProviderHealthState, ProviderTargetRecord, RunRecord, RunnerRecord, RunnerStatusRecord,
 };
 use crate::queries::{
-    compute_retry_disposition, is_provider_failure_class, parse_rate_limit_spec,
-    parse_schedule_interval_ms, provider_slug_from_job, CancelRunParams, CompleteAttemptParams,
-    ControlLeaseParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
+    is_provider_failure_class, parse_rate_limit_spec, parse_schedule_interval_ms,
+    provider_slug_from_job, CancelRunParams, CompleteAttemptParams, ControlLeaseParams,
+    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
     RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams, ReplayRunParams,
-    SetProviderHealthParams, UpsertProviderTargetParams,
+    SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
 
 #[derive(Default)]
@@ -32,6 +33,7 @@ struct MemoryState {
     provider_targets: HashMap<String, ProviderTargetRecord>,
     provider_health: HashMap<String, ProviderHealthRecord>,
     provider_checks: Vec<ProviderCheckRecord>,
+    function_health: HashMap<String, FunctionHealthRecord>,
     logs: Vec<LogRecord>,
 }
 
@@ -153,19 +155,6 @@ impl MemoryStore {
         recovered_runs
     }
 
-    fn provider_health_by_slug(
-        state: &MemoryState,
-        provider_slug: &str,
-    ) -> Option<ProviderHealthRecord> {
-        state.provider_health.values().find_map(|record| {
-            if record.provider_slug == provider_slug {
-                Some(record.clone())
-            } else {
-                None
-            }
-        })
-    }
-
     fn apply_provider_signal_locked(
         &self,
         state: &mut MemoryState,
@@ -277,6 +266,107 @@ impl MemoryStore {
                 down_score,
             },
         );
+    }
+
+    fn function_health_for_job(state: &MemoryState, job_id: &str) -> Option<FunctionHealthRecord> {
+        state.function_health.get(job_id).cloned()
+    }
+
+    fn apply_function_signal_locked(
+        state: &mut MemoryState,
+        job_id: &str,
+        failure_class: Option<&str>,
+        attempt_status: AttemptStatus,
+        now_epoch_ms: i64,
+    ) {
+        let previous = state.function_health.get(job_id).cloned();
+        let is_success = attempt_status == AttemptStatus::Succeeded;
+        let is_infra_failure = !is_success && is_infrastructure_failure_class(failure_class);
+
+        let next = if is_success {
+            FunctionHealthRecord {
+                job_id: job_id.to_string(),
+                state: FunctionHealthState::Healthy,
+                consecutive_infra_failures: 0,
+                reason: None,
+                hold_until_epoch_ms: None,
+                last_changed_at_epoch_ms: if previous
+                    .as_ref()
+                    .map(|record| record.state == FunctionHealthState::Healthy)
+                    .unwrap_or(false)
+                {
+                    previous
+                        .as_ref()
+                        .map(|record| record.last_changed_at_epoch_ms)
+                        .unwrap_or(now_epoch_ms)
+                } else {
+                    now_epoch_ms
+                },
+                last_success_at_epoch_ms: Some(now_epoch_ms),
+                last_failure_at_epoch_ms: previous
+                    .and_then(|record| record.last_failure_at_epoch_ms),
+            }
+        } else if is_infra_failure {
+            let consecutive_infra_failures = previous
+                .as_ref()
+                .map(|record| record.consecutive_infra_failures)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let state_name = if consecutive_infra_failures >= 5 {
+                FunctionHealthState::Down
+            } else if consecutive_infra_failures >= 3 {
+                FunctionHealthState::Degraded
+            } else {
+                FunctionHealthState::Healthy
+            };
+            let hold_until_epoch_ms = if matches!(
+                state_name,
+                FunctionHealthState::Degraded | FunctionHealthState::Down
+            ) {
+                Some(now_epoch_ms + function_health_hold_delay_ms())
+            } else {
+                None
+            };
+            FunctionHealthRecord {
+                job_id: job_id.to_string(),
+                state: state_name,
+                consecutive_infra_failures,
+                reason: Some(
+                    failure_class
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "infrastructure failure".to_string()),
+                ),
+                hold_until_epoch_ms,
+                last_changed_at_epoch_ms: if previous
+                    .as_ref()
+                    .map(|record| record.state == state_name)
+                    .unwrap_or(false)
+                {
+                    previous
+                        .as_ref()
+                        .map(|record| record.last_changed_at_epoch_ms)
+                        .unwrap_or(now_epoch_ms)
+                } else {
+                    now_epoch_ms
+                },
+                last_success_at_epoch_ms: previous
+                    .and_then(|record| record.last_success_at_epoch_ms),
+                last_failure_at_epoch_ms: Some(now_epoch_ms),
+            }
+        } else {
+            previous.unwrap_or(FunctionHealthRecord {
+                job_id: job_id.to_string(),
+                state: FunctionHealthState::Healthy,
+                consecutive_infra_failures: 0,
+                reason: None,
+                hold_until_epoch_ms: None,
+                last_changed_at_epoch_ms: now_epoch_ms,
+                last_success_at_epoch_ms: None,
+                last_failure_at_epoch_ms: None,
+            })
+        };
+
+        state.function_health.insert(job_id.to_string(), next);
     }
 }
 
@@ -414,6 +504,38 @@ impl GumStore for MemoryStore {
             .provider_health
             .insert(record.provider_target_id.clone(), record.clone());
         Ok(record)
+    }
+
+    fn set_function_health(
+        &self,
+        params: SetFunctionHealthParams,
+    ) -> Result<FunctionHealthRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let record = FunctionHealthRecord {
+            job_id: params.job_id,
+            state: params.state,
+            consecutive_infra_failures: params.consecutive_infra_failures,
+            reason: params.reason,
+            hold_until_epoch_ms: params.hold_until_epoch_ms,
+            last_changed_at_epoch_ms: params.last_changed_at_epoch_ms,
+            last_success_at_epoch_ms: params.last_success_at_epoch_ms,
+            last_failure_at_epoch_ms: params.last_failure_at_epoch_ms,
+        };
+        state
+            .function_health
+            .insert(record.job_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    fn get_function_health(&self, job_id: &str) -> Result<Option<FunctionHealthRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        Ok(state.function_health.get(job_id).cloned())
     }
 
     fn list_provider_targets(&self) -> Result<Vec<ProviderTargetRecord>, String> {
@@ -634,6 +756,53 @@ impl GumStore for MemoryStore {
         Ok(leases)
     }
 
+    fn list_concurrency_status(&self) -> Result<Vec<ConcurrencyStatusRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut statuses: Vec<ConcurrencyStatusRecord> = state
+            .jobs
+            .values()
+            .filter_map(|job| {
+                let concurrency_limit = job.concurrency_limit?;
+
+                let mut active_run_ids: Vec<String> = state
+                    .attempts
+                    .values()
+                    .filter(|attempt| attempt.status == AttemptStatus::Running)
+                    .filter_map(|attempt| state.runs.get(&attempt.run_id))
+                    .filter(|run| run.job_id == job.id)
+                    .map(|run| run.id.clone())
+                    .collect();
+                active_run_ids.sort();
+                active_run_ids.dedup();
+
+                let mut queued_run_ids: Vec<String> = state
+                    .runs
+                    .values()
+                    .filter(|run| run.job_id == job.id && run.status == RunStatus::Queued)
+                    .map(|run| run.id.clone())
+                    .collect();
+                queued_run_ids.sort();
+
+                Some(ConcurrencyStatusRecord {
+                    job_id: job.id.clone(),
+                    job_name: job.name.clone(),
+                    concurrency_limit,
+                    active_run_ids,
+                    queued_run_ids,
+                })
+            })
+            .collect();
+        statuses.sort_by(|left, right| {
+            left.job_name
+                .cmp(&right.job_name)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        Ok(statuses)
+    }
+
     fn enqueue_run(&self, params: EnqueueRunParams) -> Result<RunRecord, String> {
         let mut state = self
             .state
@@ -744,6 +913,15 @@ impl GumStore for MemoryStore {
                 Some(job) if job.enabled => job,
                 _ => continue,
             };
+            if state
+                .function_health
+                .get(&job.id)
+                .and_then(|health| health.hold_until_epoch_ms)
+                .map(|hold_until| hold_until > now_epoch_ms())
+                .unwrap_or(false)
+            {
+                continue;
+            }
 
             if let Some(required_class) = &job.compute_class {
                 if runner.compute_class != *required_class {
@@ -907,6 +1085,13 @@ impl GumStore for MemoryStore {
             .cloned()
             .ok_or_else(|| "job not found".to_string())?;
         let provider_slug = provider_slug_from_job(&job)?;
+        Self::apply_function_signal_locked(
+            &mut state,
+            &job.id,
+            params.failure_class.as_deref(),
+            params.status,
+            now_epoch_ms,
+        );
 
         if let Some(provider_slug) = provider_slug.as_deref() {
             if params.status == AttemptStatus::Succeeded {
@@ -928,9 +1113,7 @@ impl GumStore for MemoryStore {
             }
         }
 
-        let provider_health = provider_slug
-            .as_deref()
-            .and_then(|slug| Self::provider_health_by_slug(&state, slug));
+        let function_health = Self::function_health_for_job(&state, &job.id);
 
         let disposition = compute_retry_disposition(
             &run_snapshot.id,
@@ -939,8 +1122,7 @@ impl GumStore for MemoryStore {
             params.status,
             params.failure_reason.clone(),
             params.failure_class.clone(),
-            provider_slug.as_deref(),
-            provider_health.as_ref().map(|record| record.state),
+            function_health.as_ref(),
             now_epoch_ms,
         );
 
@@ -958,7 +1140,7 @@ impl GumStore for MemoryStore {
                 run.failure_reason = disposition.failure_reason;
                 run.failure_class = disposition.failure_class;
                 run.retry_after_epoch_ms = disposition.retry_after_epoch_ms;
-                run.waiting_for_provider_slug = disposition.waiting_for_provider_slug;
+                run.waiting_for_provider_slug = disposition.waiting_for_scope_key;
             }
         }
 

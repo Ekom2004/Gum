@@ -1,5 +1,6 @@
-use gum_store::models::LogRecord;
-use gum_store::models::ProviderHealthState;
+use std::collections::HashMap;
+
+use gum_store::models::{ConcurrencyStatusRecord, LogRecord, ProviderHealthState, RunRecord};
 use gum_store::queries::{
     CancelRunParams, CompleteAttemptParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams,
     LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams, RegisterRunnerParams,
@@ -8,8 +9,9 @@ use gum_store::queries::{
 use gum_types::AttemptStatus;
 
 use crate::routes::{
-    AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
-    LeaseRunResponse, LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
+    AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, ConcurrencyListResponse,
+    ConcurrencyStatusResponse, EnqueueRunRequest, LeaseRunRequest, LeaseRunResponse,
+    LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
     ProviderHealthListResponse, ProviderHealthResponse, RegisterDeployRequest,
     RegisterDeployResponse, RegisterRunnerRequest, ReplayRunResponse, RunResponse,
     RunnerHeartbeatRequest, RunnerStatusResponse, RunnersListResponse, RunsListResponse,
@@ -66,11 +68,15 @@ pub fn enqueue_run<S: GumStore>(
         deploy_id: job.deploy_id,
         input_json: request.input,
     })?;
-    Ok(run_response(run))
+    let concurrency = concurrency_status_map(store)?;
+    Ok(run_response(run, concurrency.get(job_id)))
 }
 
 pub fn get_run<S: GumStore>(store: &S, run_id: &str) -> Result<Option<RunResponse>, String> {
-    Ok(store.get_run(run_id)?.map(run_response))
+    let concurrency = concurrency_status_map(store)?;
+    Ok(store
+        .get_run(run_id)?
+        .map(|run| run_response(run.clone(), concurrency.get(&run.job_id))))
 }
 
 pub fn replay_run<S: GumStore>(store: &S, run_id: &str) -> Result<ReplayRunResponse, String> {
@@ -101,11 +107,12 @@ pub fn get_logs<S: GumStore>(store: &S, run_id: &str) -> Result<Vec<LogLine>, St
 }
 
 pub fn list_runs<S: GumStore>(store: &S, limit: usize) -> Result<RunsListResponse, String> {
+    let concurrency = concurrency_status_map(store)?;
     Ok(RunsListResponse {
         runs: store
             .list_recent_runs(limit)?
             .into_iter()
-            .map(run_response)
+            .map(|run| run_response(run.clone(), concurrency.get(&run.job_id)))
             .collect(),
     })
 }
@@ -143,6 +150,24 @@ pub fn list_leases<S: GumStore>(store: &S) -> Result<LeasesListResponse, String>
     })
 }
 
+pub fn list_concurrency<S: GumStore>(store: &S) -> Result<ConcurrencyListResponse, String> {
+    Ok(ConcurrencyListResponse {
+        concurrency: store
+            .list_concurrency_status()?
+            .into_iter()
+            .map(|status| ConcurrencyStatusResponse {
+                job_id: status.job_id,
+                job_name: status.job_name,
+                concurrency_limit: status.concurrency_limit,
+                active_count: status.active_run_ids.len() as u32,
+                queued_count: status.queued_run_ids.len() as u32,
+                active_run_ids: status.active_run_ids,
+                queued_run_ids: status.queued_run_ids,
+            })
+            .collect(),
+    })
+}
+
 pub fn list_provider_health<S: GumStore>(store: &S) -> Result<ProviderHealthListResponse, String> {
     Ok(ProviderHealthListResponse {
         providers: store
@@ -168,10 +193,11 @@ pub fn tick_schedules<S: GumStore>(
     store: &S,
     now_epoch_ms: i64,
 ) -> Result<Vec<RunResponse>, String> {
+    let concurrency = concurrency_status_map(store)?;
     Ok(store
         .tick_schedules(now_epoch_ms)?
         .into_iter()
-        .map(run_response)
+        .map(|run| run_response(run.clone(), concurrency.get(&run.job_id)))
         .collect())
 }
 
@@ -263,7 +289,8 @@ pub fn complete_attempt<S: GumStore>(
         failure_reason: request.failure_reason,
         failure_class: request.failure_class,
     })?;
-    Ok(run_response(run))
+    let concurrency = concurrency_status_map(store)?;
+    Ok(run_response(run.clone(), concurrency.get(&run.job_id)))
 }
 
 pub fn append_log<S: GumStore>(
@@ -294,10 +321,12 @@ pub fn cancel_run<S: GumStore>(
         run_id: run_id.to_string(),
         requested_at_epoch_ms: now_epoch_ms(),
     })?;
-    Ok(run_response(run))
+    let concurrency = concurrency_status_map(store)?;
+    Ok(run_response(run.clone(), concurrency.get(&run.job_id)))
 }
 
-fn run_response(run: gum_store::models::RunRecord) -> RunResponse {
+fn run_response(run: RunRecord, concurrency: Option<&ConcurrencyStatusRecord>) -> RunResponse {
+    let waiting_reason = derive_waiting_reason(&run, concurrency);
     RunResponse {
         id: run.id,
         job_id: run.job_id,
@@ -306,9 +335,40 @@ fn run_response(run: gum_store::models::RunRecord) -> RunResponse {
         failure_reason: run.failure_reason,
         failure_class: run.failure_class,
         retry_after_epoch_ms: run.retry_after_epoch_ms,
+        waiting_reason,
         waiting_for_provider_slug: run.waiting_for_provider_slug,
         replay_of: run.replay_of_run_id,
     }
+}
+
+fn concurrency_status_map<S: GumStore>(
+    store: &S,
+) -> Result<HashMap<String, ConcurrencyStatusRecord>, String> {
+    Ok(store
+        .list_concurrency_status()?
+        .into_iter()
+        .map(|status| (status.job_id.clone(), status))
+        .collect())
+}
+
+fn derive_waiting_reason(
+    run: &RunRecord,
+    concurrency: Option<&ConcurrencyStatusRecord>,
+) -> Option<String> {
+    if run.status != gum_types::RunStatus::Queued {
+        return None;
+    }
+    if run.failure_class.as_deref() == Some("blocked_by_downstream") {
+        return Some("waiting_for_function_health".to_string());
+    }
+    if run.retry_after_epoch_ms.is_some() {
+        return None;
+    }
+    let concurrency = concurrency?;
+    if concurrency.active_run_ids.len() as u32 >= concurrency.concurrency_limit {
+        return Some("waiting_on_concurrency".to_string());
+    }
+    None
 }
 
 fn provider_health_state_to_str(state: ProviderHealthState) -> &'static str {
