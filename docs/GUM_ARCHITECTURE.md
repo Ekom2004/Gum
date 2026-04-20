@@ -299,10 +299,10 @@ Timeout must be a hard kill, not just a status update.
 
 ## Concurrency Semantics
 
-V1 concurrency is per job.
+V1 concurrency is per function.
 
 Meaning:
-- at most `N` attempts for that job may be actively running at once
+- at most `N` attempts for that function may be actively running at once
 
 If the limit is reached:
 - further runs remain queued
@@ -311,13 +311,15 @@ Per-key concurrency is out of scope for v1.
 
 ## Rate Limit Semantics
 
-V1 rate limits are per job.
+V1 rate limits are per function or shared pool.
 
-Example:
+Examples:
 - `20/m`
+- `openai_limit = gum.rate_limit("60/m")`
 
 Meaning:
-- that job may start at most 20 runs per minute
+- a function may start at most 20 runs per minute
+- functions sharing the same rate-limit pool share one budget
 
 If the rate limit is exhausted:
 - the run remains queued
@@ -382,7 +384,6 @@ Out of scope for this architecture:
 - workflows
 - step graphs
 - waits as a first-class execution primitive
-- shared rate-limit pools
 - per-key concurrency
 - multi-language execution
 - advanced artifact/output systems

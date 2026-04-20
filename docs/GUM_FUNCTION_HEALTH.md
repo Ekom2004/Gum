@@ -429,7 +429,6 @@ The public knobs remain:
 - `rate_limit`
 - `concurrency`
 - `every`
-- `compute`
 - `key`
 
 Health-aware retry preservation should be Gum behavior, not user ceremony.

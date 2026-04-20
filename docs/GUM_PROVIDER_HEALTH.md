@@ -1,6 +1,8 @@
 # Gum Provider Health
 
-This document defines how Gum should detect downstream provider health and how that health should influence execution.
+This document defines how Gum should detect downstream provider health and expose better operator visibility.
+
+Function health is the default retry-protection model. Provider health is an internal signal layer that can improve messaging now and support shared/provider-wide behavior later.
 
 The goal is simple:
 
@@ -8,7 +10,7 @@ The goal is simple:
 - know when it is likely degraded
 - know when it is likely down
 - explain that state clearly to operators and users
-- avoid burning retries blindly when a dependency is unhealthy
+- avoid burning retries blindly when Gum has enough confidence to hold safely
 
 This is an internal Gum capability.
 
@@ -39,6 +41,8 @@ then it can still waste:
 - operator attention
 
 Provider health gives Gum a way to reason about downstream systems as first-class dependencies.
+
+In v1, it should not replace function health as the default retry gate.
 
 ## Design Principles
 
@@ -392,10 +396,11 @@ Phase 1:
 
 - provider health does not change retry counts
 - provider health improves messaging and operator visibility
+- function health remains the default retry-hold decision
 
 Phase 2:
 
-- if provider is `down`, Gum may preserve retries instead of spending them immediately
+- if a shared/provider scope is explicitly available, Gum may preserve retries instead of spending them immediately
 - runs remain queued
 - Gum retries again after provider recovery or probe success
 

@@ -5,7 +5,7 @@ import gum
 
 openai_limit = gum.rate_limit("60/m")
 
-@gum.job(retries=5, timeout="5m", rate_limit=openai_limit, concurrency=5)
+@gum.job(retries=5, timeout="5m", rate_limit=openai_limit, concurrency=5, key="customer_id")
 def sync_customer(customer_id: str):
     ...
 

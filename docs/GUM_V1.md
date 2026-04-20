@@ -44,6 +44,7 @@ Gum v1 supports these policy fields:
 - `timeout`
 - `rate_limit`
 - `concurrency`
+- `key`
 
 Gum v1 owns:
 - deploys
@@ -51,8 +52,9 @@ Gum v1 owns:
 - run dispatch
 - retries
 - timeout enforcement
-- per-job rate limits
-- per-job concurrency limits
+- per-function and shared-pool rate limits
+- per-function concurrency limits
+- enqueue-time duplicate protection
 - logs
 - replay
 - managed execution
@@ -83,9 +85,7 @@ Scheduled jobs matter for the homepage and product story, but enqueue is the fir
 These are explicitly out of scope for v1:
 - workflow steps
 - waits and long-lived orchestration
-- shared rate-limit pools
 - per-key concurrency
-- dedupe
 - budgets
 - TypeScript-first SDK work
 - visual builders
@@ -114,7 +114,9 @@ def send_followup():
 ```python
 import gum
 
-@gum.job(retries=5, timeout="5m", rate_limit="20/m", concurrency=5)
+salesforce_limit = gum.rate_limit("20/m")
+
+@gum.job(retries=5, timeout="5m", rate_limit=salesforce_limit, concurrency=5, key="customer_id")
 def sync_customer(customer_id: str):
     ...
 

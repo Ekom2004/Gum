@@ -2,8 +2,8 @@
 
 Deploy production functions on Gum.
 
-Gum is a managed execution platform for production functions. The first version
-is focused on Python execution with:
+Gum is a managed runtime for background jobs. The first version is focused on
+Python execution with:
 
 - enqueue
 - schedules
@@ -11,6 +11,7 @@ is focused on Python execution with:
 - timeouts
 - rate limits
 - concurrency
+- deduplication keys
 - logs
 - replay
 

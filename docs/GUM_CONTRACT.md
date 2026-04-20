@@ -57,24 +57,20 @@ Optional fields:
 - `every`
 - `retries`
 - `timeout`
-- `rateLimit`
+- `rate_limit`
 - `concurrency`
+- `key`
 
-Canonical TypeScript shape:
+Canonical Python shape:
 
-```ts
-const syncCustomer = job("sync-customer", {
-  input: z.object({
-    customerId: z.string(),
-  }),
-  retries: 8,
-  timeout: "15m",
-  rateLimit: "salesforce:20/m",
-  concurrency: 5,
-  run: async ({ customerId }) => {
-    await salesforce.upsertCustomer(customerId);
-  },
-});
+```python
+import gum
+
+salesforce_limit = gum.rate_limit("20/m")
+
+@gum.job(retries=8, timeout="15m", rate_limit=salesforce_limit, concurrency=5)
+def sync_customer(customer_id: str):
+    salesforce.upsert_customer(customer_id)
 ```
 
 ### Run
@@ -118,15 +114,10 @@ Gum creates runs automatically from `every`.
 
 Example:
 
-```ts
-const nightlySync = job("nightly-sync", {
-  every: "1d",
-  retries: 5,
-  timeout: "10m",
-  run: async () => {
-    await syncEverything();
-  },
-});
+```python
+@gum.job(every="1d", retries=5, timeout="10m")
+def nightly_sync():
+    sync_everything()
 ```
 
 ### Enqueued
@@ -135,10 +126,8 @@ Application code explicitly requests a run.
 
 Example:
 
-```ts
-await syncCustomer.enqueue({
-  customerId: "cus_123",
-});
+```python
+sync_customer.enqueue(customer_id="cus_123")
 ```
 
 ## Job Definition Contract
@@ -152,7 +141,8 @@ Stable job identifier within a project.
 Optional input schema.
 
 v1 recommendation:
-- `zod` in TypeScript
+- Python type hints first
+- optional Pydantic-style validation later if we need stricter payload contracts
 
 If present:
 - enqueue payloads must validate against it
@@ -177,7 +167,7 @@ v1:
 Maximum retry attempts after the first run.
 
 Example:
-- `retries: 4`
+- `retries=4`
 - total possible attempts = `1 initial + 4 retries`
 
 ### `timeout`
@@ -189,7 +179,7 @@ If exceeded:
 - the run becomes `timed_out`
 - retry policy is evaluated
 
-### `rateLimit`
+### `rate_limit`
 
 Maximum run starts allowed in a time window.
 
@@ -197,24 +187,36 @@ Two forms are supported:
 
 #### Per-job
 
-```ts
-rateLimit: "20/m"
+```python
+@gum.job(rate_limit="20/m")
+def sync_customer(...):
+    ...
 ```
 
 Meaning:
-- this job cannot start more than 20 runs per minute
+- this function cannot start more than 20 runs per minute
 
 #### Shared pool
 
-```ts
-rateLimit: "openai:60/m"
+```python
+openai_limit = gum.rate_limit("60/m")
+
+@gum.job(rate_limit=openai_limit)
+def summarize(...):
+    ...
+
+@gum.job(rate_limit=openai_limit)
+def embed(...):
+    ...
 ```
 
 Meaning:
-- all jobs in the same project using pool `openai` share one 60/min budget
+- all jobs in the same project using `openai_limit` share one 60/min budget
 
 Shared pools are:
-- project-scoped in v1.1
+- project-scoped
+- inferred from module-level `gum.rate_limit(...)` binding names in the Python SDK
+- rejected if the same pool name has conflicting definitions
 
 ### `concurrency`
 
@@ -222,16 +224,35 @@ Maximum simultaneous active runs for this job.
 
 Example:
 
-```ts
-concurrency: 5
+```python
+@gum.job(concurrency=5)
+def sync_customer(...):
+    ...
 ```
 
 Meaning:
-- no more than 5 runs of this job may be active at once
+- no more than 5 runs of this function may be active at once
 
 v1:
-- concurrency is per job
+- concurrency is per function
 - per-key concurrency is out of scope
+
+### `key`
+
+Field name used for enqueue-time duplicate protection.
+
+Example:
+
+```python
+@gum.job(key="event_id")
+def process_webhook(event_id: str, event: dict):
+    ...
+```
+
+Meaning:
+- a duplicate enqueue with the same `event_id` returns the existing run
+- retries stay inside the same keyed run
+- replay intentionally bypasses dedupe and creates new work
 
 ## Run Status Contract
 
@@ -283,12 +304,12 @@ Backfill is bulk enqueue for a single job.
 
 Canonical shape:
 
-```ts
-await syncCustomer.backfill([
-  { customerId: "cus_1" },
-  { customerId: "cus_2" },
-  { customerId: "cus_3" },
-]);
+```python
+sync_customer.backfill([
+    {"customer_id": "cus_1"},
+    {"customer_id": "cus_2"},
+    {"customer_id": "cus_3"},
+])
 ```
 
 Semantics:
@@ -312,17 +333,10 @@ Minimum v1 behavior:
 
 ## SDK Contract
 
-The v1 SDK surface should stay small.
+The v1 SDK surface should stay small and Python-first:
 
-TypeScript:
-- `job(...)`
-- `job.enqueue(...)`
-- `job.backfill(...)`
-- `gum.runs.get(...)`
-- `gum.runs.replay(...)`
-
-Python:
 - `@gum.job(...)`
+- `gum.rate_limit(...)`
 - `job.enqueue(...)`
 - `job.backfill(...)`
 - `gum.runs.get(...)`
@@ -337,15 +351,15 @@ Support:
 - enqueued jobs
 - retries
 - timeout
-- per-job rate limits
-- per-job concurrency
+- per-function and shared-pool rate limits
+- per-function concurrency
+- enqueue-time duplicate protection with `key`
 - logs
 - replay one run
 
 ### v1.1
 
 Add:
-- shared rate-limit pools
 - bulk backfill as a first-class UX
 - replay failed subset
 
@@ -355,7 +369,6 @@ Out of scope for v1:
 - DAGs
 - step workflows
 - agent orchestration
-- dedupe as a primary product feature
 - budget accounting
 - per-key concurrency
 - cross-job fairness scheduling
@@ -370,4 +383,3 @@ If a feature makes Gum feel like:
 do not add it to v1.
 
 If a feature makes a job definition feel like a stronger operational contract, it is a better fit.
-

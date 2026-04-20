@@ -1,128 +1,132 @@
 # Gum Knob Design
 
-This document defines how Gum should think about public knobs.
+This document defines Gum's public job configuration surface.
 
 The goal is:
 
-- expose only what users really understand and need
-- keep advanced protective behavior inside Gum
-- avoid flat, unstructured configuration growth
+- expose only decisions users understand
+- keep protective runtime behavior built into Gum
+- avoid flat configuration growth
 
 ## Core Principle
 
 Every exposed knob must answer:
 
-- what problem does the user recognize?
-- what decision are they actually qualified to make?
-- is this a stable contract Gum can support long-term?
+- what user problem does this solve?
+- can the user set it correctly without understanding Gum internals?
+- does it compose cleanly with the other knobs?
+- is it a contract Gum should support long-term?
 
-If the answer is weak, the behavior should stay internal.
+If the answer is weak, the behavior stays internal.
 
-## Types of Controls
+## Public Job Knobs
 
-### 1. User policy knobs
+The beta public surface is:
 
-These belong in the public API because users understand the intent.
+```python
+@gum.job(
+    retries=...,
+    timeout=...,
+    rate_limit=...,
+    concurrency=...,
+    every=...,
+    key=...,
+)
+def work(...):
+    ...
+```
 
-Examples:
-
-- `retries`
-- `timeout`
-- `rate_limit`
-- `concurrency`
-- `every`
-- `compute`
-- `key`
-
-### 2. Internal system behaviors
-
-These should generally stay inside Gum.
-
-Examples:
-
-- provider health inference
-- outage guards
-- probe cadence
-- circuit open/close logic
-- retry preservation when a provider is down
-- stale-runner recovery rules
-
-## Current Public Knobs
+These are the only job-level knobs users should see in public docs.
 
 ### `retries`
 
 User intent:
 
-- how many times Gum should retry after failure
+- how many additional attempts Gum may spend after the first attempt fails
 
-Why exposed:
+Contract:
 
-- clear and expected
+- retries stay inside the same `run_id`
+- each retry creates a new `attempt_id`
+- Gum owns backoff, jitter, and health-aware retry timing internally
 
 ### `timeout`
 
 User intent:
 
-- how long this work is allowed to run
+- how long one execution attempt is allowed to run
 
-Why exposed:
+Contract:
 
-- tied directly to workload shape
+- timeout is per attempt, not per logical run
+- a timed-out attempt may retry if budget remains
+- stale or expired runners cannot commit completion after ownership is lost
 
 ### `rate_limit`
 
 User intent:
 
-- do not exceed this provider or job throughput budget
+- limit how quickly a function or shared external dependency is called
 
-Why exposed:
+Per-function form:
 
-- common operational concern
+```python
+@gum.job(rate_limit="20/m")
+def sync_customer(...):
+    ...
+```
+
+Shared-pool form:
+
+```python
+openai_limit = gum.rate_limit("60/m")
+
+@gum.job(rate_limit=openai_limit)
+def summarize(...):
+    ...
+
+@gum.job(rate_limit=openai_limit)
+def embed(...):
+    ...
+```
+
+Contract:
+
+- inline strings are function-scoped by default
+- module-level `gum.rate_limit("60/m")` definitions infer the pool name from the binding, e.g. `openai_limit`
+- jobs using the same pool share one budget
+- conflicting definitions for the same pool are rejected
 
 ### `concurrency`
 
 User intent:
 
-- bound parallel execution for this job
+- bound how many executions of one function may run simultaneously
 
-Why exposed:
+Contract:
 
-- resource and ordering concern users understand
+- concurrency is per function
+- active usage is derived from durable running attempts, not an in-memory counter
+- queued runs can wait on `waiting_on_concurrency`
+- retries compete for slots like normal work
 
 ### `every`
 
 User intent:
 
-- run this on a schedule
+- run this function repeatedly on an interval
 
-Why exposed:
+Contract:
 
-- directly describes trigger semantics
-
-### `compute`
-
-User intent:
-
-- choose the compute class this work needs
-
-Why exposed:
-
-- workload size and cost decision
+- scheduled ticks create normal Gum runs
+- scheduled runs use the same retries, timeout, rate limit, concurrency, key, logs, cancel, and replay behavior
+- `concurrency=1` naturally prevents overlapping scheduled runs
 
 ### `key`
 
 User intent:
 
-- define duplicate identity for this work
-
-Why exposed:
-
-- duplicate delivery is a real application concern
-- users often know the stable external id
-
-## Planned Public Knob: `key`
-
-Use `key` for duplicate protection.
+- define duplicate identity for enqueue-time duplicate protection
 
 Example:
 
@@ -132,129 +136,98 @@ def process_stripe_webhook(event_id: str, event: dict):
     ...
 ```
 
-Meaning:
+Contract:
 
-- Gum treats `event_id` as duplicate identity
-- repeated enqueue of the same identity should not produce duplicate work
+- same function plus same resolved key returns the existing run
+- different functions do not collide
+- retries stay inside the same keyed run
+- replay bypasses dedupe and intentionally creates new work
+- canceled keyed runs keep their key claim until retention expiry
 
-Why not `unique=True`:
+## Internal System Behavior
 
-- too vague
-- unclear identity source
-- too much hidden magic
+These are intentionally not public knobs:
 
-## What Should Stay Internal
-
-### Provider outage handling
-
-Keep internal:
-
-- provider health checks
-- degraded/down inference
-- outage-aware retry preservation
-- probe-based recovery
-
-Users should not need:
-
-- `circuit_breaker=True`
-
-### Retry preservation timing
-
-Keep internal:
-
-- whether Gum should spend the next retry now or wait
-
-Users care about:
-
-- retry budget
-
-They do not need:
-
-- fine-grained retry spend timing knobs
-
-### Recovery logic
-
-Keep internal:
-
-- lease expiry rules
+- function health
+- provider health
+- circuit breakers / outage guards
+- retry preservation timing
+- probe cadence
+- lease expiry
 - stale-runner fencing
-- control lease timing
+- runner recovery
+- internal execution context
+- compute placement
 
-## Knob Interaction Principles
+Users should experience these as Gum being reliable, not as knobs they must configure.
+
+## Interaction Rules
 
 Knobs must not behave as isolated flat flags.
 
-They need clear interaction rules.
+### `retries` x `timeout`
 
-### `retries` × provider health
+- timeout fails one attempt
+- retry may create a later attempt on the same run
+- timeout does not fork run identity
 
-Rule:
+### `retries` x function health
 
-- `retries` is the user budget
-- provider health may affect when retries are spent
-- provider health should not silently reduce the total retry budget
+- retries are the user budget
+- function health may delay when a retry is spent
+- function health must not silently reduce the total retry budget
 
-### `rate_limit` × provider health
+### `rate_limit` x `concurrency`
 
-Rule:
+- concurrency is checked before rate-limit budget is spent
+- work that cannot acquire a slot should not consume rate-limit capacity
 
-- rate limit controls throughput
-- provider health controls whether downstream is usable at all
-- these are separate dimensions
+### `key` x `retries`
 
-### `concurrency` × `compute`
+- retries stay inside the same run
+- no new dedupe record is created for retry attempts
 
-Rule:
+### `key` x `rate_limit`
 
-- `compute` chooses machine class
-- `concurrency` chooses parallelism on that work
-- Gum should enforce both
+- duplicate enqueue returns the existing run
+- duplicate enqueue does not spend extra rate-limit budget
 
-### `key` × `replay`
+### `key` x `concurrency`
 
-Rule:
+- duplicate enqueue returns the existing run
+- duplicate enqueue creates no extra slot pressure
 
-- replay should not be accidentally blocked by duplicate protection
-- replay semantics should be explicit
+### `key` x `replay`
 
-This will need a dedicated contract later.
+- replay bypasses dedupe
+- replay creates new work intentionally
+
+### `every` x `concurrency`
+
+- `concurrency=1` provides no-overlap scheduled execution
+- later scheduled ticks wait behind active work instead of creating parallel overlap
 
 ## Rule For Adding New Knobs
 
 Before adding a knob, ask:
 
-1. Is this a user decision or Gum’s internal decision?
-2. Can the user explain it in plain language?
+1. Is this truly a user decision?
+2. Can users explain it in plain language?
 3. Will most users set it correctly?
 4. Does it compose cleanly with existing knobs?
-5. Is there a simpler internal default instead?
+5. Can Gum make this built in instead?
 
 If the answer is weak, do not add the knob.
 
-## Near-Term Public Surface
+## Summary
 
-Public user surface should stay close to:
+Gum exposes a small public policy surface:
 
 - `retries`
 - `timeout`
 - `rate_limit`
 - `concurrency`
 - `every`
-- `compute`
 - `key`
 
-Everything else should be heavily questioned.
-
-## Summary
-
-Gum should expose a small set of meaningful policy knobs and keep smarter reliability behavior internal.
-
-That gives users:
-
-- enough control
-- clear intent
-
-And it gives Gum:
-
-- room to be opinionated
-- room to improve system behavior without inflating the API
+Everything else is internal runtime behavior.

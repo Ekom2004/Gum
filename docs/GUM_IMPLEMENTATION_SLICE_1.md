@@ -24,12 +24,13 @@ Slice 1 includes:
 - runner execution
 - timeout enforcement
 - retry handling
+- shared rate-limit pools
+- enqueue-time duplicate protection
 - log retrieval
 - replay
 
 Slice 1 does not include:
 - scheduler
-- shared rate-limit pools
 - backfill
 - TypeScript SDK
 - dashboard work
@@ -64,7 +65,7 @@ Dispatch logic for:
 - selecting eligible queued runs
 - creating leases
 - expiring lost leases
-- applying per-job concurrency and rate-limit checks
+- applying per-function concurrency and rate-limit checks
 
 ### `gum-runner`
 
@@ -129,7 +130,9 @@ The first runner loop is:
 ```python
 import gum
 
-@gum.job(retries=5, timeout="5m", rate_limit="20/m", concurrency=5)
+salesforce_limit = gum.rate_limit("20/m")
+
+@gum.job(retries=5, timeout="5m", rate_limit=salesforce_limit, concurrency=5, key="customer_id")
 def sync_customer(customer_id: str):
     ...
 
@@ -143,7 +146,6 @@ If Gum can make this example real end to end, slice 1 is successful.
 Defer until after slice 1:
 - `every` scheduling runtime
 - backfill
-- shared rate-limit pools
 - per-key concurrency
 - long-lived orchestration
 - artifacts/output management

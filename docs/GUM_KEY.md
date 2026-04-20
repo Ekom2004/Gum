@@ -153,7 +153,9 @@ If a keyed run is held for health:
 
 ### `key + provider health`
 
-Provider-aware retry preservation also applies to the same keyed run.
+Provider health is an internal signal layer, not a key-scoping rule.
+
+If Gum later uses provider health to hold work, that hold must still apply to the same keyed run.
 
 Health-aware holding must never create replacement work for the same key.
 
