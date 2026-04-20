@@ -89,6 +89,7 @@ def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
                     module_path=module_path,
                 )
             )
+    _validate_rate_limit_pools(jobs)
     return jobs
 
 
@@ -201,13 +202,18 @@ def _collect_module_bindings(tree: ast.Module) -> _ModuleBindings:
         if not isinstance(target, ast.Name):
             continue
         try:
-            values[target.id] = _literal_value(node.value, bindings)
+            values[target.id] = _literal_value(node.value, bindings, binding_name=target.id)
         except Exception:
             continue
     return bindings
 
 
-def _literal_value(node: ast.AST, bindings: _ModuleBindings):
+def _literal_value(
+    node: ast.AST,
+    bindings: _ModuleBindings,
+    *,
+    binding_name: str | None = None,
+):
     if isinstance(node, ast.Name):
         if node.id in bindings.values:
             return bindings.values[node.id]
@@ -222,7 +228,10 @@ def _literal_value(node: ast.AST, bindings: _ModuleBindings):
         if is_rate_limit_call:
             if len(node.args) != 1 or node.keywords:
                 raise ValueError("rate_limit() expects exactly one positional spec")
-            return str(_literal_value(node.args[0], bindings))
+            spec = str(_literal_value(node.args[0], bindings))
+            if ":" in spec or binding_name is None:
+                return spec
+            return f"{binding_name}:{spec}"
     return ast.literal_eval(node)
 
 
@@ -246,3 +255,29 @@ def _parse_timeout_secs(raw: str) -> int:
     if multiplier is None:
         raise DeployError(f"unsupported timeout value: {raw}")
     return value * multiplier
+
+
+def _validate_rate_limit_pools(jobs: list[DiscoveredJob]) -> None:
+    pools: dict[str, str] = {}
+    for job in jobs:
+        if job.rate_limit_spec is None:
+            continue
+        pool_name = _rate_limit_pool_name(job.rate_limit_spec)
+        if pool_name is None:
+            continue
+        existing = pools.get(pool_name)
+        if existing is not None and existing != job.rate_limit_spec:
+            raise DeployError(
+                f'rate limit pool "{pool_name}" has conflicting definitions: '
+                f"{existing} and {job.rate_limit_spec}"
+            )
+        pools[pool_name] = job.rate_limit_spec
+
+
+def _rate_limit_pool_name(spec: str) -> str | None:
+    if ":" not in spec:
+        return None
+    pool_name, _quota = spec.rsplit(":", 1)
+    if not pool_name:
+        raise DeployError(f"rate limit pool must not be empty: {spec}")
+    return pool_name

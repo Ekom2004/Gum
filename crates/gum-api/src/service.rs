@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use gum_store::models::{ConcurrencyStatusRecord, LogRecord, ProviderHealthState, RunRecord};
 use gum_store::queries::{
-    CancelRunParams, CompleteAttemptParams, EnqueueRunParams, GumStore, HeartbeatRunnerParams,
-    LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams, RegisterRunnerParams,
-    ReplayRunParams,
+    parse_rate_limit_spec, CancelRunParams, CompleteAttemptParams, EnqueueRunParams, GumStore,
+    HeartbeatRunnerParams, LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams,
+    RegisterRunnerParams, ReplayRunParams,
 };
 use gum_types::AttemptStatus;
 use serde_json::Value;
@@ -23,6 +23,7 @@ pub fn register_deploy<S: GumStore>(
     store: &S,
     request: RegisterDeployRequest,
 ) -> Result<RegisterDeployResponse, String> {
+    validate_rate_limit_pools(&request.jobs)?;
     let params = RegisterDeployParams {
         project_id: request.project_id,
         version: request.version,
@@ -422,6 +423,29 @@ fn rate_limit_waiting_run_ids<S: GumStore>(store: &S) -> Result<HashSet<String>,
         .into_iter()
         .flat_map(|status| status.waiting_run_ids.into_iter())
         .collect())
+}
+
+fn validate_rate_limit_pools(jobs: &[crate::routes::RegisteredJob]) -> Result<(), String> {
+    let mut pools: HashMap<String, String> = HashMap::new();
+    for job in jobs {
+        let Some(raw_spec) = job.rate_limit_spec.as_deref() else {
+            continue;
+        };
+        let spec = parse_rate_limit_spec(raw_spec)?;
+        let Some(pool_name) = spec.pool else {
+            continue;
+        };
+        if let Some(existing) = pools.get(&pool_name) {
+            if existing != raw_spec {
+                return Err(format!(
+                    "rate limit pool \"{pool_name}\" has conflicting definitions: {existing} and {raw_spec}"
+                ));
+            }
+            continue;
+        }
+        pools.insert(pool_name, raw_spec.to_string());
+    }
+    Ok(())
 }
 
 fn derive_waiting_reason(

@@ -29,7 +29,7 @@ class _FakeClient:
 
 class GumJobTests(unittest.TestCase):
     def test_decorator_wraps_function_and_exposes_policy(self) -> None:
-        resend_limit = gum.rate_limit("resend:500/h")
+        resend_limit = gum.rate_limit("500/h")
 
         @gum.job(
             every="20d",
@@ -49,7 +49,7 @@ class GumJobTests(unittest.TestCase):
         self.assertEqual(send_followup.policy.every, "20d")
         self.assertEqual(send_followup.policy.retries, 5)
         self.assertEqual(send_followup.policy.timeout, "5m")
-        self.assertEqual(send_followup.policy.rate_limit, "resend:500/h")
+        self.assertEqual(send_followup.policy.rate_limit, "500/h")
         self.assertEqual(send_followup.policy.concurrency, 20)
         self.assertEqual(send_followup.policy.key, "event_id")
 

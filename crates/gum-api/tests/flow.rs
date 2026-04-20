@@ -724,6 +724,65 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
 }
 
 #[test]
+fn conflicting_shared_rate_limit_pool_definitions_are_rejected() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    let error = service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![
+                RegisteredJob {
+                    id: "job_summarize".to_string(),
+                    name: "summarize".to_string(),
+                    handler_ref: "jobs:summarize".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 0,
+                    timeout_secs: 300,
+                    rate_limit_spec: Some("openai:60/m".to_string()),
+                    concurrency_limit: None,
+                    key_field: None,
+                    compute_class: None,
+                },
+                RegisteredJob {
+                    id: "job_embed".to_string(),
+                    name: "embed".to_string(),
+                    handler_ref: "jobs:embed".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    schedule_expr: None,
+                    retries: 0,
+                    timeout_secs: 300,
+                    rate_limit_spec: Some("openai:100/m".to_string()),
+                    concurrency_limit: None,
+                    key_field: None,
+                    compute_class: None,
+                },
+            ],
+        },
+    )
+    .expect_err("conflicting pool definitions should fail");
+
+    assert_eq!(
+        error,
+        "rate limit pool \"openai\" has conflicting definitions: openai:60/m and openai:100/m"
+    );
+}
+
+#[test]
 fn canceling_a_queued_run_marks_it_canceled() {
     let store = MemoryStore::default();
     store
