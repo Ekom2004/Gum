@@ -20,7 +20,7 @@ export default function BookDemoPage() {
           <div className="mb-6 inline-flex items-center gap-2 border border-zinc-800 bg-zinc-900/80 px-3 py-1 text-xs text-zinc-400">
             Get a Demo
           </div>
-          <h1 className="font-[family:var(--font-heading)] text-5xl font-bold leading-tight tracking-tight text-white md:text-7xl">
+          <h1 className="gum-display text-5xl font-bold leading-tight tracking-tight text-white md:text-7xl">
             Bring a real media workload.
           </h1>
           <p className="mt-6 max-w-2xl text-lg leading-relaxed text-zinc-400 md:text-xl">

@@ -11,7 +11,7 @@ export default function DocsPage() {
           <span className="block text-[11px] font-medium uppercase tracking-[0.22em] text-zinc-500">
             Docs
           </span>
-          <h1 className="mt-4 font-[family:var(--font-heading)] text-5xl font-bold leading-[0.96] tracking-tight text-white md:text-7xl">
+          <h1 className="gum-display mt-4 text-5xl font-bold leading-[0.96] tracking-tight text-white md:text-7xl">
             Gum Docs
           </h1>
           <p className="mt-5 max-w-2xl text-lg leading-relaxed text-zinc-400">

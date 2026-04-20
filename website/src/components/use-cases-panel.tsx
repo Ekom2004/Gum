@@ -1,7 +1,6 @@
 "use client";
 
-import { AnimatePresence, motion } from "framer-motion";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 
 type UseCase = {
   id: "exports" | "uploads" | "scheduled" | "rate_limited";
@@ -322,94 +321,76 @@ const useCases: UseCase[] = [
 ];
 
 export function UseCasesPanel() {
-  const [activeId, setActiveId] = useState<UseCase["id"]>("exports");
-  const active = useCases.find((item) => item.id === activeId) ?? useCases[0];
-  const tabRefs = useRef<Partial<Record<UseCase["id"], HTMLButtonElement | null>>>({});
-
-  useEffect(() => {
-    tabRefs.current[activeId]?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-      inline: "center",
-    });
-  }, [activeId]);
-
   return (
-    <div className="w-full max-w-[980px]">
-      <div className="relative">
-        <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-8 bg-gradient-to-r from-[#09090b] to-transparent lg:hidden" />
-        <div className="pointer-events-none absolute inset-y-0 right-0 z-10 w-8 bg-gradient-to-l from-[#09090b] to-transparent lg:hidden" />
-        <div className="gum-scrollbar-none overflow-x-auto scroll-smooth px-1 lg:overflow-visible lg:px-0">
-          <div className="flex min-w-max gap-4 border-b border-zinc-900/90 pb-4 lg:min-w-0 lg:grid lg:grid-cols-4 lg:gap-4">
-            {useCases.map((item) => {
-              const isActive = item.id === active.id;
-              return (
-                <button
-                  key={item.id}
-                  ref={(node) => {
-                    tabRefs.current[item.id] = node;
-                  }}
-                  type="button"
-                  onClick={() => setActiveId(item.id)}
-                  className={`relative snap-start whitespace-nowrap border-b pb-2 text-left text-[13px] font-medium tracking-[-0.01em] transition-colors lg:w-full ${
-                    isActive
-                      ? "border-zinc-300 text-zinc-100"
-                      : "border-transparent text-zinc-500 hover:text-zinc-300"
-                  }`}
-                >
-                  {item.tabLabel}
-                  {isActive ? (
-                    <motion.span
-                      layoutId="gum-use-case-active-line"
-                      className="absolute inset-x-0 -bottom-px h-px bg-zinc-200"
-                      transition={{ type: "spring", stiffness: 420, damping: 36 }}
-                    />
-                  ) : null}
-                </button>
-              );
-            })}
-          </div>
+    <div className="gum-use-cases grid grid-cols-1 items-stretch gap-12 lg:grid-cols-12 lg:gap-8">
+      {useCases.map((item, index) => (
+        <input
+          key={item.id}
+          id={`gum-use-case-${item.id}`}
+          name="gum-use-case"
+          type="radio"
+          className="gum-use-case-input"
+          defaultChecked={index === 0}
+        />
+      ))}
+
+      <div className="lg:col-span-5">
+        <div className="gum-use-case-menu grid h-full grid-cols-1 gap-2 lg:grid-rows-4">
+          {useCases.map((item) => (
+            <label
+              key={item.id}
+              htmlFor={`gum-use-case-${item.id}`}
+              data-use-case-tab={item.id}
+              className="flex cursor-pointer flex-col justify-center rounded-r-lg border-l-2 border-transparent px-4 py-3 text-left text-zinc-500 transition-colors hover:text-zinc-300"
+            >
+              <span className="block text-sm font-medium tracking-[-0.01em]">{item.tabLabel}</span>
+              <span className="mt-1 block max-w-md text-sm leading-relaxed text-zinc-500">
+                {item.description}
+              </span>
+            </label>
+          ))}
         </div>
       </div>
 
-      <AnimatePresence mode="wait" initial={false}>
-        <motion.div
-          key={active.id}
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -8 }}
-          transition={{ duration: 0.22, ease: "easeOut" }}
-          className="pt-5"
-        >
-          <div>
-            <p className="max-w-[42rem] text-sm leading-relaxed text-zinc-400">
-              {active.description}
-            </p>
-          </div>
-          <motion.div
-            initial={{ opacity: 0.92, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.2, ease: "easeOut", delay: 0.03 }}
-            className="gum-code-surface relative mt-5 w-full overflow-hidden rounded-sm border border-zinc-800 bg-black text-left"
-          >
-            <div className="min-h-[320px] bg-black px-4 py-5 font-mono text-[13px] leading-7 text-[#e4e4e7] md:text-sm text-left">
-              <div className="space-y-0.5">
-                {active.lines.map((line, index) => (
-                  <div
-                    key={`${active.id}-${index}`}
-                    className="gum-code-line grid grid-cols-[28px_minmax(0,1fr)] gap-3"
-                  >
-                    <span className="gum-code-gutter select-none text-right text-xs">
-                      {index + 1}
-                    </span>
-                    <div className="text-left">{line || <span>&nbsp;</span>}</div>
-                  </div>
-                ))}
+      <div className="gum-use-case-panels lg:col-span-7 lg:sticky lg:top-24">
+        <div className="gum-code-surface relative flex h-full w-full overflow-hidden rounded-xl border border-zinc-800 bg-black text-left">
+          <div className="flex min-h-full w-full flex-col">
+            <div className="flex h-10 shrink-0 items-center gap-3 border-b border-zinc-800 bg-zinc-900 px-4">
+              <div className="flex items-center gap-1.5" aria-hidden="true">
+                <span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" />
+                <span className="h-2.5 w-2.5 rounded-full bg-[#ffbd2e]" />
+                <span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" />
               </div>
+              <span className="font-mono text-xs text-zinc-500">worker.py</span>
             </div>
-          </motion.div>
-        </motion.div>
-      </AnimatePresence>
+            <div className="gum-use-case-code-stack grid flex-1 overflow-hidden">
+        {useCases.map((item) => (
+          <div
+            key={item.id}
+            data-use-case-panel={item.id}
+            className="gum-use-case-panel col-start-1 row-start-1 overflow-auto"
+          >
+              <div className="gum-code-body px-4 py-6 font-mono text-[13px] leading-7 text-zinc-200 md:px-6 md:text-sm text-left">
+                <div className="space-y-0.5">
+                  {item.lines.map((line, index) => (
+                    <div
+                      key={`${item.id}-${index}`}
+                      className="gum-code-line grid grid-cols-[28px_minmax(0,1fr)] gap-3"
+                    >
+                      <span className="gum-code-gutter select-none text-right text-xs">
+                        {index + 1}
+                      </span>
+                      <div className="text-left">{line || <span>&nbsp;</span>}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+          </div>
+        ))}
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

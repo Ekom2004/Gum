@@ -80,7 +80,7 @@ export function HeroCodePanel() {
   return (
     <div className="w-full max-w-[620px] text-left">
       <div className="gum-code-surface relative w-full overflow-hidden rounded-sm border border-zinc-800 bg-black text-left">
-        <div className="bg-black px-4 pt-5 pb-5 font-mono text-[13px] leading-7 text-[#e4e4e7] md:text-sm text-left">
+        <div className="gum-code-body px-4 pt-5 pb-5 font-mono text-[13px] leading-7 text-zinc-200 md:text-sm text-left">
           <div className="space-y-0.5">
             {lines.map((line, index) => (
               <div key={index} className="gum-code-line grid grid-cols-[28px_minmax(0,1fr)] gap-3">
