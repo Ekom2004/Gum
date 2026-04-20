@@ -66,12 +66,21 @@ async fn execute_leased_run_inner(
         .arg(payload_json)
         .arg("--run-id")
         .arg(&leased.run_id)
-        .arg("--attempt")
-        .arg("1")
+        .arg("--attempt-id")
+        .arg(&leased.attempt_id)
+        .arg("--job-id")
+        .arg(&leased.job_id)
         .current_dir(&extract_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("PYTHONPATH", python_path_value(&extract_dir, &sdk_path));
+
+    if let Some(key) = &leased.key {
+        command.arg("--key").arg(key);
+    }
+    if let Some(replay_of) = &leased.replay_of {
+        command.arg("--replay-of").arg(replay_of);
+    }
 
     let mut child = command
         .spawn()

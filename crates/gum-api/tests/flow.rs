@@ -1295,6 +1295,104 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
 }
 
 #[test]
+fn expired_lease_cannot_commit_completion_before_recovery_runs() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_export".to_string(),
+                name: "export".to_string(),
+                handler_ref: "jobs:export".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 1,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                key_field: None,
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+
+    let run = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 1,
+        },
+    )
+    .expect("lease should work")
+    .expect("run should be leased");
+
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+
+    let completion_error = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Succeeded,
+            failure_reason: None,
+            failure_class: None,
+        },
+    )
+    .expect_err("expired lease should be fenced before completion");
+    assert!(
+        completion_error.contains("lease no longer valid"),
+        "expired lease should not be able to commit late completion"
+    );
+
+    let before_recovery = service::get_run(&store, &run.id)
+        .expect("get run should work")
+        .expect("run should exist");
+    assert_eq!(before_recovery.status, RunStatus::Running);
+
+    let recovered = store
+        .recover_lost_attempts(now_epoch_ms())
+        .expect("recovery should work");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, RunStatus::Queued);
+}
+
+#[test]
 fn compute_class_and_runner_capacity_drive_placement() {
     let store = MemoryStore::default();
     store
@@ -1688,6 +1786,102 @@ fn replay_bypasses_key_dedupe() {
     let replay = service::replay_run(&store, &first.id).expect("replay should work");
     assert_ne!(replay.id, first.id);
     assert_eq!(replay.replay_of, first.id);
+}
+
+#[test]
+fn lease_run_includes_execution_context_fields() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 3,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                key_field: Some("event_id".to_string()),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123" }),
+        },
+    )
+    .expect("enqueue should work");
+    let first_lease = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("initial lease should work")
+    .expect("initial run should be leased");
+    service::complete_attempt(
+        &store,
+        &first_lease.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Succeeded,
+            failure_reason: None,
+            failure_class: None,
+        },
+    )
+    .expect("initial completion should work");
+
+    let replay = service::replay_run(&store, &first.id).expect("replay should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("run should be leased");
+
+    assert_eq!(leased.run_id, replay.id);
+    assert_eq!(leased.key.as_deref(), Some("evt_123"));
+    assert_eq!(leased.replay_of.as_deref(), Some(first.id.as_str()));
+    assert_eq!(leased.job_id, "job_process_webhook");
 }
 
 #[test]

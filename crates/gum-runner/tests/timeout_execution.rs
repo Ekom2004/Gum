@@ -291,6 +291,8 @@ fn leased_run_from_response(response: &LeaseRunResponse) -> LeasedRun {
         attempt_id: response.attempt_id.clone(),
         run_id: response.run_id.clone(),
         job_id: response.job_id.clone(),
+        key: response.key.clone(),
+        replay_of: response.replay_of.clone(),
         deploy_id: response.deploy_id.clone(),
         bundle_url: response.bundle_url.clone(),
         entrypoint: response.entrypoint.clone(),

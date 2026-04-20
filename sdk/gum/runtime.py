@@ -2,12 +2,36 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import importlib
 import inspect
 import json
 import sys
 import traceback
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class ExecutionContext:
+    run_id: str
+    attempt_id: str
+    job_id: str
+    key: str | None = None
+    replay_of: str | None = None
+
+
+_execution_context: contextvars.ContextVar[ExecutionContext | None] = contextvars.ContextVar(
+    "gum_execution_context",
+    default=None,
+)
+
+
+def _context() -> ExecutionContext:
+    current = _execution_context.get()
+    if current is None:
+        raise RuntimeError("Gum execution context is only available while a Gum job is running.")
+    return current
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -15,23 +39,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--handler", required=True)
     parser.add_argument("--payload-json", required=True)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--attempt", required=True, type=int)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--job-id", required=True)
+    parser.add_argument("--key")
+    parser.add_argument("--replay-of")
     args = parser.parse_args(argv)
 
     try:
-        payload = json.loads(args.payload_json)
-        if not isinstance(payload, dict):
-            raise RuntimeError("Gum job payload must decode to a JSON object.")
-
-        module_name, fn_name = _parse_handler(args.handler)
-        module = importlib.import_module(module_name)
-        target = getattr(module, fn_name, None)
-        if target is None:
-            raise RuntimeError(f"Handler {args.handler!r} was not found.")
-
-        result = target(**payload)
-        if inspect.isawaitable(result):
-            asyncio.run(_await_result(result))
+        _run_handler(args)
         return 0
     except Exception as exc:
         traceback.print_exc()
@@ -46,6 +61,34 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+
+def _run_handler(args: argparse.Namespace) -> None:
+    payload = json.loads(args.payload_json)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Gum job payload must decode to a JSON object.")
+
+    module_name, fn_name = _parse_handler(args.handler)
+    module = importlib.import_module(module_name)
+    target = getattr(module, fn_name, None)
+    if target is None:
+        raise RuntimeError(f"Handler {args.handler!r} was not found.")
+
+    token = _execution_context.set(
+        ExecutionContext(
+            run_id=args.run_id,
+            attempt_id=args.attempt_id,
+            job_id=args.job_id,
+            key=args.key,
+            replay_of=args.replay_of,
+        )
+    )
+    try:
+        result = target(**payload)
+        if inspect.isawaitable(result):
+            asyncio.run(_await_result(result))
+    finally:
+        _execution_context.reset(token)
 
 
 async def _await_result(result: Any) -> Any:

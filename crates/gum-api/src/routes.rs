@@ -87,6 +87,8 @@ pub struct LeaseRunResponse {
     pub attempt_id: String,
     pub run_id: String,
     pub job_id: String,
+    pub key: Option<String>,
+    pub replay_of: Option<String>,
     pub deploy_id: String,
     pub input: Value,
     pub bundle_url: String,

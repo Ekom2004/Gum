@@ -1733,6 +1733,34 @@ impl GumStore for PostgresStore {
             return Err("runner mismatch".to_string());
         }
 
+        let lease_id = attempt
+            .lease_id
+            .as_deref()
+            .ok_or_else(|| "attempt lease missing".to_string())?;
+        let lease_row = tx
+            .query_opt(
+                "SELECT id,
+                        attempt_id,
+                        runner_id,
+                        (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint AS expires_at_epoch_ms,
+                        (EXTRACT(EPOCH FROM acked_at) * 1000)::bigint AS acked_at_epoch_ms,
+                        (EXTRACT(EPOCH FROM released_at) * 1000)::bigint AS released_at_epoch_ms,
+                        (EXTRACT(EPOCH FROM revoke_requested_at) * 1000)::bigint AS revoke_requested_at_epoch_ms
+                 FROM leases
+                 WHERE id = $1
+                 FOR UPDATE",
+                &[&lease_id],
+            )
+            .map_err(|error| format!("failed to load lease for completion: {error}"))?
+            .ok_or_else(|| "attempt lease missing".to_string())?;
+        let lease = lease_from_projection_row(lease_row)?;
+        if lease.acked_at_epoch_ms.is_some()
+            || lease.released_at_epoch_ms.is_some()
+            || lease.expires_at_epoch_ms <= now_epoch_ms()
+        {
+            return Err("attempt lease no longer valid".to_string());
+        }
+
         let updated_attempt_row = tx
             .query_one(
                 "UPDATE attempts
@@ -1754,13 +1782,14 @@ impl GumStore for PostgresStore {
             )
             .map_err(|error| format!("failed to update attempt: {error}"))?;
 
-        if let Some(lease_id) = &attempt.lease_id {
-            tx.execute(
-                "UPDATE leases SET acked_at = NOW() WHERE id = $1",
-                &[lease_id],
-            )
-            .map_err(|error| format!("failed to ack lease: {error}"))?;
-        }
+        tx.execute(
+            "UPDATE leases
+             SET acked_at = NOW(),
+                 released_at = NOW()
+             WHERE id = $1",
+            &[&lease_id],
+        )
+        .map_err(|error| format!("failed to ack lease: {error}"))?;
 
         let run_row = tx
             .query_one(

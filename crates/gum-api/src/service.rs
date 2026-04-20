@@ -267,12 +267,15 @@ pub fn lease_run<S: GumStore>(
     let job = store
         .get_job(&run.job_id)?
         .ok_or_else(|| "job not found".to_string())?;
+    let key = resolve_key_value(job.key_field.as_deref(), &run.input_json)?;
 
     Ok(Some(LeaseRunResponse {
         lease_id: lease.id,
         attempt_id: attempt.id,
         run_id: run.id,
         job_id: run.job_id,
+        key,
+        replay_of: run.replay_of_run_id,
         deploy_id: run.deploy_id,
         input: run.input_json,
         bundle_url: deploy.bundle_url,

@@ -8,6 +8,8 @@ pub struct LeasedRun {
     pub attempt_id: String,
     pub run_id: String,
     pub job_id: String,
+    pub key: Option<String>,
+    pub replay_of: Option<String>,
     pub deploy_id: String,
     pub bundle_url: String,
     pub entrypoint: String,

@@ -1210,24 +1210,47 @@ impl GumStore for MemoryStore {
             .map_err(|_| "memory store lock poisoned".to_string())?;
 
         let now_epoch_ms = now_epoch_ms();
+        let attempt_preflight = state
+            .attempts
+            .get(&params.attempt_id)
+            .cloned()
+            .ok_or_else(|| "attempt not found".to_string())?;
+
+        if attempt_preflight.finished_at_epoch_ms.is_some()
+            || is_terminal_attempt(attempt_preflight.status)
+        {
+            return Err("attempt already finished".to_string());
+        }
+        if attempt_preflight.cancel_requested_at_epoch_ms.is_some()
+            && params.status != AttemptStatus::Canceled
+        {
+            return Err("attempt cancel requested".to_string());
+        }
+        if attempt_preflight.runner_id.as_deref() != Some(params.runner_id.as_str()) {
+            return Err("runner mismatch".to_string());
+        }
+
+        let lease_id = attempt_preflight
+            .lease_id
+            .as_deref()
+            .ok_or_else(|| "attempt lease missing".to_string())?;
+        let lease = state
+            .leases
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| "attempt lease missing".to_string())?;
+        if lease.acked_at_epoch_ms.is_some()
+            || lease.released_at_epoch_ms.is_some()
+            || lease.expires_at_epoch_ms <= now_epoch_ms
+        {
+            return Err("attempt lease no longer valid".to_string());
+        }
+
         let attempt_snapshot = {
             let attempt = state
                 .attempts
                 .get_mut(&params.attempt_id)
                 .ok_or_else(|| "attempt not found".to_string())?;
-
-            if attempt.finished_at_epoch_ms.is_some() || is_terminal_attempt(attempt.status) {
-                return Err("attempt already finished".to_string());
-            }
-            if attempt.cancel_requested_at_epoch_ms.is_some()
-                && params.status != AttemptStatus::Canceled
-            {
-                return Err("attempt cancel requested".to_string());
-            }
-
-            if attempt.runner_id.as_deref() != Some(params.runner_id.as_str()) {
-                return Err("runner mismatch".to_string());
-            }
 
             attempt.status = params.status;
             attempt.failure_reason = params.failure_reason.clone();
@@ -1236,10 +1259,9 @@ impl GumStore for MemoryStore {
             attempt.clone()
         };
 
-        if let Some(lease_id) = &attempt_snapshot.lease_id {
-            if let Some(lease) = state.leases.get_mut(lease_id) {
-                lease.acked_at_epoch_ms = Some(now_epoch_ms);
-            }
+        if let Some(lease) = state.leases.get_mut(lease_id) {
+            lease.acked_at_epoch_ms = Some(now_epoch_ms);
+            lease.released_at_epoch_ms = Some(now_epoch_ms);
         }
 
         let run_snapshot = state
