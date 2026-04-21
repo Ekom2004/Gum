@@ -1,0 +1,49 @@
+---
+title: "Key"
+description: "Drop duplicate enqueues before they create duplicate work."
+---
+
+Use `key` to tell Gum which input field identifies duplicate work.
+
+```python
+@gum.job(retries=3, key="event_id")
+def process_stripe_webhook(event_id: str, event: dict):
+    payments.handle(event)
+```
+
+If Stripe sends the same webhook more than once, Gum returns the existing run instead of creating another one.
+
+## Scope
+
+Key dedupe is scoped to:
+
+- project
+- function
+- key value
+
+Different functions do not collide.
+
+## Retry behavior
+
+Retries stay inside the same run.
+
+They do not create:
+
+- a new run
+- a new key record
+- duplicate concurrency pressure
+- duplicate rate-limit spend
+
+## Replay behavior
+
+Replay bypasses dedupe because replay is explicit new work.
+
+```bash
+gum replay run_123
+```
+
+## Honest boundary
+
+`key` prevents duplicate Gum runs at enqueue time.
+
+It does not guarantee exactly-once external side effects by itself. For that, pass stable ids to downstream systems when they support idempotency.

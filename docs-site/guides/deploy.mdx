@@ -1,0 +1,60 @@
+---
+title: "Deploy Jobs"
+description: "Register Python jobs with Gum."
+---
+
+Deploy packages your Python project and registers decorated jobs.
+
+```bash
+gum deploy --project-id proj_live
+```
+
+Run the command from a project root that has a `pyproject.toml`.
+
+## What deploy does
+
+Gum deploy:
+
+- scans Python files for `@gum.job(...)`
+- discovers job policies
+- packages the project into a bundle
+- uploads or registers the bundle
+- activates the deploy for future runs
+
+## Example
+
+```python
+import gum
+
+salesforce_limit = gum.rate_limit("20/m")
+
+@gum.job(retries=5, timeout="10m", rate_limit=salesforce_limit, concurrency=3)
+def sync_account(account_id: str):
+    salesforce.sync_account(account_id)
+```
+
+```bash
+gum deploy --project-id proj_live
+```
+
+## Shared rate-limit discovery
+
+For shared rate limits, define a module-level binding.
+
+```python
+openai_limit = gum.rate_limit("60/m")
+```
+
+Jobs using that binding share one project-scoped pool.
+
+```python
+@gum.job(rate_limit=openai_limit)
+def summarize(doc_id: str):
+    ...
+
+@gum.job(rate_limit=openai_limit)
+def embed(doc_id: str):
+    ...
+```
+
+If two files define the same pool with conflicting values, deploy fails clearly.

@@ -1,0 +1,34 @@
+---
+title: "Retries"
+description: "Retry failed work without writing retry loops."
+---
+
+Use `retries` to set how many additional attempts Gum may spend after the first attempt fails.
+
+```python
+@gum.job(retries=5)
+def generate_summary(doc_id: str):
+    llm.summarize(doc_id)
+```
+
+`retries=5` means:
+
+- 1 initial attempt
+- up to 5 retry attempts
+- 6 total possible attempts
+
+## What Gum owns
+
+Gum owns retry timing:
+
+- backoff
+- jitter
+- retry holds when function health indicates the path is unhealthy
+
+The retry budget still belongs to the user. Gum should not silently reduce it.
+
+## What stays stable
+
+Retries keep the same `run_id`.
+
+Each retry gets a new `attempt_id`.

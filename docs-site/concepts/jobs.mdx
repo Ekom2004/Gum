@@ -1,0 +1,52 @@
+---
+title: "Jobs"
+description: "A job is a Python function plus its execution policy."
+---
+
+A Gum job is a decorated Python function.
+
+```python
+import gum
+
+@gum.job(retries=3, timeout="2m")
+def send_receipt(order_id: str):
+    email.send_receipt(order_id)
+```
+
+The function body is your code. The decorator is the operational contract Gum enforces around that code.
+
+## Job identity
+
+Gum derives a stable job id from the function name.
+
+```text
+send_receipt -> job_send_receipt
+```
+
+That id is used for deploy registration, enqueue, logs, replay, concurrency, rate limits, and key scoping.
+
+## Trigger modes
+
+Jobs can start in two ways:
+
+- enqueue: application code explicitly creates a run
+- schedule: Gum creates runs from `every`
+
+```python
+@gum.job(every="1h")
+def refresh_cache():
+    cache.refresh()
+```
+
+## Public policy surface
+
+The job decorator supports:
+
+- `retries`
+- `timeout`
+- `rate_limit`
+- `concurrency`
+- `every`
+- `key`
+
+Gum keeps lower-level runtime behavior internal so users do not have to configure leases, health probes, circuit breakers, runner placement, or recovery rules.

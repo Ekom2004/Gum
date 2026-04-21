@@ -1,0 +1,76 @@
+---
+title: "Quickstart"
+description: "Define, deploy, enqueue, and inspect your first Gum job."
+---
+
+## 1. Install the SDK
+
+During the beta, install the Python SDK from the Gum repository or from the package once it is published.
+
+```bash
+pip install gum
+```
+
+## 2. Configure the client
+
+Set your Gum API URL and API key.
+
+```bash
+export GUM_API_BASE_URL="https://api.your-gum-cloud.com"
+export GUM_API_KEY="gum_live_..."
+```
+
+For local development, Gum defaults to:
+
+```bash
+http://127.0.0.1:8000
+```
+
+## 3. Write a job
+
+Create `jobs.py`.
+
+```python
+import gum
+
+openai_limit = gum.rate_limit("60/m")
+
+@gum.job(retries=5, timeout="5m", rate_limit=openai_limit, concurrency=5, key="customer_id")
+def sync_customer(customer_id: str):
+    crm.sync(customer_id)
+```
+
+## 4. Deploy
+
+Run deploy from the project root.
+
+```bash
+gum deploy --project-id proj_live
+```
+
+Gum discovers decorated functions, packages your code, and registers the deploy.
+
+## 5. Enqueue work
+
+Call `.enqueue(...)` from application code.
+
+```python
+run = sync_customer.enqueue(customer_id="cus_123")
+print(run.id, run.status)
+```
+
+If another enqueue uses the same `customer_id` while the key is active, Gum returns the existing run instead of creating duplicate work.
+
+## 6. Inspect the run
+
+```bash
+gum get run_123
+gum logs run_123
+gum replay run_123
+```
+
+For operators:
+
+```bash
+gum admin
+```

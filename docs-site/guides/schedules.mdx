@@ -1,0 +1,39 @@
+---
+title: "Schedules"
+description: "Run jobs repeatedly with the every knob."
+---
+
+Use `every` for interval-based scheduled work.
+
+```python
+import gum
+
+@gum.job(every="5m", retries=3, timeout="1m")
+def refresh_metrics():
+    metrics.refresh()
+```
+
+Each schedule tick creates a normal Gum run.
+
+Scheduled runs still obey:
+
+- retries
+- timeout
+- rate limits
+- concurrency
+- key
+- logs
+- cancel
+- replay
+
+## No-overlap schedules
+
+Use `concurrency=1` when a scheduled job must not overlap itself.
+
+```python
+@gum.job(every="5m", concurrency=1, timeout="10m")
+def cleanup():
+    storage.cleanup()
+```
+
+If the previous run is still active, the next tick waits behind the concurrency limit instead of running in parallel.

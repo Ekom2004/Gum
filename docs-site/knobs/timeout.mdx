@@ -1,0 +1,36 @@
+---
+title: "Timeout"
+description: "Set a hard runtime limit for one attempt."
+---
+
+Use `timeout` to limit how long one execution attempt may run.
+
+```python
+@gum.job(timeout="5m", retries=3)
+def export_workspace(workspace_id: str):
+    exports.build(workspace_id)
+```
+
+Timeout is per attempt, not per logical run.
+
+If an attempt times out:
+
+- Gum terminates the attempt
+- the run keeps the same `run_id`
+- Gum retries later if retry budget remains
+
+## Supported shape
+
+Use duration strings:
+
+```python
+timeout="30s"
+timeout="5m"
+timeout="1h"
+```
+
+## External side effects
+
+If user code performs an external side effect and the worker crashes before Gum records success, Gum cannot know whether that side effect happened.
+
+Use `key` and downstream idempotency keys for side-effect safety.

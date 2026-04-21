@@ -1,0 +1,86 @@
+---
+title: "Environment"
+description: "Environment variables used by the Gum SDK and CLI."
+---
+
+## `GUM_API_BASE_URL`
+
+Base URL for the Gum API.
+
+```bash
+export GUM_API_BASE_URL="https://api.your-gum-cloud.com"
+```
+
+Default:
+
+```bash
+http://127.0.0.1:8000
+```
+
+## `GUM_API_KEY`
+
+API key used for normal SDK and CLI requests.
+
+```bash
+export GUM_API_KEY="gum_live_..."
+```
+
+## `GUM_ADMIN_KEY`
+
+Admin key used for operator-only views.
+
+```bash
+export GUM_ADMIN_KEY="gum_admin_..."
+```
+
+You can also store the admin key locally:
+
+```bash
+gum admin login
+```
+---
+title: "Statuses"
+description: "Run statuses shown by the SDK, CLI, and admin console."
+---
+
+Runs move through a small public status set.
+
+## `queued`
+
+The run exists but is not executing yet.
+
+Common reasons:
+
+- waiting for concurrency
+- waiting for rate limit
+- waiting for retry delay
+- waiting for function health recovery
+
+## `running`
+
+An attempt is actively executing.
+
+## `succeeded`
+
+The run completed successfully.
+
+## `failed`
+
+The run failed and has no retry budget left, or the failure is terminal.
+
+## `timed_out`
+
+The attempt exceeded its timeout. The run may retry if retry budget remains.
+
+## `canceled`
+
+The run was canceled by an operator or API request.
+
+## Waiting reasons
+
+Gum may include waiting or failure details such as:
+
+- `waiting_on_concurrency`
+- `waiting_on_rate_limit`
+- `waiting_for_function_health_recovery`
+- `downstream_unavailable`

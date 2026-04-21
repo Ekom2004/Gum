@@ -1,0 +1,64 @@
+---
+title: "Admin CLI"
+description: "Inspect runs, logs, runners, leases, and concurrency from your terminal."
+---
+
+Use `gum admin` for the operator console.
+
+```bash
+gum admin
+```
+
+In an interactive terminal, Gum opens the admin TUI.
+
+## Login
+
+Store admin credentials locally.
+
+```bash
+gum admin login
+```
+
+You can also use an environment variable.
+
+```bash
+export GUM_ADMIN_KEY="gum_admin_..."
+```
+
+## Common commands
+
+List runs:
+
+```bash
+gum admin runs list
+```
+
+Inspect one run:
+
+```bash
+gum admin runs get run_123
+```
+
+View logs:
+
+```bash
+gum admin logs run_123
+```
+
+Inspect runners:
+
+```bash
+gum admin runners list
+```
+
+Inspect active leases:
+
+```bash
+gum admin leases list
+```
+
+## Filtering
+
+In the interactive admin console, press `/` to filter the current view.
+
+Use it to narrow runs by status, id, job, runner, lease, or failure text.

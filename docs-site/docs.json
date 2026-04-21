@@ -1,0 +1,55 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Gum",
+  "colors": {
+    "primary": "#18181B",
+    "light": "#FFFFFF",
+    "dark": "#000000"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "index",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Core Concepts",
+        "pages": [
+          "concepts/jobs",
+          "concepts/runs-attempts"
+        ]
+      },
+      {
+        "group": "Guides",
+        "pages": [
+          "guides/deploy",
+          "guides/enqueue",
+          "guides/schedules",
+          "guides/admin-cli"
+        ]
+      },
+      {
+        "group": "Job Knobs",
+        "pages": [
+          "knobs/retries",
+          "knobs/timeout",
+          "knobs/rate-limits",
+          "knobs/concurrency",
+          "knobs/every",
+          "knobs/key"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference/environment",
+          "reference/statuses"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,53 @@
+---
+title: "Runs and Attempts"
+description: "How Gum preserves job identity across retries, timeouts, and crashes."
+---
+
+Gum separates logical work from execution tries.
+
+## Run
+
+A run is the logical unit of work.
+
+One enqueue, schedule tick, or replay creates one `run_id`.
+
+The same run survives:
+
+- retries
+- timeout recovery
+- rate-limit waits
+- concurrency waits
+- function-health holds
+- worker crash recovery
+
+## Attempt
+
+An attempt is one execution try for a run.
+
+Retries and recovery create new attempts, not new runs.
+
+```text
+run_123
+  attempt_1 -> timed out
+  attempt_2 -> failed
+  attempt_3 -> succeeded
+```
+
+## Why this matters
+
+Stable run identity makes Gum predictable:
+
+- logs stay attached to the same logical work
+- retries do not look like duplicate user work
+- `key` dedupe stays scoped to one run
+- replay is the explicit way to create new work from an old run
+
+## Side effects
+
+Gum can preserve run identity and recover from crashes.
+
+Gum cannot magically know whether an external side effect happened if a worker crashes before durable completion. For exactly-once behavior with external systems, use:
+
+- `key`
+- downstream idempotency keys
+- idempotent user code

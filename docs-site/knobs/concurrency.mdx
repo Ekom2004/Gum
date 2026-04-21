@@ -1,0 +1,36 @@
+---
+title: "Concurrency"
+description: "Limit how many runs of one function execute at the same time."
+---
+
+Use `concurrency` to cap simultaneous executions for a function.
+
+```python
+@gum.job(concurrency=5)
+def process_event(event_id: str):
+    analytics.ingest(event_id)
+```
+
+At most five runs of `process_event` may be active at once.
+
+## Serial execution
+
+Use `concurrency=1` when work must never overlap.
+
+```python
+@gum.job(concurrency=1)
+def run_migration(batch_id: str):
+    migrations.run(batch_id)
+```
+
+## Retry behavior
+
+Retries do not reserve slots.
+
+A retry competes for concurrency like normal queued work.
+
+## Crash safety
+
+Gum derives active slot usage from durable running attempts. It does not rely on a fragile in-memory counter.
+
+This prevents slot leaks across success, failure, timeout, crash recovery, and scheduler restart.

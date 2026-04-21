@@ -1,0 +1,52 @@
+---
+title: "Rate Limits"
+description: "Protect providers and shared dependencies from too much work."
+---
+
+Use `rate_limit` to limit how quickly Gum starts work.
+
+## Per-function limit
+
+```python
+@gum.job(rate_limit="20/m")
+def sync_customer(customer_id: str):
+    crm.sync(customer_id)
+```
+
+This function may start at most 20 runs per minute.
+
+## Shared pool
+
+Use `gum.rate_limit(...)` when multiple functions share the same downstream budget.
+
+```python
+openai_limit = gum.rate_limit("60/m")
+
+@gum.job(rate_limit=openai_limit)
+def summarize(doc_id: str):
+    openai.summarize(doc_id)
+
+@gum.job(rate_limit=openai_limit)
+def embed(doc_id: str):
+    openai.embed(doc_id)
+```
+
+Both jobs share one 60/minute budget.
+
+## Pool naming
+
+Gum infers the pool name from the module-level binding.
+
+```python
+openai_limit = gum.rate_limit("60/m")
+```
+
+The pool is named `openai_limit`.
+
+If the same pool name has conflicting definitions, deploy fails.
+
+## Interaction with concurrency
+
+Gum checks concurrency before rate limits.
+
+If a job cannot run because concurrency is full, Gum does not spend a rate-limit token.

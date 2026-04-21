@@ -1,0 +1,45 @@
+---
+title: "Every"
+description: "Schedule jobs on an interval."
+---
+
+Use `every` to run a function repeatedly.
+
+```python
+@gum.job(every="1h")
+def refresh_dashboard():
+    dashboard.refresh()
+```
+
+Scheduled runs are normal Gum runs.
+
+They support:
+
+- retries
+- timeout
+- rate limits
+- concurrency
+- key
+- logs
+- replay
+- cancel
+
+## Common intervals
+
+```python
+every="5m"
+every="1h"
+every="1d"
+```
+
+## Prevent overlap
+
+Combine `every` with `concurrency=1`.
+
+```python
+@gum.job(every="5m", concurrency=1)
+def cleanup():
+    storage.cleanup()
+```
+
+If one run is still active, the next run waits.

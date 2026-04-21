@@ -1,0 +1,51 @@
+---
+title: "Enqueue Work"
+description: "Create runs from application code."
+---
+
+Use `.enqueue(...)` to create a run.
+
+```python
+run = sync_customer.enqueue(customer_id="cus_123")
+print(run.id)
+```
+
+The payload must use keyword arguments.
+
+```python
+sync_customer.enqueue(customer_id="cus_123", source="webhook")
+```
+
+## Return value
+
+Enqueue returns a run reference.
+
+```python
+run.id
+run.status
+run.deduped
+```
+
+If the job has a `key` and the same work is already active, Gum returns the existing run and sets `deduped=True`.
+
+## Inspect a run
+
+```bash
+gum get run_123
+```
+
+## View logs
+
+```bash
+gum logs run_123
+```
+
+## Replay
+
+Replay intentionally creates new work from an existing run.
+
+```bash
+gum replay run_123
+```
+
+Replay bypasses `key` dedupe because the operator is explicitly asking Gum to run it again.

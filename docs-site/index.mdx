@@ -1,0 +1,48 @@
+---
+title: "Introduction"
+description: "Managed functions, with reliability built in."
+---
+
+Gum is a managed runtime for background jobs.
+
+You write a Python function. Gum runs it with retries, timeouts, rate limits, concurrency limits, schedules, logs, replay, and duplicate protection built in.
+
+```python
+import gum
+
+openai_limit = gum.rate_limit("60/m")
+
+@gum.job(
+    retries=5,
+    timeout="5m",
+    rate_limit=openai_limit,
+    concurrency=5,
+    key="customer_id",
+)
+def sync_customer(customer_id: str):
+    crm.sync(customer_id)
+
+sync_customer.enqueue(customer_id="cus_123")
+```
+
+## What Gum replaces
+
+- queue setup for normal background work
+- ad hoc cron jobs
+- Redis locks for duplicate suppression
+- hand-rolled retry loops
+- manual worker dashboards
+- timeout and crash recovery glue
+
+## Public job knobs
+
+Gum keeps the public API small:
+
+- `retries`: how many retry attempts Gum may spend
+- `timeout`: how long one attempt may run
+- `rate_limit`: how quickly a function or shared dependency may start work
+- `concurrency`: how many runs of one function may execute at once
+- `every`: how often Gum should schedule a function
+- `key`: which input field identifies duplicate work
+
+Everything else is Gum runtime behavior.
