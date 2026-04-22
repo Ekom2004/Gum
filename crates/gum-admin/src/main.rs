@@ -71,6 +71,8 @@ struct RunsResponse {
 struct RunnerStatusRecord {
     id: String,
     compute_class: String,
+    memory_mb: u32,
+    active_memory_mb: u32,
     max_concurrent_leases: u32,
     last_heartbeat_at_epoch_ms: i64,
     active_lease_count: u32,
@@ -720,6 +722,7 @@ fn render_runners_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Row::new(vec![
             Cell::from(truncate_text(&runner.id, 18)),
             Cell::from(truncate_text(&runner.compute_class, 10)),
+            Cell::from(format!("{}/{}", runner.active_memory_mb, runner.memory_mb)),
             Cell::from(format!(
                 "{}/{}",
                 runner.active_lease_count, runner.max_concurrent_leases
@@ -736,12 +739,13 @@ fn render_runners_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(20),
             Constraint::Length(12),
             Constraint::Length(12),
+            Constraint::Length(12),
             Constraint::Length(14),
         ],
     )
     .block(panel_block(" RUNNERS "))
     .header(
-        Row::new(vec!["id", "class", "active/max", "heartbeat"])
+        Row::new(vec!["id", "class", "memory", "active/max", "heartbeat"])
             .style(Style::default().fg(Color::DarkGray)),
     )
     .highlight_style(Style::default().bg(Color::DarkGray))
@@ -887,6 +891,10 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Some(runner) => vec![
                 detail_line("runner", &runner.id),
                 detail_line("class", &runner.compute_class),
+                detail_line(
+                    "memory",
+                    &format!("{}/{} MB", runner.active_memory_mb, runner.memory_mb),
+                ),
                 detail_line(
                     "active",
                     &format!(

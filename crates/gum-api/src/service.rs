@@ -44,6 +44,7 @@ pub fn register_deploy<S: GumStore>(
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                memory_mb: job.memory_mb,
                 key_field: job.key_field,
                 compute_class: job.compute_class,
             })
@@ -146,6 +147,8 @@ pub fn list_runners<S: GumStore>(store: &S) -> Result<RunnersListResponse, Strin
             .map(|runner| RunnerStatusResponse {
                 id: runner.id,
                 compute_class: runner.compute_class,
+                memory_mb: runner.memory_mb,
+                active_memory_mb: runner.active_memory_mb,
                 max_concurrent_leases: runner.max_concurrent_leases,
                 last_heartbeat_at_epoch_ms: runner.last_heartbeat_at_epoch_ms,
                 active_lease_count: runner.active_lease_count,
@@ -283,6 +286,7 @@ pub fn lease_run<S: GumStore>(
         entrypoint: deploy.entrypoint,
         handler_ref: job.handler_ref,
         timeout_secs: job.timeout_secs,
+        memory_mb: job.memory_mb,
         lease_ttl_secs: request.lease_ttl_secs,
     }))
 }
@@ -294,6 +298,7 @@ pub fn register_runner<S: GumStore>(
     store.register_runner(RegisterRunnerParams {
         runner_id: request.runner_id,
         compute_class: request.compute_class,
+        memory_mb: request.memory_mb,
         max_concurrent_leases: request.max_concurrent_leases,
         heartbeat_timeout_secs: request.heartbeat_timeout_secs,
     })?;
@@ -307,6 +312,7 @@ pub fn heartbeat_runner<S: GumStore>(
     store.heartbeat_runner(HeartbeatRunnerParams {
         runner_id: request.runner_id,
         compute_class: request.compute_class,
+        memory_mb: request.memory_mb,
         max_concurrent_leases: request.max_concurrent_leases,
         heartbeat_timeout_secs: request.heartbeat_timeout_secs,
         lease_ttl_secs: request.lease_ttl_secs,

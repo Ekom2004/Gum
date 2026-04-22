@@ -57,6 +57,7 @@ Optional fields:
 - `every`
 - `retries`
 - `timeout`
+- `memory`
 - `rate_limit`
 - `concurrency`
 - `key`
@@ -68,7 +69,7 @@ import gum
 
 salesforce_limit = gum.rate_limit("20/m")
 
-@gum.job(retries=8, timeout="15m", rate_limit=salesforce_limit, concurrency=5)
+@gum.job(retries=8, timeout="15m", memory="1gb", rate_limit=salesforce_limit, concurrency=5)
 def sync_customer(customer_id: str):
     salesforce.upsert_customer(customer_id)
 ```
@@ -178,6 +179,23 @@ If exceeded:
 - the attempt is terminated
 - the run becomes `timed_out`
 - retry policy is evaluated
+
+### `memory`
+
+Memory required by one execution attempt.
+
+Example:
+
+```python
+@gum.job(memory="4gb")
+def render_video(video_id: str):
+    ...
+```
+
+Meaning:
+- Gum treats memory as a placement requirement
+- a runner must have enough remaining memory capacity before leasing the run
+- memory is per attempt, not per logical run
 
 ### `rate_limit`
 
@@ -351,6 +369,7 @@ Support:
 - enqueued jobs
 - retries
 - timeout
+- memory sizing
 - per-function and shared-pool rate limits
 - per-function concurrency
 - enqueue-time duplicate protection with `key`

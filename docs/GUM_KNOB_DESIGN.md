@@ -27,6 +27,7 @@ The beta public surface is:
 @gum.job(
     retries=...,
     timeout=...,
+    memory=...,
     rate_limit=...,
     concurrency=...,
     every=...,
@@ -61,6 +62,27 @@ Contract:
 - timeout is per attempt, not per logical run
 - a timed-out attempt may retry if budget remains
 - stale or expired runners cannot commit completion after ownership is lost
+
+### `memory`
+
+User intent:
+
+- choose how much memory one cloud function attempt needs
+
+Example:
+
+```python
+@gum.job(memory="4gb", timeout="30m")
+def render_video(video_id: str):
+    ...
+```
+
+Contract:
+
+- memory is per attempt
+- Gum only leases the run to a runner with enough remaining memory capacity
+- memory composes with concurrency as `memory * active slots`
+- compute placement remains internal
 
 ### `rate_limit`
 
@@ -182,6 +204,12 @@ Knobs must not behave as isolated flat flags.
 - concurrency is checked before rate-limit budget is spent
 - work that cannot acquire a slot should not consume rate-limit capacity
 
+### `memory` x `concurrency`
+
+- memory is per active attempt
+- total pressure is `memory * active slots`
+- work waits if no runner has enough remaining memory capacity
+
 ### `key` x `retries`
 
 - retries stay inside the same run
@@ -225,6 +253,7 @@ Gum exposes a small public policy surface:
 
 - `retries`
 - `timeout`
+- `memory`
 - `rate_limit`
 - `concurrency`
 - `every`

@@ -12,6 +12,10 @@ use crate::models::{
     ProviderHealthState, ProviderTargetRecord, RateLimitStatusRecord, RunKeyRecord, RunRecord,
     RunnerRecord, RunnerStatusRecord,
 };
+
+fn job_memory_mb(job: &JobRecord) -> u32 {
+    job.memory_mb.unwrap_or(512)
+}
 use crate::queries::{
     compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
     is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, parse_schedule_interval_ms,
@@ -105,6 +109,7 @@ impl MemoryStore {
         state: &mut MemoryState,
         runner_id: &str,
         compute_class: &str,
+        memory_mb: u32,
         max_concurrent_leases: u32,
         heartbeat_timeout_secs: u64,
         now_epoch_ms: i64,
@@ -112,6 +117,7 @@ impl MemoryStore {
         let record = RunnerRecord {
             id: runner_id.to_string(),
             compute_class: compute_class.to_string(),
+            memory_mb,
             max_concurrent_leases,
             heartbeat_timeout_secs,
             last_heartbeat_at_epoch_ms: now_epoch_ms,
@@ -452,6 +458,7 @@ impl GumStore for MemoryStore {
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                memory_mb: job.memory_mb,
                 key_field: job.key_field,
                 compute_class: job.compute_class,
                 enabled: true,
@@ -611,6 +618,7 @@ impl GumStore for MemoryStore {
             &mut state,
             &params.runner_id,
             &params.compute_class,
+            params.memory_mb,
             params.max_concurrent_leases,
             params.heartbeat_timeout_secs,
             now_epoch_ms(),
@@ -627,6 +635,7 @@ impl GumStore for MemoryStore {
             &mut state,
             &params.runner_id,
             &params.compute_class,
+            params.memory_mb,
             params.max_concurrent_leases,
             params.heartbeat_timeout_secs,
             heartbeat_at,
@@ -754,6 +763,16 @@ impl GumStore for MemoryStore {
             .map(|runner| RunnerStatusRecord {
                 id: runner.id.clone(),
                 compute_class: runner.compute_class.clone(),
+                memory_mb: runner.memory_mb,
+                active_memory_mb: state
+                    .attempts
+                    .values()
+                    .filter(|attempt| attempt.status == AttemptStatus::Running)
+                    .filter(|attempt| attempt.runner_id.as_deref() == Some(runner.id.as_str()))
+                    .filter_map(|attempt| state.runs.get(&attempt.run_id))
+                    .filter_map(|run| state.jobs.get(&run.job_id))
+                    .map(job_memory_mb)
+                    .sum(),
                 max_concurrent_leases: runner.max_concurrent_leases,
                 last_heartbeat_at_epoch_ms: runner.last_heartbeat_at_epoch_ms,
                 active_lease_count: state
@@ -1102,6 +1121,19 @@ impl GumStore for MemoryStore {
                 if runner.compute_class != *required_class {
                     continue;
                 }
+            }
+            let active_memory_mb: u32 = state
+                .attempts
+                .values()
+                .filter(|attempt| attempt.status == AttemptStatus::Running)
+                .filter(|attempt| attempt.runner_id.as_deref() == Some(params.runner_id.as_str()))
+                .filter_map(|attempt| state.runs.get(&attempt.run_id))
+                .filter_map(|run| state.jobs.get(&run.job_id))
+                .map(job_memory_mb)
+                .sum();
+            let required_memory_mb = job_memory_mb(job);
+            if active_memory_mb.saturating_add(required_memory_mb) > runner.memory_mb {
+                continue;
             }
 
             if let Some(limit) = job.concurrency_limit {

@@ -44,6 +44,7 @@ fn enqueue_lease_complete_replay_flow_works() {
                 timeout_secs: 300,
                 rate_limit_spec: Some("20/m".to_string()),
                 concurrency_limit: Some(5),
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -55,6 +56,7 @@ fn enqueue_lease_complete_replay_flow_works() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -149,6 +151,7 @@ fn failed_attempt_requeues_when_retries_remain() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -160,6 +163,7 @@ fn failed_attempt_requeues_when_retries_remain() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -239,6 +243,7 @@ fn function_health_blocks_retry_without_provider_config() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: Some(5),
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -250,6 +255,7 @@ fn function_health_blocks_retry_without_provider_config() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -396,6 +402,7 @@ fn user_code_failures_do_not_consume_retry_budget_as_requeues() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: Some(5),
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -407,6 +414,7 @@ fn user_code_failures_do_not_consume_retry_budget_as_requeues() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -497,6 +505,7 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
                 timeout_secs: 300,
                 rate_limit_spec: Some("1/h".to_string()),
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -508,6 +517,7 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -518,6 +528,7 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
         RegisterRunnerRequest {
             runner_id: "runner_2".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -617,6 +628,7 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
                     timeout_secs: 300,
                     rate_limit_spec: Some("openai:1/h".to_string()),
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: None,
                     compute_class: None,
                 },
@@ -630,6 +642,7 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
                     timeout_secs: 300,
                     rate_limit_spec: Some("openai:1/h".to_string()),
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: None,
                     compute_class: None,
                 },
@@ -642,6 +655,7 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -652,6 +666,7 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
         RegisterRunnerRequest {
             runner_id: "runner_2".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -755,6 +770,7 @@ fn conflicting_shared_rate_limit_pool_definitions_are_rejected() {
                     timeout_secs: 300,
                     rate_limit_spec: Some("openai:60/m".to_string()),
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: None,
                     compute_class: None,
                 },
@@ -768,6 +784,7 @@ fn conflicting_shared_rate_limit_pool_definitions_are_rejected() {
                     timeout_secs: 300,
                     rate_limit_spec: Some("openai:100/m".to_string()),
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: None,
                     compute_class: None,
                 },
@@ -813,6 +830,7 @@ fn canceling_a_queued_run_marks_it_canceled() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -868,6 +886,7 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -879,6 +898,7 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -978,6 +998,7 @@ fn admin_views_expose_runs_runners_leases_and_concurrency() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: Some(1),
+                memory_mb: None,
                 key_field: None,
                 compute_class: Some("high-mem".to_string()),
             }],
@@ -989,6 +1010,7 @@ fn admin_views_expose_runs_runners_leases_and_concurrency() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "high-mem".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 2,
             heartbeat_timeout_secs: 30,
         },
@@ -1162,6 +1184,7 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -1173,6 +1196,7 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -1241,6 +1265,7 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
                 timeout_secs: 7_200,
                 rate_limit_spec: None,
                 concurrency_limit: Some(1),
+                memory_mb: None,
                 key_field: None,
                 compute_class: Some("high-mem".to_string()),
             }],
@@ -1253,6 +1278,7 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "high-mem".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 2,
         },
@@ -1263,6 +1289,7 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
         RegisterRunnerRequest {
             runner_id: "runner_2".to_string(),
             compute_class: "high-mem".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 2,
         },
@@ -1294,6 +1321,7 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
         RunnerHeartbeatRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "high-mem".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 2,
             lease_ttl_secs: 2,
@@ -1384,6 +1412,7 @@ fn expired_lease_cannot_commit_completion_before_recovery_runs() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -1395,6 +1424,7 @@ fn expired_lease_cannot_commit_completion_before_recovery_runs() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -1483,6 +1513,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
                     timeout_secs: 7_200,
                     rate_limit_spec: None,
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: None,
                     compute_class: Some("high-mem".to_string()),
                 },
@@ -1496,6 +1527,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
                     timeout_secs: 300,
                     rate_limit_spec: None,
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: None,
                     compute_class: None,
                 },
@@ -1509,6 +1541,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
         RegisterRunnerRequest {
             runner_id: "runner_standard".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -1519,6 +1552,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
         RegisterRunnerRequest {
             runner_id: "runner_high_mem".to_string(),
             compute_class: "high-mem".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -1604,6 +1638,104 @@ fn compute_class_and_runner_capacity_drive_placement() {
 }
 
 #[test]
+fn memory_requirement_drives_runner_placement() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_render_video".to_string(),
+                name: "render_video".to_string(),
+                handler_ref: "jobs:render_video".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 1,
+                timeout_secs: 1_800,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: Some(4096),
+                key_field: None,
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_small".to_string(),
+            compute_class: "standard".to_string(),
+            memory_mb: 1024,
+            max_concurrent_leases: 4,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register small runner should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_large".to_string(),
+            compute_class: "standard".to_string(),
+            memory_mb: 8192,
+            max_concurrent_leases: 4,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register large runner should work");
+
+    service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_render_video",
+        EnqueueRunRequest {
+            input: json!({ "video_id": "vid_123" }),
+        },
+    )
+    .expect("enqueue should work");
+
+    let small = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_small".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("small runner lease should work");
+    assert!(
+        small.is_none(),
+        "runner with too little memory should not lease the job"
+    );
+
+    let large = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_large".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("large runner lease should work")
+    .expect("large runner should lease the memory-heavy job");
+    assert_eq!(large.job_id, "job_render_video");
+    assert_eq!(large.memory_mb, Some(4096));
+}
+
+#[test]
 fn control_lease_fences_scheduler_work() {
     let store = MemoryStore::default();
     let now = now_epoch_ms();
@@ -1686,6 +1818,7 @@ fn keyed_enqueue_returns_existing_run_for_duplicate_payload() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: Some(1),
+                memory_mb: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
             }],
@@ -1749,6 +1882,7 @@ fn keyed_enqueue_does_not_collide_across_functions() {
                     timeout_secs: 300,
                     rate_limit_spec: None,
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: Some("event_id".to_string()),
                     compute_class: None,
                 },
@@ -1762,6 +1896,7 @@ fn keyed_enqueue_does_not_collide_across_functions() {
                     timeout_secs: 300,
                     rate_limit_spec: None,
                     concurrency_limit: None,
+                    memory_mb: None,
                     key_field: Some("event_id".to_string()),
                     compute_class: None,
                 },
@@ -1825,6 +1960,7 @@ fn replay_bypasses_key_dedupe() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
             }],
@@ -1878,6 +2014,7 @@ fn lease_run_includes_execution_context_fields() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
             }],
@@ -1889,6 +2026,7 @@ fn lease_run_includes_execution_context_fields() {
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -1974,6 +2112,7 @@ fn keyed_enqueue_requires_the_configured_field() {
                 timeout_secs: 300,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
             }],

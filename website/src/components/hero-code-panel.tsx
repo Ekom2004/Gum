@@ -22,6 +22,10 @@ const lines: ReactNode[] = [
     <span className="text-zinc-500">=</span>
     <span className="text-[#ce9178]">&quot;2h&quot;</span>
     <span className="text-zinc-300">,</span>
+    <span className="text-[#9cdcfe]">memory</span>
+    <span className="text-zinc-500">=</span>
+    <span className="text-[#ce9178]">&quot;4gb&quot;</span>
+    <span className="text-zinc-300">,</span>
     <span className="text-[#9cdcfe]">concurrency</span>
     <span className="text-zinc-500">=</span>
     <span className="text-[#b5cea8]">1</span>

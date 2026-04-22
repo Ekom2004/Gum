@@ -17,8 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         poll_interval_ms: 1_000,
         lease_ttl_secs: 30,
         heartbeat_timeout_secs: 30,
-        compute_class: "standard".to_string(),
-        max_concurrent_leases: 1,
+        compute_class: std::env::var("GUM_RUNNER_COMPUTE_CLASS")
+            .unwrap_or_else(|_| "standard".to_string()),
+        memory_mb: env_u32("GUM_RUNNER_MEMORY_MB", 1024),
+        max_concurrent_leases: env_u32("GUM_RUNNER_MAX_CONCURRENT_LEASES", 1),
     };
     let client = reqwest::Client::new();
     let base_url = match std::env::var("GUM_API_BASE_URL") {
@@ -94,6 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 async fn register_once(
     client: &reqwest::Client,
     base_url: &str,
@@ -107,6 +117,7 @@ async fn register_once(
         .json(&RegisterRunnerRequest {
             runner_id: config.runner_id.clone(),
             compute_class: config.compute_class.clone(),
+            memory_mb: config.memory_mb,
             max_concurrent_leases: config.max_concurrent_leases,
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
         })
@@ -227,6 +238,7 @@ async fn heartbeat_once(
         .json(&RunnerHeartbeatRequest {
             runner_id: config.runner_id.clone(),
             compute_class: config.compute_class.clone(),
+            memory_mb: config.memory_mb,
             max_concurrent_leases: config.max_concurrent_leases,
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             lease_ttl_secs: config.lease_ttl_secs,

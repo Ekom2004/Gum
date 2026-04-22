@@ -37,6 +37,7 @@ class GumJobTests(unittest.TestCase):
             timeout="5m",
             rate_limit=resend_limit,
             concurrency=20,
+            memory="2gb",
             key="event_id",
         )
         def send_followup() -> str:
@@ -51,6 +52,7 @@ class GumJobTests(unittest.TestCase):
         self.assertEqual(send_followup.policy.timeout, "5m")
         self.assertEqual(send_followup.policy.rate_limit, "500/h")
         self.assertEqual(send_followup.policy.concurrency, 20)
+        self.assertEqual(send_followup.policy.memory, "2gb")
         self.assertEqual(send_followup.policy.key, "event_id")
 
     def test_enqueue_uses_keyword_payload_and_client(self) -> None:

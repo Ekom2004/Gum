@@ -337,7 +337,7 @@ fn require_admin(admin_key: &str, headers: &HeaderMap) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::require_admin;
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 
     #[test]
     fn admin_auth_rejects_missing_header() {

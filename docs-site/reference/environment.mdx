@@ -38,6 +38,24 @@ You can also store the admin key locally:
 ```bash
 gum admin login
 ```
+
+## `GUM_RUNNER_MEMORY_MB`
+
+Memory capacity reported by a Gum runner.
+
+```bash
+export GUM_RUNNER_MEMORY_MB="4096"
+```
+
+Jobs with `memory="4gb"` can only lease onto runners with enough remaining memory capacity.
+
+## `GUM_RUNNER_MAX_CONCURRENT_LEASES`
+
+Maximum active leases a runner should take at once.
+
+```bash
+export GUM_RUNNER_MAX_CONCURRENT_LEASES="4"
+```
 ---
 title: "Statuses"
 description: "Run statuses shown by the SDK, CLI, and admin console."

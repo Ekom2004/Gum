@@ -38,7 +38,7 @@ class DeployDiscoveryTests(unittest.TestCase):
 
                     openai_limit = gum.rate_limit("60/m")
 
-                    @gum.job(every="20d", retries=5, timeout="5m", rate_limit=openai_limit, concurrency=5, key="event_id", compute="high-mem")
+                    @gum.job(every="20d", retries=5, timeout="5m", rate_limit=openai_limit, concurrency=5, memory="2gb", key="event_id")
                     def send_followup():
                         return None
                     """
@@ -55,8 +55,9 @@ class DeployDiscoveryTests(unittest.TestCase):
         self.assertEqual(jobs[0].schedule_expr, "20d")
         self.assertEqual(jobs[0].timeout_secs, 300)
         self.assertEqual(jobs[0].rate_limit_spec, "openai_limit:60/m")
+        self.assertEqual(jobs[0].memory_mb, 2048)
         self.assertEqual(jobs[0].key_field, "event_id")
-        self.assertEqual(jobs[0].compute_class, "high-mem")
+        self.assertIsNone(jobs[0].compute_class)
 
     def test_package_project_creates_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -87,7 +88,7 @@ class DeployDiscoveryTests(unittest.TestCase):
 
                     openai_limit = gum.rate_limit("60/m")
 
-                    @gum.job(retries=3, timeout="30s", rate_limit=openai_limit, concurrency=2, key="customer_id", compute="gpu")
+                    @gum.job(retries=3, timeout="30s", rate_limit=openai_limit, concurrency=2, memory="512mb", key="customer_id")
                     def sync_signup(user_id: str):
                         return user_id
                     """
@@ -107,8 +108,9 @@ class DeployDiscoveryTests(unittest.TestCase):
         self.assertEqual(client.payload["project_id"], "proj_dev")
         self.assertEqual(client.payload["jobs"][0]["id"], "job_sync_signup")
         self.assertEqual(client.payload["jobs"][0]["rate_limit_spec"], "openai_limit:60/m")
+        self.assertEqual(client.payload["jobs"][0]["memory_mb"], 512)
         self.assertEqual(client.payload["jobs"][0]["key_field"], "customer_id")
-        self.assertEqual(client.payload["jobs"][0]["compute_class"], "gpu")
+        self.assertIsNone(client.payload["jobs"][0]["compute_class"])
 
     def test_shared_rate_limit_pool_conflict_fails_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

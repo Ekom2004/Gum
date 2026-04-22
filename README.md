@@ -1,14 +1,15 @@
 # Gum
 
-Deploy production functions on Gum.
+Run Python functions in the cloud.
 
-Gum is a managed runtime for background jobs. The first version is focused on
-Python execution with:
+Gum is a Python function cloud for reliable background work. The first version
+is focused on Python execution with:
 
 - enqueue
 - schedules
 - retries
 - timeouts
+- memory sizing
 - rate limits
 - concurrency
 - deduplication keys

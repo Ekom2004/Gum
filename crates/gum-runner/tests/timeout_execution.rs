@@ -59,6 +59,7 @@ def slow_job():
                 timeout_secs: 1,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -70,6 +71,7 @@ def slow_job():
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -177,6 +179,7 @@ def slow_job():
                 timeout_secs: 10,
                 rate_limit_spec: None,
                 concurrency_limit: None,
+                memory_mb: None,
                 key_field: None,
                 compute_class: None,
             }],
@@ -188,6 +191,7 @@ def slow_job():
         RegisterRunnerRequest {
             runner_id: "runner_1".to_string(),
             compute_class: "standard".to_string(),
+            memory_mb: 1024,
             max_concurrent_leases: 1,
             heartbeat_timeout_secs: 30,
         },
@@ -298,6 +302,7 @@ fn leased_run_from_response(response: &LeaseRunResponse) -> LeasedRun {
         entrypoint: response.entrypoint.clone(),
         handler_ref: response.handler_ref.clone(),
         timeout_secs: response.timeout_secs,
+        memory_mb: response.memory_mb,
         input: response.input.clone(),
     }
 }

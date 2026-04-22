@@ -32,6 +32,7 @@ const MIGRATION_0006: &str = include_str!("../migrations/0006_provider_health.sq
 const MIGRATION_0007: &str = include_str!("../migrations/0007_retry_policy.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_function_health.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_run_keys.sql");
+const MIGRATION_0010: &str = include_str!("../migrations/0010_memory_resources.sql");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -78,6 +79,9 @@ impl PostgresStore {
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .batch_execute(MIGRATION_0009)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
+            .batch_execute(MIGRATION_0010)
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .execute(
@@ -531,6 +535,7 @@ impl GumStore for PostgresStore {
                 timeout_secs: job.timeout_secs,
                 rate_limit_spec: job.rate_limit_spec,
                 concurrency_limit: job.concurrency_limit,
+                memory_mb: job.memory_mb,
                 key_field: job.key_field,
                 compute_class: job.compute_class,
                 enabled: true,
@@ -540,8 +545,8 @@ impl GumStore for PostgresStore {
             tx.execute(
                 "INSERT INTO jobs (
                     id, project_id, deploy_id, name, handler_ref, trigger_mode, schedule_expr,
-                    retries, timeout_secs, rate_limit_spec, concurrency_limit, key_field, compute_class, enabled
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    retries, timeout_secs, rate_limit_spec, concurrency_limit, memory_mb, key_field, compute_class, enabled
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                  ON CONFLICT (id) DO UPDATE
                  SET project_id = EXCLUDED.project_id,
                      deploy_id = EXCLUDED.deploy_id,
@@ -553,6 +558,7 @@ impl GumStore for PostgresStore {
                      timeout_secs = EXCLUDED.timeout_secs,
                      rate_limit_spec = EXCLUDED.rate_limit_spec,
                      concurrency_limit = EXCLUDED.concurrency_limit,
+                     memory_mb = EXCLUDED.memory_mb,
                      key_field = EXCLUDED.key_field,
                      compute_class = EXCLUDED.compute_class,
                      enabled = EXCLUDED.enabled,
@@ -569,6 +575,7 @@ impl GumStore for PostgresStore {
                     &(record.timeout_secs as i32),
                     &record.rate_limit_spec,
                     &record.concurrency_limit.map(|value| value as i32),
+                    &record.memory_mb.map(|value| value as i32),
                     &record.key_field,
                     &record.compute_class,
                     &record.enabled,
@@ -861,22 +868,25 @@ impl GumStore for PostgresStore {
         let row = client
             .query_one(
                 "INSERT INTO runners (
-                    id, compute_class, max_concurrent_leases, heartbeat_timeout_secs, last_heartbeat_at
-                 ) VALUES ($1, $2, $3, $4, NOW())
+                    id, compute_class, memory_mb, max_concurrent_leases, heartbeat_timeout_secs, last_heartbeat_at
+                 ) VALUES ($1, $2, $3, $4, $5, NOW())
                  ON CONFLICT (id) DO UPDATE
                  SET compute_class = EXCLUDED.compute_class,
+                     memory_mb = EXCLUDED.memory_mb,
                      max_concurrent_leases = EXCLUDED.max_concurrent_leases,
                      heartbeat_timeout_secs = EXCLUDED.heartbeat_timeout_secs,
                      last_heartbeat_at = EXCLUDED.last_heartbeat_at,
                      updated_at = NOW()
                  RETURNING id,
                            compute_class,
+                           memory_mb,
                            max_concurrent_leases,
                            heartbeat_timeout_secs,
                            (EXTRACT(EPOCH FROM last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms",
                 &[
                     &params.runner_id,
                     &params.compute_class,
+                    &(params.memory_mb as i32),
                     &(params.max_concurrent_leases as i32),
                     &(params.heartbeat_timeout_secs as i32),
                 ],
@@ -894,22 +904,25 @@ impl GumStore for PostgresStore {
         let runner_row = tx
             .query_one(
                 "INSERT INTO runners (
-                    id, compute_class, max_concurrent_leases, heartbeat_timeout_secs, last_heartbeat_at
-                 ) VALUES ($1, $2, $3, $4, NOW())
+                    id, compute_class, memory_mb, max_concurrent_leases, heartbeat_timeout_secs, last_heartbeat_at
+                 ) VALUES ($1, $2, $3, $4, $5, NOW())
                  ON CONFLICT (id) DO UPDATE
                  SET compute_class = EXCLUDED.compute_class,
+                     memory_mb = EXCLUDED.memory_mb,
                      max_concurrent_leases = EXCLUDED.max_concurrent_leases,
                      heartbeat_timeout_secs = EXCLUDED.heartbeat_timeout_secs,
                      last_heartbeat_at = EXCLUDED.last_heartbeat_at,
                      updated_at = NOW()
                  RETURNING id,
                            compute_class,
+                           memory_mb,
                            max_concurrent_leases,
                            heartbeat_timeout_secs,
                            (EXTRACT(EPOCH FROM last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms",
                 &[
                     &params.runner_id,
                     &params.compute_class,
+                    &(params.memory_mb as i32),
                     &(params.max_concurrent_leases as i32),
                     &(params.heartbeat_timeout_secs as i32),
                 ],
@@ -1059,14 +1072,18 @@ impl GumStore for PostgresStore {
             .query(
                 "SELECT runners.id,
                         runners.compute_class,
+                        runners.memory_mb,
                         runners.max_concurrent_leases,
                         (EXTRACT(EPOCH FROM runners.last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms,
-                        COUNT(attempts.id)::bigint AS active_lease_count
+                        COUNT(attempts.id)::bigint AS active_lease_count,
+                        COALESCE(SUM(COALESCE(jobs.memory_mb, 512)), 0)::bigint AS active_memory_mb
                  FROM runners
                  LEFT JOIN attempts
                    ON attempts.runner_id = runners.id
                   AND attempts.status = 'running'
-                 GROUP BY runners.id, runners.compute_class, runners.max_concurrent_leases, runners.last_heartbeat_at
+                 LEFT JOIN runs ON runs.id = attempts.run_id
+                 LEFT JOIN jobs ON jobs.id = runs.job_id
+                 GROUP BY runners.id, runners.compute_class, runners.memory_mb, runners.max_concurrent_leases, runners.last_heartbeat_at
                  ORDER BY runners.id ASC",
                 &[],
             )
@@ -1074,9 +1091,12 @@ impl GumStore for PostgresStore {
         rows.into_iter()
             .map(|row| {
                 let active_lease_count: i64 = row.get("active_lease_count");
+                let active_memory_mb: i64 = row.get("active_memory_mb");
                 Ok(RunnerStatusRecord {
                     id: row.get("id"),
                     compute_class: row.get("compute_class"),
+                    memory_mb: row.get::<_, i32>("memory_mb") as u32,
+                    active_memory_mb: active_memory_mb as u32,
                     max_concurrent_leases: row.get::<_, i32>("max_concurrent_leases") as u32,
                     last_heartbeat_at_epoch_ms: row.get("last_heartbeat_at_epoch_ms"),
                     active_lease_count: active_lease_count as u32,
@@ -1503,6 +1523,7 @@ impl GumStore for PostgresStore {
             .query_opt(
                 "SELECT id,
                         compute_class,
+                        memory_mb,
                         max_concurrent_leases,
                         heartbeat_timeout_secs,
                         (EXTRACT(EPOCH FROM last_heartbeat_at) * 1000)::bigint AS last_heartbeat_at_epoch_ms
@@ -1565,7 +1586,7 @@ impl GumStore for PostgresStore {
             let run = run_from_row(run_row)?;
             let job_row = tx
                 .query_one(
-                    "SELECT project_id, rate_limit_spec, compute_class
+                    "SELECT project_id, rate_limit_spec, compute_class, memory_mb
                      FROM jobs
                      WHERE id = $1",
                     &[&run.job_id],
@@ -1574,11 +1595,30 @@ impl GumStore for PostgresStore {
             let project_id: String = job_row.get("project_id");
             let rate_limit_spec: Option<String> = job_row.get("rate_limit_spec");
             let compute_class: Option<String> = job_row.get("compute_class");
+            let memory_mb: Option<i32> = job_row.get("memory_mb");
 
             if let Some(required_class) = compute_class {
                 if runner.compute_class != required_class {
                     continue;
                 }
+            }
+            let required_memory_mb = memory_mb.unwrap_or(512);
+            let active_memory_row = tx
+                .query_one(
+                    "SELECT COALESCE(SUM(COALESCE(jobs.memory_mb, 512)), 0)::bigint AS active_memory_mb
+                     FROM attempts
+                     JOIN runs ON runs.id = attempts.run_id
+                     JOIN jobs ON jobs.id = runs.job_id
+                     WHERE attempts.status = 'running'
+                       AND attempts.runner_id = $1",
+                    &[&params.runner_id],
+                )
+                .map_err(|error| format!("failed to count active runner memory: {error}"))?;
+            let active_memory_mb: i64 = active_memory_row.get("active_memory_mb");
+            if active_memory_mb.saturating_add(i64::from(required_memory_mb))
+                > i64::from(runner.memory_mb)
+            {
+                continue;
             }
 
             let allowed = if let Some(rate_limit_spec) = rate_limit_spec {
@@ -2224,6 +2264,7 @@ fn job_from_row(row: Row) -> Result<JobRecord, String> {
     let retries: i32 = row.get("retries");
     let timeout_secs: i32 = row.get("timeout_secs");
     let concurrency_limit: Option<i32> = row.get("concurrency_limit");
+    let memory_mb: Option<i32> = row.get("memory_mb");
     let created_at_epoch_ms: i64 = row
         .try_get("created_at_epoch_ms")
         .map_err(|error| format!("job row missing created_at_epoch_ms: {error}"))?;
@@ -2240,6 +2281,7 @@ fn job_from_row(row: Row) -> Result<JobRecord, String> {
         timeout_secs: timeout_secs as u32,
         rate_limit_spec: row.get("rate_limit_spec"),
         concurrency_limit: concurrency_limit.map(|value| value as u32),
+        memory_mb: memory_mb.map(|value| value as u32),
         key_field: row.get("key_field"),
         compute_class: row.get("compute_class"),
         enabled: row.get("enabled"),
@@ -2315,11 +2357,13 @@ fn lease_from_projection_row(row: Row) -> Result<LeaseRecord, String> {
 }
 
 fn runner_from_row(row: Row) -> Result<RunnerRecord, String> {
+    let memory_mb: i32 = row.get("memory_mb");
     let max_concurrent_leases: i32 = row.get("max_concurrent_leases");
     let heartbeat_timeout_secs: i32 = row.get("heartbeat_timeout_secs");
     Ok(RunnerRecord {
         id: row.get("id"),
         compute_class: row.get("compute_class"),
+        memory_mb: memory_mb as u32,
         max_concurrent_leases: max_concurrent_leases as u32,
         heartbeat_timeout_secs: heartbeat_timeout_secs as u64,
         last_heartbeat_at_epoch_ms: row.get("last_heartbeat_at_epoch_ms"),

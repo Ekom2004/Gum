@@ -35,16 +35,16 @@ export default function Home() {
                   </span>
                   Early access open
                 </div>
-                <h1 className="gum-display mb-6 max-w-[18ch] text-5xl font-medium leading-[1.1] tracking-tight text-white md:text-6xl">
-                  Managed functions, with reliability
+                <h1 className="gum-display mb-6 max-w-[18ch] text-6xl font-medium leading-[1.02] tracking-tight text-white md:text-7xl">
+                  Run Python functions
                   <br />
-                  built in.
+                  in the cloud.
                 </h1>
 
                 <p className="mb-10 max-w-2xl text-lg leading-relaxed text-zinc-400">
-                  Stop writing Terraform for SQS queues and managing Redis locks. Gum is a background
-                  runtime that executes your code with retries, timeouts, global rate limits, and
-                  deduplication natively injected.
+                  Gum turns ordinary Python functions into reliable cloud jobs with retries,
+                  timeouts, memory sizing, rate limits, concurrency, schedules, logs, replay, and
+                  deduplication built in.
                 </p>
 
                 <div className="flex flex-wrap items-center justify-center gap-4 lg:justify-start">

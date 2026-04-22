@@ -15,6 +15,7 @@ pub struct LeasedRun {
     pub entrypoint: String,
     pub handler_ref: String,
     pub timeout_secs: u32,
+    pub memory_mb: Option<u32>,
     pub input: Value,
 }
 
@@ -25,6 +26,7 @@ pub struct RunnerLoopConfig {
     pub lease_ttl_secs: u64,
     pub heartbeat_timeout_secs: u64,
     pub compute_class: String,
+    pub memory_mb: u32,
     pub max_concurrent_leases: u32,
 }
 
@@ -46,6 +48,7 @@ pub struct AppendLogRequest {
 pub struct RegisterRunnerRequest {
     pub runner_id: String,
     pub compute_class: String,
+    pub memory_mb: u32,
     pub max_concurrent_leases: u32,
     pub heartbeat_timeout_secs: u64,
 }
@@ -54,6 +57,7 @@ pub struct RegisterRunnerRequest {
 pub struct RunnerHeartbeatRequest {
     pub runner_id: String,
     pub compute_class: String,
+    pub memory_mb: u32,
     pub max_concurrent_leases: u32,
     pub heartbeat_timeout_secs: u64,
     pub lease_ttl_secs: u64,

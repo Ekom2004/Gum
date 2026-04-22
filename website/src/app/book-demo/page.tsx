@@ -3,9 +3,9 @@ import type { Metadata } from "next";
 import { SiteHeader } from "../../components/site-header";
 
 export const metadata: Metadata = {
-  title: "Get a Demo | MX8",
+  title: "Book a Demo | Gum",
   description:
-    "Talk to the MX8 team about search and transforms for massive media datasets.",
+    "Talk to the Gum team about running Python functions in the cloud.",
 };
 
 export default function BookDemoPage() {
@@ -21,11 +21,11 @@ export default function BookDemoPage() {
             Get a Demo
           </div>
           <h1 className="gum-display text-5xl font-bold leading-tight tracking-tight text-white md:text-7xl">
-            Bring a real media workload.
+            Bring one Python function.
           </h1>
           <p className="mt-6 max-w-2xl text-lg leading-relaxed text-zinc-400 md:text-xl">
-            If your team needs to search, resize, convert, clip, extract, or
-            transcode large media datasets, we want to see the real job.
+            If your team has background work running on Celery, cron, Lambda,
+            Redis, or a worker box, we want to see the real function.
           </p>
         </div>
 
@@ -34,17 +34,17 @@ export default function BookDemoPage() {
             What To Bring
           </div>
           <div className="space-y-4 text-base leading-relaxed text-zinc-400">
-            <p>The dataset shape: images, video, or both.</p>
-            <p>The job you run today: resize, convert, clip, extract, transcode, or search.</p>
-            <p>The output you need and where it should land.</p>
-            <p>The size of the workload and how often it happens.</p>
+            <p>The Python function you want to run in the cloud.</p>
+            <p>The tool you use today: Celery, cron, Lambda, Redis, SQS, or a custom worker.</p>
+            <p>The operational pain: retries, timeouts, logs, replay, rate limits, or duplicates.</p>
+            <p>The memory, concurrency, and schedule the function needs.</p>
           </div>
         </div>
 
         <div className="mt-16 border-t border-zinc-800 pt-10">
           <p className="max-w-2xl text-base leading-relaxed text-zinc-400">
             The fastest way to start is with one real job. Bring the workload,
-            and we’ll tell you whether MX8 is the right fit.
+            and we'll tell you whether Gum is the right fit.
           </p>
         </div>
       </main>

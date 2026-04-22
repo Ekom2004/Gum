@@ -426,6 +426,7 @@ The public knobs remain:
 
 - `retries`
 - `timeout`
+- `memory`
 - `rate_limit`
 - `concurrency`
 - `every`

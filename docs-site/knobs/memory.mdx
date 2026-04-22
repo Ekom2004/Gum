@@ -1,0 +1,45 @@
+---
+title: "Memory"
+description: "Choose how much memory a cloud function attempt needs."
+---
+
+Use `memory` to tell Gum how much memory one function attempt needs.
+
+```python
+@gum.job(memory="4gb", timeout="30m")
+def render_video(video_id: str):
+    video.render(video_id)
+```
+
+Gum uses this as a placement contract. A runner only leases the job when it has enough remaining memory capacity.
+
+## Supported values
+
+Use simple duration-style strings:
+
+```python
+memory="512mb"
+memory="1gb"
+memory="4gb"
+memory="8gb"
+```
+
+## Interaction with concurrency
+
+Memory is per running attempt.
+
+```python
+@gum.job(memory="4gb", concurrency=3)
+def export_workspace(workspace_id: str):
+    exports.build(workspace_id)
+```
+
+This can require up to 12 GB of runner capacity when all three slots are active.
+
+## What Gum owns
+
+Users choose the memory contract. Gum owns the internal placement decision:
+
+- which runner can satisfy it
+- whether the run waits for capacity
+- how runner capacity is reported in the admin console

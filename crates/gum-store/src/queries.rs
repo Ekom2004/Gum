@@ -29,6 +29,7 @@ pub struct RegisterJobParams {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub memory_mb: Option<u32>,
     pub key_field: Option<String>,
     pub compute_class: Option<String>,
 }
@@ -63,6 +64,7 @@ pub struct LeaseNextAttemptParams {
 pub struct RegisterRunnerParams {
     pub runner_id: String,
     pub compute_class: String,
+    pub memory_mb: u32,
     pub max_concurrent_leases: u32,
     pub heartbeat_timeout_secs: u64,
 }
@@ -71,6 +73,7 @@ pub struct RegisterRunnerParams {
 pub struct HeartbeatRunnerParams {
     pub runner_id: String,
     pub compute_class: String,
+    pub memory_mb: u32,
     pub max_concurrent_leases: u32,
     pub heartbeat_timeout_secs: u64,
     pub lease_ttl_secs: u64,

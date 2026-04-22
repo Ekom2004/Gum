@@ -67,6 +67,8 @@ class _FakeAdminAPI:
             RunnerStatus(
                 id="runner_1",
                 compute_class="high-mem",
+                memory_mb=4096,
+                active_memory_mb=2048,
                 max_concurrent_leases=2,
                 last_heartbeat_at_epoch_ms=123456,
                 active_lease_count=1,

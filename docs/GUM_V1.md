@@ -42,6 +42,7 @@ Gum v1 supports these policy fields:
 - `every`
 - `retries`
 - `timeout`
+- `memory`
 - `rate_limit`
 - `concurrency`
 - `key`
@@ -52,6 +53,7 @@ Gum v1 owns:
 - run dispatch
 - retries
 - timeout enforcement
+- memory-aware runner placement
 - per-function and shared-pool rate limits
 - per-function concurrency limits
 - enqueue-time duplicate protection
@@ -116,7 +118,7 @@ import gum
 
 salesforce_limit = gum.rate_limit("20/m")
 
-@gum.job(retries=5, timeout="5m", rate_limit=salesforce_limit, concurrency=5, key="customer_id")
+@gum.job(retries=5, timeout="5m", memory="1gb", rate_limit=salesforce_limit, concurrency=5, key="customer_id")
 def sync_customer(customer_id: str):
     ...
 

@@ -23,6 +23,7 @@ Slice 1 includes:
 - leased dispatch
 - runner execution
 - timeout enforcement
+- memory-aware runner placement
 - retry handling
 - shared rate-limit pools
 - enqueue-time duplicate protection
@@ -132,7 +133,7 @@ import gum
 
 salesforce_limit = gum.rate_limit("20/m")
 
-@gum.job(retries=5, timeout="5m", rate_limit=salesforce_limit, concurrency=5, key="customer_id")
+@gum.job(retries=5, timeout="5m", memory="1gb", rate_limit=salesforce_limit, concurrency=5, key="customer_id")
 def sync_customer(customer_id: str):
     ...
 

@@ -34,3 +34,15 @@ A retry competes for concurrency like normal queued work.
 Gum derives active slot usage from durable running attempts. It does not rely on a fragile in-memory counter.
 
 This prevents slot leaks across success, failure, timeout, crash recovery, and scheduler restart.
+
+## Memory
+
+Concurrency multiplies memory demand.
+
+```python
+@gum.job(memory="2gb", concurrency=4)
+def process_batch(batch_id: str):
+    batches.process(batch_id)
+```
+
+If all slots are active, Gum needs 8 GB of runner capacity.
