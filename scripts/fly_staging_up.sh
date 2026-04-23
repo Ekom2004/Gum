@@ -33,6 +33,18 @@ else
   ADMIN_KEY="gum_admin_$(openssl rand -hex 24)"
 fi
 
+if [[ -n "${GUM_API_KEY:-}" ]]; then
+  API_KEY="${GUM_API_KEY}"
+else
+  API_KEY="gum_live_$(openssl rand -hex 24)"
+fi
+
+if [[ -n "${GUM_INTERNAL_KEY:-}" ]]; then
+  INTERNAL_KEY="${GUM_INTERNAL_KEY}"
+else
+  INTERNAL_KEY="gum_internal_$(openssl rand -hex 24)"
+fi
+
 echo "org=${ORG} region=${REGION}"
 echo "api=${API_APP} runner=${RUNNER_APP} postgres=${PG_APP}"
 
@@ -76,13 +88,16 @@ fi
 
 echo "setting api secrets"
 fly secrets set -a "${API_APP}" \
+  GUM_API_KEY="${API_KEY}" \
   GUM_ADMIN_KEY="${ADMIN_KEY}" \
+  GUM_INTERNAL_KEY="${INTERNAL_KEY}" \
   GUM_API_BIND_ADDR="0.0.0.0" \
   GUM_API_PORT="8080"
 
 echo "setting runner secrets"
 fly secrets set -a "${RUNNER_APP}" \
   GUM_API_BASE_URL="${API_URL}" \
+  GUM_INTERNAL_KEY="${INTERNAL_KEY}" \
   GUM_RUNNER_COMPUTE_CLASS="standard" \
   GUM_RUNNER_MEMORY_MB="1024" \
   GUM_RUNNER_MAX_CONCURRENT_LEASES="2"
@@ -96,7 +111,8 @@ fly deploy -c "${REPO_ROOT}/deploy/fly/runner.fly.toml" --app "${RUNNER_APP}" --
 echo
 echo "staging deploy complete"
 echo "API URL: ${API_URL}"
+echo "API KEY: ${API_KEY}"
 echo "ADMIN KEY: ${ADMIN_KEY}"
 echo
 echo "next:"
-echo "  GUM_SMOKE_USE_EXISTING_API=1 GUM_API_BASE_URL=${API_URL} GUM_ADMIN_KEY=${ADMIN_KEY} KEEP_SMOKE_ARTIFACTS=1 ./scripts/beta_onboarding_smoke.sh"
+echo "  GUM_SMOKE_USE_EXISTING_API=1 GUM_API_BASE_URL=${API_URL} GUM_API_KEY=${API_KEY} GUM_ADMIN_KEY=${ADMIN_KEY} KEEP_SMOKE_ARTIFACTS=1 ./scripts/beta_onboarding_smoke.sh"

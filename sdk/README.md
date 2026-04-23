@@ -1,5 +1,9 @@
 # Gum Python SDK
 
+```bash
+pip install usegum
+```
+
 ```python
 import gum
 

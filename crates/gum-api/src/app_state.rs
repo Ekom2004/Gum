@@ -5,7 +5,9 @@ use gum_store::pg::PostgresStore;
 pub struct AppState {
     pub store: PostgresStore,
     pub project_id: String,
+    pub api_key: String,
     pub admin_key: String,
+    pub internal_key: String,
 }
 
 impl AppState {
@@ -26,8 +28,11 @@ impl AppState {
         Ok(Self {
             store,
             project_id: "proj_dev".to_string(),
+            api_key: std::env::var("GUM_API_KEY").unwrap_or_else(|_| "dev".to_string()),
             admin_key: std::env::var("GUM_ADMIN_KEY")
                 .unwrap_or_else(|_| "gum-dev-admin".to_string()),
+            internal_key: std::env::var("GUM_INTERNAL_KEY")
+                .unwrap_or_else(|_| "gum-dev-internal".to_string()),
         })
     }
 }

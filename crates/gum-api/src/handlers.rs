@@ -94,8 +94,10 @@ impl IntoResponse for ApiError {
 
 pub async fn register_deploy(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RegisterDeployRequest>,
 ) -> Result<Json<crate::routes::RegisterDeployResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::register_deploy(&store, payload))
         .await
@@ -105,9 +107,11 @@ pub async fn register_deploy(
 
 pub async fn enqueue_run(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
     Json(payload): Json<EnqueueRunRequest>,
 ) -> Result<Json<crate::routes::EnqueueRunResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
     let store = state.store.clone();
     let project_id = state.project_id.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -120,8 +124,10 @@ pub async fn enqueue_run(
 
 pub async fn get_run(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<crate::routes::RunResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
     let store = state.store.clone();
     let maybe_run = tokio::task::spawn_blocking(move || service::get_run(&store, &run_id))
         .await
@@ -138,8 +144,10 @@ pub async fn get_run(
 
 pub async fn replay_run(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<crate::routes::ReplayRunResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::replay_run(&store, &run_id))
         .await
@@ -149,9 +157,11 @@ pub async fn replay_run(
 
 pub async fn cancel_run(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
     Json(payload): Json<CancelRunRequest>,
 ) -> Result<Json<crate::routes::RunResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::cancel_run(&store, &run_id, payload))
         .await
@@ -161,8 +171,10 @@ pub async fn cancel_run(
 
 pub async fn get_logs(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Result<Json<Vec<crate::routes::LogLine>>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::get_logs(&store, &run_id))
         .await
@@ -246,8 +258,10 @@ pub async fn list_provider_health(
 
 pub async fn lease_run(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<LeaseRunRequest>,
 ) -> Result<Response, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
     let store = state.store.clone();
     let leased = tokio::task::spawn_blocking(move || service::lease_run(&store, payload))
         .await
@@ -261,8 +275,10 @@ pub async fn lease_run(
 
 pub async fn register_runner(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RegisterRunnerRequest>,
 ) -> Result<StatusCode, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::register_runner(&store, payload))
         .await
@@ -274,8 +290,10 @@ pub async fn register_runner(
 
 pub async fn heartbeat_runner(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RunnerHeartbeatRequest>,
 ) -> Result<StatusCode, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || service::heartbeat_runner(&store, payload))
         .await
@@ -287,8 +305,10 @@ pub async fn heartbeat_runner(
 
 pub async fn get_lease_state(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(lease_id): Path<String>,
 ) -> Result<Json<crate::routes::LeaseStateResponse>, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
     let store = state.store.clone();
     let maybe_state =
         tokio::task::spawn_blocking(move || service::get_lease_state(&store, &lease_id))
@@ -306,9 +326,11 @@ pub async fn get_lease_state(
 
 pub async fn complete_attempt(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(attempt_id): Path<String>,
     Json(payload): Json<CompleteAttemptRequest>,
 ) -> Result<Json<crate::routes::RunResponse>, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || {
         service::complete_attempt(&store, &attempt_id, payload)
@@ -319,25 +341,81 @@ pub async fn complete_attempt(
 }
 
 fn require_admin(admin_key: &str, headers: &HeaderMap) -> Result<(), ApiError> {
-    if admin_key.trim().is_empty() {
-        return Err(ApiError::internal("admin auth misconfigured"));
+    require_single_bearer(
+        admin_key,
+        headers,
+        "admin auth misconfigured",
+        "missing admin authorization",
+        "invalid admin authorization",
+    )
+}
+
+fn require_api_or_admin(
+    api_key: &str,
+    admin_key: &str,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    if api_key.trim().is_empty() && admin_key.trim().is_empty() {
+        return Err(ApiError::internal("api auth misconfigured"));
     }
-    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
-        return Err(ApiError::unauthorized("missing admin authorization"));
-    };
-    let Ok(value) = value.to_str() else {
-        return Err(ApiError::unauthorized("invalid admin authorization"));
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return Err(ApiError::unauthorized("invalid admin authorization"));
-    };
-    if token.is_empty() {
-        return Err(ApiError::unauthorized("invalid admin authorization"));
+    let token = extract_bearer(
+        headers,
+        "missing api authorization",
+        "invalid api authorization",
+    )?;
+    if (!api_key.trim().is_empty() && constant_time_eq(token, api_key))
+        || (!admin_key.trim().is_empty() && constant_time_eq(token, admin_key))
+    {
+        return Ok(());
     }
-    if !constant_time_eq(token, admin_key) {
-        return Err(ApiError::unauthorized("invalid admin authorization"));
+    Err(ApiError::unauthorized("invalid api authorization"))
+}
+
+fn require_internal(internal_key: &str, headers: &HeaderMap) -> Result<(), ApiError> {
+    require_single_bearer(
+        internal_key,
+        headers,
+        "internal auth misconfigured",
+        "missing internal authorization",
+        "invalid internal authorization",
+    )
+}
+
+fn require_single_bearer(
+    expected_token: &str,
+    headers: &HeaderMap,
+    misconfigured_message: &str,
+    missing_message: &str,
+    invalid_message: &str,
+) -> Result<(), ApiError> {
+    if expected_token.trim().is_empty() {
+        return Err(ApiError::internal(misconfigured_message));
+    }
+    let token = extract_bearer(headers, missing_message, invalid_message)?;
+    if !constant_time_eq(token, expected_token) {
+        return Err(ApiError::unauthorized(invalid_message));
     }
     Ok(())
+}
+
+fn extract_bearer<'a>(
+    headers: &'a HeaderMap,
+    missing_message: &str,
+    invalid_message: &str,
+) -> Result<&'a str, ApiError> {
+    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Err(ApiError::unauthorized(missing_message));
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(ApiError::unauthorized(invalid_message));
+    };
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return Err(ApiError::unauthorized(invalid_message));
+    };
+    if token.is_empty() {
+        return Err(ApiError::unauthorized(invalid_message));
+    }
+    Ok(token)
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -357,7 +435,7 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, require_admin};
+    use super::{constant_time_eq, require_admin, require_api_or_admin, require_internal};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 
     #[test]
@@ -393,8 +471,8 @@ mod tests {
     fn admin_auth_rejects_empty_bearer_token() {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
-        let error = require_admin("admin-secret", &headers)
-            .expect_err("empty bearer token should fail");
+        let error =
+            require_admin("admin-secret", &headers).expect_err("empty bearer token should fail");
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
     }
 
@@ -423,6 +501,59 @@ mod tests {
     }
 
     #[test]
+    fn api_auth_accepts_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer api-secret"),
+        );
+        require_api_or_admin("api-secret", "admin-secret", &headers)
+            .expect("matching api key should pass");
+    }
+
+    #[test]
+    fn api_auth_accepts_admin_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-secret"),
+        );
+        require_api_or_admin("api-secret", "admin-secret", &headers)
+            .expect("matching admin key should pass api auth");
+    }
+
+    #[test]
+    fn api_auth_rejects_invalid_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        let error = require_api_or_admin("api-secret", "admin-secret", &headers)
+            .expect_err("invalid token should fail api auth");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn internal_auth_rejects_missing_header() {
+        let headers = HeaderMap::new();
+        let error = require_internal("internal-secret", &headers)
+            .expect_err("missing header should fail internal auth");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn internal_auth_accepts_matching_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer internal-secret"),
+        );
+        require_internal("internal-secret", &headers)
+            .expect("matching token should pass internal auth");
+    }
+
+    #[test]
     fn constant_time_compare_matches_expected_results() {
         assert!(constant_time_eq("admin-secret", "admin-secret"));
         assert!(!constant_time_eq("admin-secret", "admin-secrex"));
@@ -433,9 +564,11 @@ mod tests {
 
 pub async fn append_log(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((run_id, attempt_id)): Path<(String, String)>,
     Json(payload): Json<AppendLogRequest>,
 ) -> Result<StatusCode, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || {
         service::append_log(&store, &run_id, &attempt_id, payload)

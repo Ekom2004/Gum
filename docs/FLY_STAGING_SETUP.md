@@ -28,7 +28,7 @@ This script will:
 1. create API and runner apps if missing
 2. create Postgres if missing
 3. attach Postgres to API (`DATABASE_URL`)
-4. set API + runner secrets
+4. set API + admin + internal runner secrets
 5. deploy API and runner
 
 Environment overrides:
@@ -39,6 +39,7 @@ FLY_REGION=yyz \
 FLY_API_APP=gum-api-stg \
 FLY_RUNNER_APP=gum-runner-stg \
 FLY_PG_APP=gum-pg-stg \
+GUM_API_KEY=your_api_key \
 GUM_ADMIN_KEY=your_admin_key \
 ./scripts/fly_staging_up.sh
 ```
@@ -50,6 +51,7 @@ After deploy succeeds:
 ```bash
 GUM_SMOKE_USE_EXISTING_API=1 \
 GUM_API_BASE_URL=https://gum-api-stg.fly.dev \
+GUM_API_KEY=<api_key_from_bootstrap> \
 GUM_ADMIN_KEY=<admin_key_from_bootstrap> \
 KEEP_SMOKE_ARTIFACTS=1 \
 ./scripts/beta_onboarding_smoke.sh

@@ -13,8 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let app = handlers::router(state);
-    let bind_addr = std::env::var("GUM_API_BIND_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind_addr = std::env::var("GUM_API_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("GUM_API_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())

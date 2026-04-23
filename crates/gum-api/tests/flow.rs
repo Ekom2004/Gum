@@ -1198,7 +1198,10 @@ fn concurrency_slot_releases_after_success_and_next_run_leases() {
     let after = service::list_concurrency(&store).expect("concurrency should list");
     assert_eq!(after.concurrency[0].active_count, 0);
     assert_eq!(after.concurrency[0].queued_count, 1);
-    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+    assert_eq!(
+        after.concurrency[0].queued_run_ids,
+        vec![queued_run_id.clone()]
+    );
 
     let next = service::lease_run(
         &store,
@@ -1267,7 +1270,10 @@ fn concurrency_slot_releases_after_failure_and_next_run_leases() {
     let after = service::list_concurrency(&store).expect("concurrency should list");
     assert_eq!(after.concurrency[0].active_count, 0);
     assert_eq!(after.concurrency[0].queued_count, 1);
-    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+    assert_eq!(
+        after.concurrency[0].queued_run_ids,
+        vec![queued_run_id.clone()]
+    );
 
     let next = service::lease_run(
         &store,
@@ -1336,7 +1342,10 @@ fn concurrency_slot_releases_after_timeout_and_next_run_leases() {
     let after = service::list_concurrency(&store).expect("concurrency should list");
     assert_eq!(after.concurrency[0].active_count, 0);
     assert_eq!(after.concurrency[0].queued_count, 1);
-    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+    assert_eq!(
+        after.concurrency[0].queued_run_ids,
+        vec![queued_run_id.clone()]
+    );
 
     let next = service::lease_run(
         &store,
@@ -1408,7 +1417,10 @@ fn concurrency_slot_releases_after_cancel_and_next_run_leases() {
     let after = service::list_concurrency(&store).expect("concurrency should list");
     assert_eq!(after.concurrency[0].active_count, 0);
     assert_eq!(after.concurrency[0].queued_count, 1);
-    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+    assert_eq!(
+        after.concurrency[0].queued_run_ids,
+        vec![queued_run_id.clone()]
+    );
 
     let next = service::lease_run(
         &store,
@@ -1477,7 +1489,10 @@ fn concurrency_slot_recovers_after_lost_lease_and_next_run_leases() {
     let after = service::list_concurrency(&store).expect("concurrency should list");
     assert_eq!(after.concurrency[0].active_count, 0);
     assert_eq!(after.concurrency[0].queued_count, 1);
-    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+    assert_eq!(
+        after.concurrency[0].queued_run_ids,
+        vec![queued_run_id.clone()]
+    );
 
     let next = service::lease_run(
         &store,

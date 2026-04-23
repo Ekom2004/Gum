@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use gum_types::AttemptStatus;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -238,7 +238,11 @@ async fn sleep_until(deadline: Instant) {
     tokio::time::sleep_until(deadline).await;
 }
 
-fn resolve_bundle_path(bundle_url: &str, run_id: &str, attempt_id: &str) -> Result<PathBuf, String> {
+fn resolve_bundle_path(
+    bundle_url: &str,
+    run_id: &str,
+    attempt_id: &str,
+) -> Result<PathBuf, String> {
     if let Some(path) = bundle_url.strip_prefix("file://") {
         return Ok(PathBuf::from(path));
     }
@@ -257,8 +261,12 @@ fn write_inline_bundle(encoded: &str, run_id: &str, attempt_id: &str) -> Result<
     let base = std::env::temp_dir().join("gum-runner").join("bundles");
     std::fs::create_dir_all(&base)
         .map_err(|error| format!("failed to create runner bundle dir: {error}"))?;
-    let path = base.join(format!("{run_id}-{attempt_id}-{}.tar.gz", timestamp_suffix()));
-    std::fs::write(&path, bytes).map_err(|error| format!("failed to write inline bundle: {error}"))?;
+    let path = base.join(format!(
+        "{run_id}-{attempt_id}-{}.tar.gz",
+        timestamp_suffix()
+    ));
+    std::fs::write(&path, bytes)
+        .map_err(|error| format!("failed to write inline bundle: {error}"))?;
     Ok(path)
 }
 

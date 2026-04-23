@@ -508,7 +508,7 @@ def _render_pyproject(*, project_name: str) -> str:
         f'name = "{normalized_name}"\n'
         'version = "0.1.0"\n'
         'requires-python = ">=3.10"\n'
-        'dependencies = ["gum"]\n'
+        'dependencies = ["usegum"]\n'
     )
 
 

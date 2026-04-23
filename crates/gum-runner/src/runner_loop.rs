@@ -28,6 +28,7 @@ pub struct RunnerLoopConfig {
     pub compute_class: String,
     pub memory_mb: u32,
     pub max_concurrent_leases: u32,
+    pub internal_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

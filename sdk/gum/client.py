@@ -167,7 +167,7 @@ class GumClient:
     ) -> Any:
         url = f"{self.base_url.rstrip('/')}{path}"
         headers = {"Accept": "application/json"}
-        token = self.admin_key if use_admin_auth else self.api_key
+        token = self.admin_key if use_admin_auth else (self.api_key or self.admin_key)
         if token:
             headers["Authorization"] = f"Bearer {token}"
 

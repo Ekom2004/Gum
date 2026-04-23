@@ -63,6 +63,16 @@ You can also store the admin key locally:
 gum admin login
 ```
 
+## `GUM_INTERNAL_KEY`
+
+Shared internal auth key between Gum API and runners.
+
+```bash
+export GUM_INTERNAL_KEY="gum_internal_..."
+```
+
+Set this in your runtime environment for both API and runner processes. Do not commit it.
+
 ## `GUM_RUNNER_MEMORY_MB`
 
 Memory capacity reported by a Gum runner.

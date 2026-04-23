@@ -21,6 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "standard".to_string()),
         memory_mb: env_u32("GUM_RUNNER_MEMORY_MB", 1024),
         max_concurrent_leases: env_u32("GUM_RUNNER_MAX_CONCURRENT_LEASES", 1),
+        internal_key: std::env::var("GUM_INTERNAL_KEY")
+            .unwrap_or_else(|_| "gum-dev-internal".to_string()),
     };
     let client = reqwest::Client::new();
     let base_url = match std::env::var("GUM_API_BASE_URL") {
@@ -48,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cancel_task = tokio::spawn(cancel_poll_loop(
                     client.clone(),
                     base_url.clone(),
+                    config.internal_key.clone(),
                     leased.lease_id.clone(),
                     cancel_tx,
                     cancel_stop_rx,
@@ -58,12 +61,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = cancel_stop_tx.send(());
                 let _ = heartbeat_task.await;
                 let _ = cancel_task.await;
-                append_logs(&client, &base_url, &leased, "stdout", &outcome.stdout).await?;
-                append_logs(&client, &base_url, &leased, "stderr", &outcome.stderr).await?;
+                append_logs(
+                    &client,
+                    &base_url,
+                    &config.internal_key,
+                    &leased,
+                    "stdout",
+                    &outcome.stdout,
+                )
+                .await?;
+                append_logs(
+                    &client,
+                    &base_url,
+                    &config.internal_key,
+                    &leased,
+                    "stderr",
+                    &outcome.stderr,
+                )
+                .await?;
                 if let Some(message) = &outcome.app_message {
                     append_log_once(
                         &client,
                         &base_url,
+                        &config.internal_key,
                         &leased.run_id,
                         &leased.attempt_id,
                         "app",
@@ -114,6 +134,7 @@ async fn register_once(
             "{}/internal/runners/register",
             base_url.trim_end_matches('/')
         ))
+        .bearer_auth(&config.internal_key)
         .json(&RegisterRunnerRequest {
             runner_id: config.runner_id.clone(),
             compute_class: config.compute_class.clone(),
@@ -146,6 +167,7 @@ async fn lease_once(
             "{}/internal/runs/lease",
             base_url.trim_end_matches('/')
         ))
+        .bearer_auth(&config.internal_key)
         .json(&LeaseRunRequest {
             runner_id: config.runner_id.clone(),
             lease_ttl_secs: config.lease_ttl_secs,
@@ -199,6 +221,7 @@ async fn heartbeat_loop(
 async fn cancel_poll_loop(
     client: reqwest::Client,
     base_url: String,
+    internal_key: String,
     lease_id: String,
     cancel_tx: watch::Sender<bool>,
     mut stop_rx: oneshot::Receiver<()>,
@@ -206,7 +229,7 @@ async fn cancel_poll_loop(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                match lease_state_once(&client, &base_url, &lease_id).await {
+                match lease_state_once(&client, &base_url, &internal_key, &lease_id).await {
                     Ok(Some(state)) if state.cancel_requested => {
                         let _ = cancel_tx.send(true);
                         break;
@@ -235,6 +258,7 @@ async fn heartbeat_once(
             "{}/internal/runners/heartbeat",
             base_url.trim_end_matches('/')
         ))
+        .bearer_auth(&config.internal_key)
         .json(&RunnerHeartbeatRequest {
             runner_id: config.runner_id.clone(),
             compute_class: config.compute_class.clone(),
@@ -262,6 +286,7 @@ async fn heartbeat_once(
 async fn lease_state_once(
     client: &reqwest::Client,
     base_url: &str,
+    internal_key: &str,
     lease_id: &str,
 ) -> Result<Option<LeaseStateResponse>, String> {
     let response = client
@@ -270,6 +295,7 @@ async fn lease_state_once(
             base_url.trim_end_matches('/'),
             lease_id
         ))
+        .bearer_auth(internal_key)
         .send()
         .await
         .map_err(|error| format!("failed to fetch lease state: {error}"))?;
@@ -296,6 +322,7 @@ async fn lease_state_once(
 async fn append_logs(
     client: &reqwest::Client,
     base_url: &str,
+    internal_key: &str,
     leased: &LeasedRun,
     stream: &str,
     output: &str,
@@ -308,6 +335,7 @@ async fn append_logs(
         append_log_once(
             client,
             base_url,
+            internal_key,
             &leased.run_id,
             &leased.attempt_id,
             stream,
@@ -322,6 +350,7 @@ async fn append_logs(
 async fn append_log_once(
     client: &reqwest::Client,
     base_url: &str,
+    internal_key: &str,
     run_id: &str,
     attempt_id: &str,
     stream: &str,
@@ -334,6 +363,7 @@ async fn append_log_once(
             run_id,
             attempt_id
         ))
+        .bearer_auth(internal_key)
         .json(&AppendLogRequest {
             stream: stream.to_string(),
             message: message.to_string(),
@@ -368,6 +398,7 @@ async fn complete_once(
             base_url.trim_end_matches('/'),
             leased.attempt_id
         ))
+        .bearer_auth(&config.internal_key)
         .json(&CompleteAttemptRequest {
             runner_id: config.runner_id.clone(),
             status,
