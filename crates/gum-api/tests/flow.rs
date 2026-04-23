@@ -1851,6 +1851,70 @@ fn keyed_enqueue_returns_existing_run_for_duplicate_payload() {
 }
 
 #[test]
+fn keyed_enqueue_dedupes_by_key_even_when_payload_differs() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 3,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                key_field: Some("event_id".to_string()),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123", "payload": { "attempt": 1 } }),
+        },
+    )
+    .expect("first enqueue should work");
+    assert!(!first.deduped);
+
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": "evt_123", "payload": { "attempt": 2, "extra": true } }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    assert!(second.deduped);
+    assert_eq!(second.id, first.id);
+}
+
+#[test]
 fn keyed_enqueue_does_not_collide_across_functions() {
     let store = MemoryStore::default();
     store
@@ -2130,6 +2194,120 @@ fn keyed_enqueue_requires_the_configured_field() {
     )
     .expect_err("missing key field should fail");
     assert!(error.contains("key field \"event_id\" missing from input"));
+}
+
+#[test]
+fn keyed_enqueue_requires_scalar_key_value() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 3,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                key_field: Some("event_id".to_string()),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let error = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": { "value": "evt_123" } }),
+        },
+    )
+    .expect_err("object key field should fail");
+    assert!(error.contains("key field \"event_id\" must resolve to a scalar value"));
+}
+
+#[test]
+fn keyed_enqueue_accepts_numeric_key_values() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_process_webhook".to_string(),
+                name: "process_webhook".to_string(),
+                handler_ref: "jobs:process_webhook".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 3,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                key_field: Some("event_id".to_string()),
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": 42, "payload": { "attempt": 1 } }),
+        },
+    )
+    .expect("first enqueue should work");
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_process_webhook",
+        EnqueueRunRequest {
+            input: json!({ "event_id": 42, "payload": { "attempt": 2 } }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    assert!(!first.deduped);
+    assert!(second.deduped);
+    assert_eq!(second.id, first.id);
 }
 
 fn now_epoch_ms() -> i64 {

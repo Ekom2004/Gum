@@ -43,8 +43,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gum")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    init_parser = subparsers.add_parser("init", help="create Gum project config")
+    init_parser.add_argument("--project-id", default="proj_dev")
+    init_parser.add_argument("--api-base-url", default="http://127.0.0.1:8000")
+    init_parser.add_argument("--force", action="store_true")
+
     deploy_parser = subparsers.add_parser("deploy", help="package and register the current project")
-    deploy_parser.add_argument("--project-id", default="proj_dev")
+    deploy_parser.add_argument("--project-id")
+    deploy_parser.add_argument("--api-base-url")
 
     list_parser = subparsers.add_parser("list", help="show recent runs")
     list_parser.add_argument("--limit", type=int, default=20)
@@ -100,24 +106,32 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.command == "deploy":
-        from .deploy import DeployError, deploy_project
+    if args.command == "init":
+        from .deploy import DeployError, init_project
 
         try:
-            result = deploy_project(project_id=args.project_id)
+            result = init_project(
+                project_id=args.project_id,
+                api_base_url=args.api_base_url,
+                force=args.force,
+            )
         except DeployError as exc:
             print(str(exc), file=sys.stderr)
             return 1
 
-        print(f'Deploying project "{result.project_root.name}"...')
-        print("")
-        print(f"Found {len(result.jobs)} jobs:")
-        for job in result.jobs:
-            print(f"  - {job.name}")
-        print("")
-        print(f"Packaged bundle {result.bundle_path.name}")
-        print(f"Registered deploy {result.deploy.id}")
-        print(f"Activated deploy {result.deploy.id}")
+        print(render_init_summary(result))
+        return 0
+
+    if args.command == "deploy":
+        from .deploy import DeployError, deploy_project
+
+        try:
+            result = deploy_project(project_id=args.project_id, api_base_url=args.api_base_url)
+        except DeployError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        print(render_deploy_summary(result))
         return 0
 
     client = default_client()
@@ -243,6 +257,79 @@ def require_admin_client(client: GumClient) -> GumClient:
         admin_key=admin_key,
         timeout_secs=client.timeout_secs,
     )
+
+
+def render_init_summary(result) -> str:
+    lines = [
+        "Gum init",
+        f"Root: {result.project_root}",
+        "",
+    ]
+    if result.created:
+        lines.append("Created:")
+        for path in result.created:
+            lines.append(f"  - {path.name}")
+    if result.kept:
+        if result.created:
+            lines.append("")
+        lines.append("Kept existing:")
+        for path in result.kept:
+            lines.append(f"  - {path.name}")
+    lines.extend(
+        [
+            "",
+            "Next:",
+            "  1. Set GUM_API_KEY in your shell or .env.",
+            "  2. Add @gum.job(...) functions to jobs.py.",
+            "  3. Run: gum deploy",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_deploy_summary(result) -> str:
+    function_word = "function" if len(result.jobs) == 1 else "functions"
+    lines = [
+        "Gum deploy",
+        f"Project: {result.project_id}",
+        f"API:     {result.api_base_url}",
+        f"Root:    {result.project_root.name}",
+        "",
+        f"Found {len(result.jobs)} {function_word}:",
+    ]
+    for job in result.jobs:
+        lines.append(f"  - {job.name} [{format_job_policy(job)}]")
+    lines.extend(
+        [
+            "",
+            f"Packaged: {result.bundle_path.name}",
+            f"Deploy:   {result.deploy.id}",
+            "Status:   active",
+            "",
+            "Next:",
+            "  1. Enqueue from your app with <job>.enqueue(...).",
+            "  2. Inspect a run with: gum get <run_id>",
+            "  3. Stream logs with: gum logs <run_id>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_job_policy(job) -> str:
+    parts = [job.trigger_mode]
+    if job.schedule_expr:
+        parts.append(f"every={job.schedule_expr}")
+    parts.append(f"retries={job.retries}")
+    parts.append(f"timeout={job.timeout_secs}s")
+    if job.memory_mb:
+        parts.append(f"memory={job.memory_mb}mb")
+    if job.rate_limit_spec:
+        parts.append(f"rate_limit={job.rate_limit_spec}")
+    if job.concurrency_limit:
+        parts.append(f"concurrency={job.concurrency_limit}")
+    if job.key_field:
+        parts.append(f"key={job.key_field}")
+    return ", ".join(parts)
 
 
 def launch_ratatui_admin(*, client: GumClient) -> int:

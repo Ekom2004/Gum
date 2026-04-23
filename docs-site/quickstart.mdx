@@ -11,22 +11,30 @@ During the beta, install the Python SDK from the Gum repository or from the pack
 pip install gum
 ```
 
-## 2. Configure the client
+## 2. Initialize a Gum project
 
-Set your Gum API URL and API key.
+Run `gum init` from the project root. It creates `gum.toml`, `.env.example`, a minimal `pyproject.toml` if one does not exist, and a starter `jobs.py`.
 
 ```bash
-export GUM_API_BASE_URL="https://api.your-gum-cloud.com"
+gum init --project-id proj_live --api-base-url https://api.your-gum-cloud.com
+```
+
+`gum.toml` stores non-secret project defaults.
+
+```toml
+project_id = "proj_live"
+api_base_url = "https://api.your-gum-cloud.com"
+```
+
+Set your API key separately.
+
+```bash
 export GUM_API_KEY="gum_live_..."
 ```
 
-For local development, Gum defaults to:
+For local development, Gum defaults to `http://127.0.0.1:8000`.
 
-```bash
-http://127.0.0.1:8000
-```
-
-## 3. Write a job
+## 3. Write a function
 
 Create `jobs.py`.
 
@@ -40,12 +48,12 @@ def sync_customer(customer_id: str):
     crm.sync(customer_id)
 ```
 
-## 4. Deploy
+## 4. Deploy to Gum
 
 Run deploy from the project root.
 
 ```bash
-gum deploy --project-id proj_live
+gum deploy
 ```
 
 Gum discovers decorated functions, packages your code, and registers the deploy.

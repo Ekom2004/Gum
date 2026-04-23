@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tarfile
 import tempfile
@@ -14,7 +15,16 @@ if sys.version_info < (3, 10):
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk"))
 
 from gum.client import DeployRef
-from gum.deploy import DeployError, deploy_project, discover_jobs, package_project
+from gum.deploy import (
+    DeployError,
+    deploy_project,
+    discover_jobs,
+    init_project,
+    load_project_config,
+    package_project,
+    resolve_api_base_url,
+    resolve_project_id,
+)
 
 
 @dataclass
@@ -80,6 +90,10 @@ class DeployDiscoveryTests(unittest.TestCase):
     def test_deploy_project_registers_bundle_and_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
+            (root / "gum.toml").write_text(
+                'project_id = "proj_file"\napi_base_url = "https://gum.example"\n',
+                encoding="utf-8",
+            )
             (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
             (root / "jobs.py").write_text(
                 textwrap.dedent(
@@ -98,14 +112,16 @@ class DeployDiscoveryTests(unittest.TestCase):
             )
             client = FakeClient()
 
-            result = deploy_project(root, client=client, project_id="proj_dev")
+            result = deploy_project(root, client=client)
             self.assertTrue(result.bundle_path.exists())
 
         self.assertEqual(result.deploy.id, "dep_test")
+        self.assertEqual(result.project_id, "proj_file")
+        self.assertEqual(result.api_base_url, "https://gum.example")
         self.assertEqual(len(result.jobs), 1)
         self.assertIsNotNone(client.payload)
         assert client.payload is not None
-        self.assertEqual(client.payload["project_id"], "proj_dev")
+        self.assertEqual(client.payload["project_id"], "proj_file")
         self.assertEqual(client.payload["jobs"][0]["id"], "job_sync_signup")
         self.assertEqual(client.payload["jobs"][0]["rate_limit_spec"], "openai_limit:60/m")
         self.assertEqual(client.payload["jobs"][0]["memory_mb"], 512)
@@ -152,6 +168,66 @@ class DeployDiscoveryTests(unittest.TestCase):
                 'rate limit pool "openai_limit" has conflicting definitions: openai_limit:100/m and openai_limit:60/m',
             ):
                 discover_jobs(root)
+
+    def test_init_project_writes_cloud_project_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            result = init_project(
+                root,
+                project_id="proj_live",
+                api_base_url="https://api.gum.example",
+            )
+
+            self.assertEqual(
+                {path.name for path in result.created},
+                {"gum.toml", ".env.example", "pyproject.toml", "jobs.py"},
+            )
+            self.assertEqual(result.kept, [])
+            self.assertIn('project_id = "proj_live"', (root / "gum.toml").read_text(encoding="utf-8"))
+            self.assertIn('GUM_API_KEY="gum_live_..."', (root / ".env.example").read_text(encoding="utf-8"))
+            self.assertIn("@gum.job", (root / "jobs.py").read_text(encoding="utf-8"))
+
+            second = init_project(root, project_id="proj_other")
+
+            self.assertEqual(second.created, [])
+            self.assertEqual(
+                {path.name for path in second.kept},
+                {"gum.toml", ".env.example", "pyproject.toml", "jobs.py"},
+            )
+            self.assertIn('project_id = "proj_live"', (root / "gum.toml").read_text(encoding="utf-8"))
+
+    def test_project_config_resolution_prefers_explicit_env_then_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "gum.toml").write_text(
+                'project_id = "proj_file"\napi_base_url = "https://file.example"\n',
+                encoding="utf-8",
+            )
+            old_project_id = os.environ.pop("GUM_PROJECT_ID", None)
+            old_api_base_url = os.environ.pop("GUM_API_BASE_URL", None)
+            try:
+                config = load_project_config(root)
+                self.assertEqual(config.project_id, "proj_file")
+                self.assertEqual(config.api_base_url, "https://file.example")
+                self.assertEqual(resolve_project_id(root), "proj_file")
+                self.assertEqual(resolve_api_base_url(root), "https://file.example")
+
+                os.environ["GUM_PROJECT_ID"] = "proj_env"
+                os.environ["GUM_API_BASE_URL"] = "https://env.example"
+                self.assertEqual(resolve_project_id(root), "proj_env")
+                self.assertEqual(resolve_api_base_url(root), "https://env.example")
+                self.assertEqual(resolve_project_id(root, "proj_flag"), "proj_flag")
+                self.assertEqual(resolve_api_base_url(root, "https://flag.example"), "https://flag.example")
+            finally:
+                if old_project_id is not None:
+                    os.environ["GUM_PROJECT_ID"] = old_project_id
+                else:
+                    os.environ.pop("GUM_PROJECT_ID", None)
+                if old_api_base_url is not None:
+                    os.environ["GUM_API_BASE_URL"] = old_api_base_url
+                else:
+                    os.environ.pop("GUM_API_BASE_URL", None)
 
 
 if __name__ == "__main__":

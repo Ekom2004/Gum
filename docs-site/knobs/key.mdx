@@ -42,6 +42,14 @@ Replay bypasses dedupe because replay is explicit new work.
 gum replay run_123
 ```
 
+## Retention window
+
+Key dedupe is time-bounded.
+
+Gum keeps the key claim for a retention window (currently 24 hours), then expires it.
+
+After expiry, enqueueing the same key again creates a new run.
+
 ## Honest boundary
 
 `key` prevents duplicate Gum runs at enqueue time.

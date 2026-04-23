@@ -36,9 +36,9 @@ export default function Home() {
                   Early access open
                 </div>
                 <h1 className="gum-display mb-6 max-w-[18ch] text-6xl font-medium leading-[1.02] tracking-tight text-white md:text-7xl">
-                  Run Python functions
+                  Write functions that don&apos;t break
                   <br />
-                  in the cloud.
+                  in production.
                 </h1>
 
                 <p className="mb-10 max-w-2xl text-lg leading-relaxed text-zinc-400">

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
@@ -12,7 +14,9 @@ if sys.version_info < (3, 10):
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk"))
 
 import gum.cli as gum_cli
-from gum.client import GumAPIError, LeaseStatus, LogLine, RunRecord, RunRef, RunnerStatus
+import gum.deploy as gum_deploy
+from gum.client import DeployRef, GumAPIError, LeaseStatus, LogLine, RunRecord, RunRef, RunnerStatus
+from gum.deploy import DeployResult, DiscoveredJob
 
 
 class _FakeRunsAPI:
@@ -97,6 +101,7 @@ class CliTests(unittest.TestCase):
         self._old_load_admin_key = gum_cli.load_admin_key
         self._old_default_admin_key = gum_cli.default_admin_key
         self._old_getpass = gum_cli.getpass.getpass
+        self._old_deploy_project = gum_deploy.deploy_project
         gum_cli.default_client = lambda: self.client
         gum_cli.default_admin_key = lambda: None
 
@@ -107,6 +112,7 @@ class CliTests(unittest.TestCase):
         gum_cli.load_admin_key = self._old_load_admin_key
         gum_cli.default_admin_key = self._old_default_admin_key
         gum_cli.getpass.getpass = self._old_getpass
+        gum_deploy.deploy_project = self._old_deploy_project
 
     def test_get_command_prints_run_details(self) -> None:
         stdout = io.StringIO()
@@ -236,6 +242,84 @@ class CliTests(unittest.TestCase):
     def test_render_runs_panel_uses_status_symbol_for_selected_run(self) -> None:
         lines = gum_cli.render_runs_panel([self.client.runs._run], 0)
         self.assertIn("> ●", lines[1])
+
+    def test_init_command_writes_project_files(self) -> None:
+        old_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.chdir(tmp_dir)
+            stdout = io.StringIO()
+            try:
+                with redirect_stdout(stdout):
+                    exit_code = gum_cli.main(
+                        [
+                            "init",
+                            "--project-id",
+                            "proj_live",
+                            "--api-base-url",
+                            "https://api.gum.example",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            root = Path(tmp_dir)
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((root / "gum.toml").exists())
+            self.assertTrue((root / ".env.example").exists())
+            self.assertIn("Gum init", stdout.getvalue())
+            self.assertIn("gum deploy", stdout.getvalue())
+
+    def test_deploy_command_prints_cloud_summary(self) -> None:
+        calls: list[tuple[str | None, str | None]] = []
+
+        def fake_deploy_project(*, project_id: str | None = None, api_base_url: str | None = None) -> DeployResult:
+            calls.append((project_id, api_base_url))
+            return DeployResult(
+                project_root=Path("/tmp/demo"),
+                project_id=project_id or "proj_live",
+                api_base_url=api_base_url or "https://api.gum.example",
+                bundle_path=Path("/tmp/bundle.tar.gz"),
+                jobs=[
+                    DiscoveredJob(
+                        id="job_sync_customer",
+                        name="sync_customer",
+                        handler_ref="jobs:sync_customer",
+                        trigger_mode="manual",
+                        schedule_expr=None,
+                        retries=3,
+                        timeout_secs=300,
+                        rate_limit_spec="openai_limit:60/m",
+                        concurrency_limit=5,
+                        memory_mb=1024,
+                        key_field="customer_id",
+                        compute_class=None,
+                        module_path="jobs.py",
+                    )
+                ],
+                deploy=DeployRef(id="dep_test", registered_jobs=1),
+            )
+
+        gum_deploy.deploy_project = fake_deploy_project
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(
+                [
+                    "deploy",
+                    "--project-id",
+                    "proj_live",
+                    "--api-base-url",
+                    "https://api.gum.example",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [("proj_live", "https://api.gum.example")])
+        output = stdout.getvalue()
+        self.assertIn("Gum deploy", output)
+        self.assertIn("Project: proj_live", output)
+        self.assertIn("sync_customer [manual, retries=3, timeout=300s", output)
+        self.assertIn("memory=1024mb", output)
+        self.assertIn("Deploy:   dep_test", output)
 
 
 if __name__ == "__main__":

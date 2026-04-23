@@ -6,10 +6,23 @@ description: "Register Python jobs with Gum."
 Deploy packages your Python project and registers decorated jobs.
 
 ```bash
-gum deploy --project-id proj_live
+gum deploy
 ```
 
-Run the command from a project root that has a `pyproject.toml`.
+Run the command from a project root that has a `pyproject.toml`. The fastest way to create the project files is:
+
+```bash
+gum init --project-id proj_live --api-base-url https://api.your-gum-cloud.com
+```
+
+`gum init` writes a local `gum.toml`:
+
+```toml
+project_id = "proj_live"
+api_base_url = "https://api.your-gum-cloud.com"
+```
+
+Keep secrets out of `gum.toml`; set `GUM_API_KEY` in your shell or deployment environment.
 
 ## What deploy does
 
@@ -20,6 +33,13 @@ Gum deploy:
 - packages the project into a bundle
 - uploads or registers the bundle
 - activates the deploy for future runs
+
+Project settings are resolved in this order:
+
+- CLI flags: `gum deploy --project-id proj_live --api-base-url https://api.your-gum-cloud.com`
+- environment: `GUM_PROJECT_ID`, `GUM_API_BASE_URL`
+- local config: `gum.toml`
+- development defaults: `proj_dev`, `http://127.0.0.1:8000`
 
 ## Example
 
@@ -34,7 +54,7 @@ def sync_account(account_id: str):
 ```
 
 ```bash
-gum deploy --project-id proj_live
+gum deploy
 ```
 
 ## Shared rate-limit discovery

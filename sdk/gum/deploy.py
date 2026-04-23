@@ -16,6 +16,28 @@ class DeployError(RuntimeError):
     pass
 
 
+CONFIG_FILE_NAME = "gum.toml"
+DEFAULT_PROJECT_ID = "proj_dev"
+DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
+
+
+@dataclass(slots=True)
+class GumProjectConfig:
+    project_id: str | None = None
+    api_base_url: str | None = None
+
+
+@dataclass(slots=True)
+class InitResult:
+    project_root: Path
+    config_path: Path
+    env_example_path: Path
+    pyproject_path: Path
+    jobs_path: Path
+    created: list[Path]
+    kept: list[Path]
+
+
 @dataclass(slots=True)
 class DiscoveredJob:
     id: str
@@ -36,6 +58,8 @@ class DiscoveredJob:
 @dataclass(slots=True)
 class DeployResult:
     project_root: Path
+    project_id: str
+    api_base_url: str
     bundle_path: Path
     jobs: list[DiscoveredJob]
     deploy: DeployRef
@@ -117,20 +141,23 @@ def deploy_project(
     project_root: Path | str | None = None,
     *,
     client: GumClient | None = None,
-    project_id: str = "proj_dev",
+    project_id: str | None = None,
+    api_base_url: str | None = None,
 ) -> DeployResult:
     root = Path(project_root or os.getcwd()).resolve()
+    resolved_project_id = resolve_project_id(root, project_id)
+    resolved_api_base_url = resolve_api_base_url(root, api_base_url)
     jobs = discover_jobs(root)
     if not jobs:
         raise DeployError("no gum jobs found")
 
     bundle_path = package_project(root)
-    deploy_client = client or default_client()
+    deploy_client = client or client_from_project(root, api_base_url=api_base_url)
     version = f"dev-{int(time.time())}"
     bundle_sha256 = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
     entrypoint = jobs[0].module_path
     payload = {
-        "project_id": project_id,
+        "project_id": resolved_project_id,
         "version": version,
         "bundle_url": f"file://{bundle_path}",
         "bundle_sha256": bundle_sha256,
@@ -155,7 +182,130 @@ def deploy_project(
         ],
     }
     deploy = deploy_client.register_deploy(payload)
-    return DeployResult(project_root=root, bundle_path=bundle_path, jobs=jobs, deploy=deploy)
+    return DeployResult(
+        project_root=root,
+        project_id=resolved_project_id,
+        api_base_url=resolved_api_base_url,
+        bundle_path=bundle_path,
+        jobs=jobs,
+        deploy=deploy,
+    )
+
+
+def init_project(
+    project_root: Path | str | None = None,
+    *,
+    project_id: str = DEFAULT_PROJECT_ID,
+    api_base_url: str = DEFAULT_API_BASE_URL,
+    force: bool = False,
+) -> InitResult:
+    root = Path(project_root or os.getcwd()).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    kept: list[Path] = []
+
+    config_path = root / CONFIG_FILE_NAME
+    env_example_path = root / ".env.example"
+    pyproject_path = root / "pyproject.toml"
+    jobs_path = root / "jobs.py"
+
+    _write_file(
+        config_path,
+        _render_gum_toml(project_id=project_id, api_base_url=api_base_url),
+        force=force,
+        created=created,
+        kept=kept,
+    )
+    _write_file(
+        env_example_path,
+        _render_env_example(api_base_url=api_base_url, project_id=project_id),
+        force=force,
+        created=created,
+        kept=kept,
+    )
+    _write_file(
+        pyproject_path,
+        _render_pyproject(project_name=root.name),
+        force=False,
+        created=created,
+        kept=kept,
+    )
+    _write_file(
+        jobs_path,
+        _render_jobs_py(),
+        force=False,
+        created=created,
+        kept=kept,
+    )
+    return InitResult(
+        project_root=root,
+        config_path=config_path,
+        env_example_path=env_example_path,
+        pyproject_path=pyproject_path,
+        jobs_path=jobs_path,
+        created=created,
+        kept=kept,
+    )
+
+
+def load_project_config(project_root: Path | str | None = None) -> GumProjectConfig:
+    root = Path(project_root or os.getcwd()).resolve()
+    config_path = root / CONFIG_FILE_NAME
+    if not config_path.exists():
+        return GumProjectConfig()
+    values: dict[str, str] = {}
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        value = raw_value.strip().strip('"').strip("'")
+        values[key] = value
+    return GumProjectConfig(
+        project_id=values.get("project_id") or None,
+        api_base_url=values.get("api_base_url") or None,
+    )
+
+
+def resolve_project_id(
+    project_root: Path | str | None = None,
+    explicit_project_id: str | None = None,
+) -> str:
+    if explicit_project_id:
+        return explicit_project_id
+    env_project_id = os.environ.get("GUM_PROJECT_ID")
+    if env_project_id:
+        return env_project_id
+    config = load_project_config(project_root)
+    return config.project_id or DEFAULT_PROJECT_ID
+
+
+def resolve_api_base_url(
+    project_root: Path | str | None = None,
+    explicit_api_base_url: str | None = None,
+) -> str:
+    if explicit_api_base_url:
+        return explicit_api_base_url
+    env_base_url = os.environ.get("GUM_API_BASE_URL")
+    if env_base_url:
+        return env_base_url
+    config = load_project_config(project_root)
+    return config.api_base_url or DEFAULT_API_BASE_URL
+
+
+def client_from_project(
+    project_root: Path | str | None = None,
+    *,
+    api_base_url: str | None = None,
+) -> GumClient:
+    if api_base_url is None and os.environ.get("GUM_API_BASE_URL") is not None:
+        return default_client()
+    return GumClient(
+        base_url=resolve_api_base_url(project_root, api_base_url),
+        api_key=os.environ.get("GUM_API_KEY"),
+        admin_key=os.environ.get("GUM_ADMIN_KEY"),
+    )
 
 
 def _extract_job_config(
@@ -312,3 +462,55 @@ def _rate_limit_pool_name(spec: str) -> str | None:
     if not pool_name:
         raise DeployError(f"rate limit pool must not be empty: {spec}")
     return pool_name
+
+
+def _write_file(
+    path: Path,
+    content: str,
+    *,
+    force: bool,
+    created: list[Path],
+    kept: list[Path],
+) -> None:
+    if path.exists() and not force:
+        kept.append(path)
+        return
+    path.write_text(content, encoding="utf-8")
+    created.append(path)
+
+
+def _render_gum_toml(*, project_id: str, api_base_url: str) -> str:
+    return (
+        "# Gum project config\n"
+        f'project_id = "{project_id}"\n'
+        f'api_base_url = "{api_base_url}"\n'
+    )
+
+
+def _render_env_example(*, api_base_url: str, project_id: str) -> str:
+    return (
+        f'GUM_API_BASE_URL="{api_base_url}"\n'
+        f'GUM_PROJECT_ID="{project_id}"\n'
+        'GUM_API_KEY="gum_live_..."\n'
+    )
+
+
+def _render_pyproject(*, project_name: str) -> str:
+    normalized_name = project_name.replace("_", "-").lower() or "gum-project"
+    return (
+        "[project]\n"
+        f'name = "{normalized_name}"\n'
+        'version = "0.1.0"\n'
+        'requires-python = ">=3.10"\n'
+        'dependencies = ["gum"]\n'
+    )
+
+
+def _render_jobs_py() -> str:
+    return (
+        "import gum\n\n\n"
+        '@gum.job(retries=3, timeout="5m", memory="512mb")\n'
+        "def hello(name: str) -> str:\n"
+        '    print(f"hello {name}")\n'
+        "    return name\n"
+    )
