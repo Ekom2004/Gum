@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose};
 use gum_types::AttemptStatus;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -47,7 +48,7 @@ async fn execute_leased_run_inner(
     leased: &LeasedRun,
     mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<ExecutionOutcome, String> {
-    let bundle_path = file_bundle_path(&leased.bundle_url)?;
+    let bundle_path = resolve_bundle_path(&leased.bundle_url, &leased.run_id, &leased.attempt_id)?;
     let extract_dir = prepare_extract_dir(&leased.run_id, &leased.attempt_id)?;
     extract_bundle(&bundle_path, &extract_dir).await?;
 
@@ -237,11 +238,28 @@ async fn sleep_until(deadline: Instant) {
     tokio::time::sleep_until(deadline).await;
 }
 
-fn file_bundle_path(bundle_url: &str) -> Result<PathBuf, String> {
-    let Some(path) = bundle_url.strip_prefix("file://") else {
-        return Err("runner only supports file:// bundle urls in local mode".to_string());
-    };
-    Ok(PathBuf::from(path))
+fn resolve_bundle_path(bundle_url: &str, run_id: &str, attempt_id: &str) -> Result<PathBuf, String> {
+    if let Some(path) = bundle_url.strip_prefix("file://") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(encoded) = bundle_url.strip_prefix("inline://") {
+        return write_inline_bundle(encoded, run_id, attempt_id);
+    }
+    Err("runner only supports file:// or inline:// bundle urls".to_string())
+}
+
+fn write_inline_bundle(encoded: &str, run_id: &str, attempt_id: &str) -> Result<PathBuf, String> {
+    let bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .or_else(|_| general_purpose::URL_SAFE.decode(encoded.as_bytes()))
+        .map_err(|error| format!("failed to decode inline bundle: {error}"))?;
+
+    let base = std::env::temp_dir().join("gum-runner").join("bundles");
+    std::fs::create_dir_all(&base)
+        .map_err(|error| format!("failed to create runner bundle dir: {error}"))?;
+    let path = base.join(format!("{run_id}-{attempt_id}-{}.tar.gz", timestamp_suffix()));
+    std::fs::write(&path, bytes).map_err(|error| format!("failed to write inline bundle: {error}"))?;
+    Ok(path)
 }
 
 fn prepare_extract_dir(run_id: &str, attempt_id: &str) -> Result<PathBuf, String> {

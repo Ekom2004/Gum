@@ -485,6 +485,7 @@ dependencies = [
 name = "gum-runner"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "gum-api",
  "gum-store",
  "gum-types",

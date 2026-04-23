@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import os
 import tarfile
@@ -159,7 +160,7 @@ def deploy_project(
     payload = {
         "project_id": resolved_project_id,
         "version": version,
-        "bundle_url": f"file://{bundle_path}",
+        "bundle_url": _inline_bundle_url(bundle_path),
         "bundle_sha256": bundle_sha256,
         "sdk_language": "python",
         "entrypoint": entrypoint,
@@ -190,6 +191,11 @@ def deploy_project(
         jobs=jobs,
         deploy=deploy,
     )
+
+
+def _inline_bundle_url(bundle_path: Path) -> str:
+    encoded = base64.urlsafe_b64encode(bundle_path.read_bytes()).decode("ascii")
+    return f"inline://{encoded.rstrip('=')}"
 
 
 def init_project(

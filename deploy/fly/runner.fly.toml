@@ -1,0 +1,16 @@
+app = "gum-runner-stg"
+primary_region = "yyz"
+
+[build]
+dockerfile = "Dockerfile.runner"
+
+[env]
+RUST_LOG = "info"
+GUM_API_BASE_URL = "https://gum-api-stg.fly.dev"
+GUM_RUNNER_COMPUTE_CLASS = "standard"
+GUM_RUNNER_MEMORY_MB = "1024"
+GUM_RUNNER_MAX_CONCURRENT_LEASES = "2"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "512mb"
