@@ -10,7 +10,7 @@ Ship a reliable, usable beta for serverless background jobs with one clear onboa
 
 ## Launch criteria (must be true by April 30, 2026)
 
-- [ ] Core flow works end-to-end on a fresh machine with no local assumptions.
+- [x] Core flow works end-to-end on a fresh machine with no local assumptions.
 - [x] Retry, timeout, key dedupe, and concurrency behavior are verified in tests.
 - [x] Admin auth works and no secrets are leaked in logs/docs/examples.
 - [ ] Docs are complete for first deploy and troubleshooting.
@@ -23,7 +23,7 @@ Status legend: `todo`, `in_progress`, `done`
 | Pri | Work item | Owner | Due date | Status |
 | --- | --- | --- | --- | --- |
 | P0 | Freeze beta scope and publish explicit "not in beta" list | Ekomotu (Product) | 2026-04-23 | `done` |
-| P0 | Lock onboarding path acceptance checks (`init -> deploy -> enqueue -> logs -> admin`) | Ekomotu (Product/Runtime) | 2026-04-23 | `in_progress` |
+| P0 | Lock onboarding path acceptance checks (`init -> deploy -> enqueue -> logs -> admin`) | Ekomotu (Product/Runtime) | 2026-04-23 | `done` |
 | P0 | Retry reliability matrix (provider/transient/user-code/timeout) | Ekomotu (Runtime) | 2026-04-24 | `done` |
 | P0 | Lease-loss and scheduler-recovery verification | Ekomotu (Runtime) | 2026-04-24 | `done` |
 | P0 | Key/idempotency matrix (dedupe, replay semantics, retention) | Ekomotu (Runtime) | 2026-04-25 | `done` |
@@ -40,7 +40,7 @@ Status legend: `todo`, `in_progress`, `done`
 ## Current snapshot (as of April 23, 2026)
 
 - `done`: scope freeze and "not in beta" list published in this doc.
-- `in_progress`: onboarding path is implemented in product surface (`gum init`, `gum deploy`, run inspection/admin) and needs fresh-machine validation.
+- `done`: onboarding path acceptance checks are locked with a repeatable smoke script and validated end-to-end.
 - `done`: retry reliability matrix core paths validated by targeted tests (transient, health-hold, user-code terminal, timeout).
 - `done`: lease-loss and scheduler-recovery behavior validated by targeted tests.
 - `done`: key/idempotency matrix validated for dedupe semantics, replay bypass, scalar key validation, and numeric key support; retention behavior documented.
@@ -54,7 +54,7 @@ Status legend: `todo`, `in_progress`, `done`
 | ID | Pri | Work item | Owner | Due date | Status |
 | --- | --- | --- | --- | --- | --- |
 | BETA-001 | P0 | Freeze beta scope and publish "not in beta" list | Ekomotu | 2026-04-23 | `done` |
-| BETA-002 | P0 | Lock onboarding path acceptance checks | Ekomotu | 2026-04-23 | `in_progress` |
+| BETA-002 | P0 | Lock onboarding path acceptance checks | Ekomotu | 2026-04-23 | `done` |
 | BETA-003 | P0 | Retry reliability matrix execution | Ekomotu | 2026-04-24 | `done` |
 | BETA-004 | P0 | Lease-loss and scheduler-recovery verification | Ekomotu | 2026-04-24 | `done` |
 | BETA-005 | P0 | Key/idempotency matrix execution | Ekomotu | 2026-04-25 | `done` |
@@ -79,6 +79,16 @@ Status legend: `todo`, `in_progress`, `done`
 - Dedicated managed database offering.
 - Non-core cloud provider integrations beyond current stack.
 - New public knobs that are not fully covered by tests/docs.
+
+## BETA-002 evidence (onboarding acceptance checks)
+
+Executed on April 23, 2026.
+
+| Scenario | Test command | Result |
+| --- | --- | --- |
+| End-to-end onboarding smoke (`init -> deploy -> enqueue -> logs -> admin`) | `KEEP_SMOKE_ARTIFACTS=1 ./scripts/beta_onboarding_smoke.sh` | pass |
+| Verified run id from smoke flow | `run_id=run_1776969563106_2` | pass |
+| Smoke artifacts captured (step-by-step logs) | `/tmp/gum-beta-onboarding-TvaHPG/logs` | pass |
 
 ## BETA-003 evidence (retry reliability matrix)
 
