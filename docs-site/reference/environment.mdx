@@ -45,6 +45,8 @@ API key used for normal SDK and CLI requests.
 export GUM_API_KEY="gum_live_..."
 ```
 
+Keep this secret out of `gum.toml` and out of git. Use shell env vars or an ignored local `.env`.
+
 ## `GUM_ADMIN_KEY`
 
 Admin key used for operator-only views.
@@ -52,6 +54,8 @@ Admin key used for operator-only views.
 ```bash
 export GUM_ADMIN_KEY="gum_admin_..."
 ```
+
+Keep this secret out of `gum.toml` and out of git. Use shell env vars or `gum admin login`.
 
 You can also store the admin key locally:
 

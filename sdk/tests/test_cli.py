@@ -225,6 +225,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("run_123", stdout.getvalue())
 
+    def test_admin_runs_list_uses_env_admin_key_without_unlock_prompt(self) -> None:
+        gum_cli.default_admin_key = lambda: "env-admin-secret"
+        gum_cli.load_admin_key = lambda _: (_ for _ in ()).throw(
+            AssertionError("load_admin_key should not be called when env key exists")
+        )
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["admin", "runs", "list"])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("run_123", stdout.getvalue())
+
+    def test_admin_runs_list_fails_with_missing_stored_credentials(self) -> None:
+        gum_cli.load_admin_key = lambda _: (_ for _ in ()).throw(
+            gum_cli.AdminAuthError("no stored admin credentials; run `gum admin login` first")
+        )
+        gum_cli.getpass.getpass = lambda _: "1234"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = gum_cli.main(["admin", "runs", "list"])
+        self.assertEqual(exit_code, 1)
+        self.assertIn("no stored admin credentials", stderr.getvalue())
+        self.assertNotIn("admin-secret", stderr.getvalue())
+
+    def test_admin_runs_list_fails_with_invalid_passphrase(self) -> None:
+        gum_cli.load_admin_key = lambda _: (_ for _ in ()).throw(
+            gum_cli.AdminAuthError("invalid passphrase")
+        )
+        gum_cli.getpass.getpass = lambda _: "wrong-passphrase"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = gum_cli.main(["admin", "runs", "list"])
+        self.assertEqual(exit_code, 1)
+        self.assertIn("invalid passphrase", stderr.getvalue())
+        self.assertNotIn("wrong-passphrase", stderr.getvalue())
+
     def test_filter_runs_matches_job_id_and_status(self) -> None:
         filtered = gum_cli.filter_runs([self.client.runs._run], "export")
         self.assertEqual(len(filtered), 1)

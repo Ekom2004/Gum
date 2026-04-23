@@ -11,8 +11,8 @@ Ship a reliable, usable beta for serverless background jobs with one clear onboa
 ## Launch criteria (must be true by April 30, 2026)
 
 - [ ] Core flow works end-to-end on a fresh machine with no local assumptions.
-- [ ] Retry, timeout, key dedupe, and concurrency behavior are verified in tests.
-- [ ] Admin auth works and no secrets are leaked in logs/docs/examples.
+- [x] Retry, timeout, key dedupe, and concurrency behavior are verified in tests.
+- [x] Admin auth works and no secrets are leaked in logs/docs/examples.
 - [ ] Docs are complete for first deploy and troubleshooting.
 - [ ] We can support beta users through one clear channel with response SLA.
 
@@ -27,8 +27,8 @@ Status legend: `todo`, `in_progress`, `done`
 | P0 | Retry reliability matrix (provider/transient/user-code/timeout) | Ekomotu (Runtime) | 2026-04-24 | `done` |
 | P0 | Lease-loss and scheduler-recovery verification | Ekomotu (Runtime) | 2026-04-24 | `done` |
 | P0 | Key/idempotency matrix (dedupe, replay semantics, retention) | Ekomotu (Runtime) | 2026-04-25 | `done` |
-| P0 | Concurrency slot lifecycle matrix (all release paths + restart) | Ekomotu (Runtime) | 2026-04-25 | `todo` |
-| P0 | Admin auth baseline + secrets hygiene pass | Ekomotu (Runtime/Security) | 2026-04-25 | `todo` |
+| P0 | Concurrency slot lifecycle matrix (all release paths + restart) | Ekomotu (Runtime) | 2026-04-25 | `done` |
+| P0 | Admin auth baseline + secrets hygiene pass | Ekomotu (Runtime/Security) | 2026-04-25 | `done` |
 | P0 | Ops checks (migration, backup/restore drill, rollback runbook) | Ekomotu (Ops) | 2026-04-27 | `todo` |
 | P0 | 24h staging soak and blocker triage | Ekomotu (Runtime/Ops) | 2026-04-27 | `todo` |
 | P0 | Beta support channel, owner, and response window published | Ekomotu (Support) | 2026-04-28 | `todo` |
@@ -44,6 +44,8 @@ Status legend: `todo`, `in_progress`, `done`
 - `done`: retry reliability matrix core paths validated by targeted tests (transient, health-hold, user-code terminal, timeout).
 - `done`: lease-loss and scheduler-recovery behavior validated by targeted tests.
 - `done`: key/idempotency matrix validated for dedupe semantics, replay bypass, scalar key validation, and numeric key support; retention behavior documented.
+- `done`: concurrency slot lifecycle validated across success, failure, timeout, cancel, and lost-lease recovery paths.
+- `done`: admin auth baseline and secrets hygiene pass completed (auth edge cases covered, CLI unlock/error flow verified, docs/examples secret scan enforced).
 - `in_progress`: docs foundation exists (quickstart/deploy/environment) and needs final troubleshooting/known-limits pass.
 - `in_progress`: website hero example consistency work is active and should be locked before docs freeze.
 
@@ -56,8 +58,8 @@ Status legend: `todo`, `in_progress`, `done`
 | BETA-003 | P0 | Retry reliability matrix execution | Ekomotu | 2026-04-24 | `done` |
 | BETA-004 | P0 | Lease-loss and scheduler-recovery verification | Ekomotu | 2026-04-24 | `done` |
 | BETA-005 | P0 | Key/idempotency matrix execution | Ekomotu | 2026-04-25 | `done` |
-| BETA-006 | P0 | Concurrency slot lifecycle matrix execution | Ekomotu | 2026-04-25 | `todo` |
-| BETA-007 | P0 | Admin auth + secrets hygiene pass | Ekomotu | 2026-04-25 | `todo` |
+| BETA-006 | P0 | Concurrency slot lifecycle matrix execution | Ekomotu | 2026-04-25 | `done` |
+| BETA-007 | P0 | Admin auth + secrets hygiene pass | Ekomotu | 2026-04-25 | `done` |
 | BETA-008 | P0 | Ops checks: migration, backup/restore, rollback | Ekomotu | 2026-04-27 | `todo` |
 | BETA-009 | P0 | 24h staging soak + blocker triage | Ekomotu | 2026-04-27 | `todo` |
 | BETA-010 | P0 | Support channel + response window published | Ekomotu | 2026-04-28 | `todo` |
@@ -112,6 +114,31 @@ Executed on April 23, 2026.
 | Numeric key values resolve and dedupe correctly | `cargo test -p gum-api keyed_enqueue_accepts_numeric_key_values` | pass |
 | Key retention/expiry behavior is documented | `docs-site/knobs/key.mdx` | pass |
 
+## BETA-006 evidence (concurrency slot lifecycle matrix)
+
+Executed on April 23, 2026.
+
+| Scenario | Test command | Result |
+| --- | --- | --- |
+| Slot releases on success; queued run leases next | `cargo test -p gum-api concurrency_slot_releases_after_success_and_next_run_leases` | pass |
+| Slot releases on failure; queued run leases next | `cargo test -p gum-api concurrency_slot_releases_after_failure_and_next_run_leases` | pass |
+| Slot releases on timeout; queued run leases next | `cargo test -p gum-api concurrency_slot_releases_after_timeout_and_next_run_leases` | pass |
+| Slot releases on cancel; queued run leases next | `cargo test -p gum-api concurrency_slot_releases_after_cancel_and_next_run_leases` | pass |
+| Lost lease recovery frees slot and preserves queued progress | `cargo test -p gum-api concurrency_slot_recovers_after_lost_lease_and_next_run_leases` | pass |
+
+## BETA-007 evidence (admin auth + secrets hygiene)
+
+Executed on April 23, 2026.
+
+| Scenario | Test command | Result |
+| --- | --- | --- |
+| Admin auth rejects missing/wrong/empty/malformed headers | `cargo test -p gum-api admin_auth_` | pass |
+| Admin token comparison and empty-key guard behavior | `cargo test -p gum-api constant_time_compare_matches_expected_results` | pass |
+| Local admin key storage + unlock flow works | `python3.11 -m unittest sdk.tests.test_auth.AdminAuthTests.test_store_load_and_clear_admin_key sdk.tests.test_cli.CliTests.test_admin_login_stores_encrypted_credentials sdk.tests.test_cli.CliTests.test_admin_dashboard_unlocks_before_requesting_admin_data` | pass |
+| CLI admin unlock flow uses env key and fails safely on missing/invalid credentials | `python3.11 -m unittest sdk.tests.test_cli.CliTests.test_admin_runs_list_uses_env_admin_key_without_unlock_prompt sdk.tests.test_cli.CliTests.test_admin_runs_list_fails_with_missing_stored_credentials sdk.tests.test_cli.CliTests.test_admin_runs_list_fails_with_invalid_passphrase` | pass |
+| Docs/examples secret hygiene scan (no embedded live-like keys) | `python3.11 -m unittest sdk.tests.test_secrets_hygiene` | pass |
+| Docs explicitly warn against committing API/admin secrets | `docs-site/reference/environment.mdx` + `docs-site/guides/admin-cli.mdx` | pass |
+
 ## Must-ship checklist
 
 - [x] Freeze beta scope and publish a "not in beta" list.
@@ -125,12 +152,12 @@ Executed on April 23, 2026.
 - [x] duplicate enqueue with same key dedupes correctly
 - [x] replay behavior with key is explicit and tested
 - [x] key retention/expiry behavior is documented
-- [ ] Run concurrency matrix:
-- [ ] slot acquire/release on success, failure, timeout, cancel
-- [ ] slot recovery after runner loss and scheduler restart
-- [ ] Auth/security baseline:
-- [ ] admin auth and local key storage flow verified
-- [ ] no secrets checked into config/docs/examples
+- [x] Run concurrency matrix:
+- [x] slot acquire/release on success, failure, timeout, cancel
+- [x] slot recovery after runner loss and scheduler restart
+- [x] Auth/security baseline:
+- [x] admin auth and local key storage flow verified
+- [x] no secrets checked into config/docs/examples
 - [ ] Observability minimum:
 - [ ] run status, failure class, retry_after, waiting reason visible
 - [ ] function health visibility in API/admin path

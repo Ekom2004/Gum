@@ -1090,6 +1090,407 @@ fn admin_views_expose_runs_runners_leases_and_concurrency() {
     );
 }
 
+fn register_concurrency_test_fixture(store: &MemoryStore, retries: u32) {
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_export".to_string(),
+                name: "export".to_string(),
+                handler_ref: "jobs:export".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: Some(1),
+                memory_mb: None,
+                key_field: None,
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            memory_mb: 1024,
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+}
+
+#[test]
+fn concurrency_slot_releases_after_success_and_next_run_leases() {
+    let store = MemoryStore::default();
+    register_concurrency_test_fixture(&store, 0);
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("first enqueue should work");
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_456" }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("first run should be leased");
+    let queued_run_id = if leased.run_id == first.id {
+        second.id.clone()
+    } else {
+        first.id.clone()
+    };
+
+    let before = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(before.concurrency[0].active_count, 1);
+    assert_eq!(before.concurrency[0].queued_count, 1);
+
+    let completed = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Succeeded,
+            failure_reason: None,
+            failure_class: None,
+        },
+    )
+    .expect("completion should succeed");
+    assert_eq!(completed.status, RunStatus::Succeeded);
+
+    let after = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(after.concurrency[0].active_count, 0);
+    assert_eq!(after.concurrency[0].queued_count, 1);
+    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+
+    let next = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("second lease should work")
+    .expect("queued run should now lease");
+    assert_eq!(next.run_id, queued_run_id);
+}
+
+#[test]
+fn concurrency_slot_releases_after_failure_and_next_run_leases() {
+    let store = MemoryStore::default();
+    register_concurrency_test_fixture(&store, 0);
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("first enqueue should work");
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_456" }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("first run should be leased");
+    let queued_run_id = if leased.run_id == first.id {
+        second.id.clone()
+    } else {
+        first.id.clone()
+    };
+
+    let completed = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Failed,
+            failure_reason: Some("terminal failure".to_string()),
+            failure_class: Some("user_code_error".to_string()),
+        },
+    )
+    .expect("completion should succeed");
+    assert_eq!(completed.status, RunStatus::Failed);
+
+    let after = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(after.concurrency[0].active_count, 0);
+    assert_eq!(after.concurrency[0].queued_count, 1);
+    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+
+    let next = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("second lease should work")
+    .expect("queued run should now lease");
+    assert_eq!(next.run_id, queued_run_id);
+}
+
+#[test]
+fn concurrency_slot_releases_after_timeout_and_next_run_leases() {
+    let store = MemoryStore::default();
+    register_concurrency_test_fixture(&store, 0);
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("first enqueue should work");
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_456" }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("first run should be leased");
+    let queued_run_id = if leased.run_id == first.id {
+        second.id.clone()
+    } else {
+        first.id.clone()
+    };
+
+    let completed = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::TimedOut,
+            failure_reason: Some("timeout exceeded".to_string()),
+            failure_class: Some("job_timeout".to_string()),
+        },
+    )
+    .expect("completion should succeed");
+    assert_eq!(completed.status, RunStatus::TimedOut);
+
+    let after = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(after.concurrency[0].active_count, 0);
+    assert_eq!(after.concurrency[0].queued_count, 1);
+    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+
+    let next = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("second lease should work")
+    .expect("queued run should now lease");
+    assert_eq!(next.run_id, queued_run_id);
+}
+
+#[test]
+fn concurrency_slot_releases_after_cancel_and_next_run_leases() {
+    let store = MemoryStore::default();
+    register_concurrency_test_fixture(&store, 0);
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("first enqueue should work");
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_456" }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work")
+    .expect("first run should be leased");
+    let queued_run_id = if leased.run_id == first.id {
+        second.id.clone()
+    } else {
+        first.id.clone()
+    };
+
+    service::cancel_run(&store, &leased.run_id, CancelRunRequest { reason: None })
+        .expect("cancel should work");
+
+    let completed = service::complete_attempt(
+        &store,
+        &leased.attempt_id,
+        CompleteAttemptRequest {
+            runner_id: "runner_1".to_string(),
+            status: AttemptStatus::Canceled,
+            failure_reason: Some("job canceled".to_string()),
+            failure_class: None,
+        },
+    )
+    .expect("completion should succeed");
+    assert_eq!(completed.status, RunStatus::Canceled);
+
+    let after = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(after.concurrency[0].active_count, 0);
+    assert_eq!(after.concurrency[0].queued_count, 1);
+    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+
+    let next = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("second lease should work")
+    .expect("queued run should now lease");
+    assert_eq!(next.run_id, queued_run_id);
+}
+
+#[test]
+fn concurrency_slot_recovers_after_lost_lease_and_next_run_leases() {
+    let store = MemoryStore::default();
+    register_concurrency_test_fixture(&store, 0);
+
+    let first = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_123" }),
+        },
+    )
+    .expect("first enqueue should work");
+    let second = service::enqueue_run(
+        &store,
+        "proj_1",
+        "job_export",
+        EnqueueRunRequest {
+            input: json!({ "workspace_id": "ws_456" }),
+        },
+    )
+    .expect("second enqueue should work");
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 1,
+        },
+    )
+    .expect("lease should work")
+    .expect("first run should be leased");
+    let queued_run_id = if leased.run_id == first.id {
+        second.id.clone()
+    } else {
+        first.id.clone()
+    };
+
+    let before = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(before.concurrency[0].active_count, 1);
+    assert_eq!(before.concurrency[0].queued_count, 1);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+
+    let recovered = store
+        .recover_lost_attempts(now_epoch_ms())
+        .expect("recovery should work");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, leased.run_id);
+    assert_eq!(recovered[0].status, RunStatus::Failed);
+
+    let after = service::list_concurrency(&store).expect("concurrency should list");
+    assert_eq!(after.concurrency[0].active_count, 0);
+    assert_eq!(after.concurrency[0].queued_count, 1);
+    assert_eq!(after.concurrency[0].queued_run_ids, vec![queued_run_id.clone()]);
+
+    let next = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("second lease should work")
+    .expect("queued run should now lease");
+    assert_eq!(next.run_id, queued_run_id);
+}
+
 #[test]
 fn provider_health_can_be_recorded_and_listed() {
     let store = MemoryStore::default();

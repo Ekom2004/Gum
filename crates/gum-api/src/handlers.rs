@@ -319,6 +319,9 @@ pub async fn complete_attempt(
 }
 
 fn require_admin(admin_key: &str, headers: &HeaderMap) -> Result<(), ApiError> {
+    if admin_key.trim().is_empty() {
+        return Err(ApiError::internal("admin auth misconfigured"));
+    }
     let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
         return Err(ApiError::unauthorized("missing admin authorization"));
     };
@@ -328,15 +331,33 @@ fn require_admin(admin_key: &str, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(token) = value.strip_prefix("Bearer ") else {
         return Err(ApiError::unauthorized("invalid admin authorization"));
     };
-    if token != admin_key {
+    if token.is_empty() {
+        return Err(ApiError::unauthorized("invalid admin authorization"));
+    }
+    if !constant_time_eq(token, admin_key) {
         return Err(ApiError::unauthorized("invalid admin authorization"));
     }
     Ok(())
 }
 
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    let max_len = left_bytes.len().max(right_bytes.len());
+
+    let mut diff = left_bytes.len() ^ right_bytes.len();
+    for index in 0..max_len {
+        let left_byte = left_bytes.get(index).copied().unwrap_or(0);
+        let right_byte = right_bytes.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
-    use super::require_admin;
+    use super::{constant_time_eq, require_admin};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 
     #[test]
@@ -366,6 +387,47 @@ mod tests {
             HeaderValue::from_static("Bearer admin-secret"),
         );
         require_admin("admin-secret", &headers).expect("matching token should pass");
+    }
+
+    #[test]
+    fn admin_auth_rejects_empty_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        let error = require_admin("admin-secret", &headers)
+            .expect_err("empty bearer token should fail");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn admin_auth_rejects_non_bearer_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Token admin-secret"),
+        );
+        let error =
+            require_admin("admin-secret", &headers).expect_err("non-bearer token should fail");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn admin_auth_rejects_empty_admin_key_configuration() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-secret"),
+        );
+        let error =
+            require_admin("", &headers).expect_err("empty admin key should be misconfigured");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn constant_time_compare_matches_expected_results() {
+        assert!(constant_time_eq("admin-secret", "admin-secret"));
+        assert!(!constant_time_eq("admin-secret", "admin-secrex"));
+        assert!(!constant_time_eq("admin-secret", "admin-secret-extra"));
+        assert!(!constant_time_eq("admin-secret", ""));
     }
 }
 
