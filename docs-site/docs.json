@@ -37,6 +37,7 @@
         "pages": [
           "knobs/retries",
           "knobs/timeout",
+          "knobs/cpu",
           "knobs/memory",
           "knobs/rate-limits",
           "knobs/concurrency",

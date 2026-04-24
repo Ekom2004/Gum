@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_timeout_secs: 30,
         compute_class: std::env::var("GUM_RUNNER_COMPUTE_CLASS")
             .unwrap_or_else(|_| "standard".to_string()),
+        cpu_cores: env_u32("GUM_RUNNER_CPU_CORES", 1),
         memory_mb: env_u32("GUM_RUNNER_MEMORY_MB", 1024),
         max_concurrent_leases: env_u32("GUM_RUNNER_MAX_CONCURRENT_LEASES", 1),
         internal_key: std::env::var("GUM_INTERNAL_KEY")
@@ -138,6 +139,7 @@ async fn register_once(
         .json(&RegisterRunnerRequest {
             runner_id: config.runner_id.clone(),
             compute_class: config.compute_class.clone(),
+            cpu_cores: config.cpu_cores,
             memory_mb: config.memory_mb,
             max_concurrent_leases: config.max_concurrent_leases,
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
@@ -262,6 +264,7 @@ async fn heartbeat_once(
         .json(&RunnerHeartbeatRequest {
             runner_id: config.runner_id.clone(),
             compute_class: config.compute_class.clone(),
+            cpu_cores: config.cpu_cores,
             memory_mb: config.memory_mb,
             max_concurrent_leases: config.max_concurrent_leases,
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,

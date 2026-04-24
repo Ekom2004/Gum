@@ -83,6 +83,16 @@ export GUM_RUNNER_MEMORY_MB="4096"
 
 Jobs with `memory="4gb"` can only lease onto runners with enough remaining memory capacity.
 
+## `GUM_RUNNER_CPU_CORES`
+
+CPU capacity reported by a Gum runner.
+
+```bash
+export GUM_RUNNER_CPU_CORES="4"
+```
+
+Jobs with `cpu=2` can only lease onto runners with enough remaining CPU capacity.
+
 ## `GUM_RUNNER_MAX_CONCURRENT_LEASES`
 
 Maximum active leases a runner should take at once.

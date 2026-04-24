@@ -48,7 +48,7 @@ import gum
 
 salesforce_limit = gum.rate_limit("20/m")
 
-@gum.job(retries=5, timeout="10m", memory="1gb", rate_limit=salesforce_limit, concurrency=3)
+@gum.job(retries=5, timeout="10m", cpu=2, memory="1gb", rate_limit=salesforce_limit, concurrency=3)
 def sync_account(account_id: str):
     salesforce.sync_account(account_id)
 ```

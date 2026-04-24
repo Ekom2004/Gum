@@ -56,7 +56,9 @@ class DeployRef:
 class RunnerStatus:
     id: str
     compute_class: str
+    cpu_cores: int
     memory_mb: int
+    active_cpu_cores: int
     active_memory_mb: int
     max_concurrent_leases: int
     last_heartbeat_at_epoch_ms: int
@@ -237,7 +239,9 @@ def _runner_status_from_payload(payload: dict[str, Any]) -> RunnerStatus:
     return RunnerStatus(
         id=payload["id"],
         compute_class=payload["compute_class"],
+        cpu_cores=payload.get("cpu_cores", 1),
         memory_mb=payload.get("memory_mb", 1024),
+        active_cpu_cores=payload.get("active_cpu_cores", 0),
         active_memory_mb=payload.get("active_memory_mb", 0),
         max_concurrent_leases=payload["max_concurrent_leases"],
         last_heartbeat_at_epoch_ms=payload["last_heartbeat_at_epoch_ms"],

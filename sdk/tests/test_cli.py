@@ -71,7 +71,9 @@ class _FakeAdminAPI:
             RunnerStatus(
                 id="runner_1",
                 compute_class="high-mem",
+                cpu_cores=4,
                 memory_mb=4096,
+                active_cpu_cores=2,
                 active_memory_mb=2048,
                 max_concurrent_leases=2,
                 last_heartbeat_at_epoch_ms=123456,
@@ -327,6 +329,7 @@ class CliTests(unittest.TestCase):
                         timeout_secs=300,
                         rate_limit_spec="openai_limit:60/m",
                         concurrency_limit=5,
+                        cpu_cores=2,
                         memory_mb=1024,
                         key_field="customer_id",
                         compute_class=None,
@@ -355,6 +358,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("Gum deploy", output)
         self.assertIn("Project: proj_live", output)
         self.assertIn("sync_customer [manual, retries=3, timeout=300s", output)
+        self.assertIn("cpu=2", output)
         self.assertIn("memory=1024mb", output)
         self.assertIn("Deploy:   dep_test", output)
 

@@ -25,6 +25,8 @@ pub struct RegisteredJob {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    #[serde(default)]
+    pub cpu_cores: Option<u32>,
     pub memory_mb: Option<u32>,
     pub key_field: Option<String>,
     pub compute_class: Option<String>,
@@ -96,6 +98,7 @@ pub struct LeaseRunResponse {
     pub entrypoint: String,
     pub handler_ref: String,
     pub timeout_secs: u32,
+    pub cpu_cores: Option<u32>,
     pub memory_mb: Option<u32>,
     pub lease_ttl_secs: u64,
 }
@@ -104,6 +107,8 @@ pub struct LeaseRunResponse {
 pub struct RegisterRunnerRequest {
     pub runner_id: String,
     pub compute_class: String,
+    #[serde(default = "default_runner_cpu_cores")]
+    pub cpu_cores: u32,
     #[serde(default = "default_runner_memory_mb")]
     pub memory_mb: u32,
     pub max_concurrent_leases: u32,
@@ -114,6 +119,8 @@ pub struct RegisterRunnerRequest {
 pub struct RunnerHeartbeatRequest {
     pub runner_id: String,
     pub compute_class: String,
+    #[serde(default = "default_runner_cpu_cores")]
+    pub cpu_cores: u32,
     #[serde(default = "default_runner_memory_mb")]
     pub memory_mb: u32,
     pub max_concurrent_leases: u32,
@@ -124,6 +131,10 @@ pub struct RunnerHeartbeatRequest {
 
 fn default_runner_memory_mb() -> u32 {
     1024
+}
+
+fn default_runner_cpu_cores() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +154,9 @@ pub struct RunsListResponse {
 pub struct RunnerStatusResponse {
     pub id: String,
     pub compute_class: String,
+    pub cpu_cores: u32,
     pub memory_mb: u32,
+    pub active_cpu_cores: u32,
     pub active_memory_mb: u32,
     pub max_concurrent_leases: u32,
     pub last_heartbeat_at_epoch_ms: i64,

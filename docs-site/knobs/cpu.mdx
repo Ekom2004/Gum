@@ -1,0 +1,45 @@
+---
+title: "CPU"
+description: "Choose how many CPU cores one function attempt needs."
+---
+
+Use `cpu` to tell Gum how many vCPU cores one function attempt requires.
+
+```python
+@gum.job(cpu=2, timeout="30m")
+def render_video(video_id: str):
+    video.render(video_id)
+```
+
+Gum uses this as a placement contract. A runner only leases the job when it has enough remaining CPU capacity.
+
+## Supported values
+
+Use positive integers:
+
+```python
+cpu=1
+cpu=2
+cpu=4
+cpu=8
+```
+
+## Interaction with concurrency
+
+CPU is per running attempt.
+
+```python
+@gum.job(cpu=2, concurrency=3)
+def export_workspace(workspace_id: str):
+    exports.build(workspace_id)
+```
+
+This can require up to 6 cores of runner capacity when all three slots are active.
+
+## What Gum owns
+
+Users choose the CPU contract. Gum owns the internal placement decision:
+
+- which runner can satisfy it
+- whether the run waits for capacity
+- how runner capacity is reported in the admin console

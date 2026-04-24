@@ -5,7 +5,7 @@ description: "Run Python functions in the cloud."
 
 Gum is a Python function cloud for reliable background work.
 
-You write a Python function. Gum runs it in the cloud with retries, timeouts, memory sizing, rate limits, concurrency limits, schedules, logs, replay, and duplicate protection built in.
+You write a Python function. Gum runs it in the cloud with retries, timeouts, CPU and memory sizing, rate limits, concurrency limits, schedules, logs, replay, and duplicate protection built in.
 
 ```python
 import gum
@@ -15,6 +15,7 @@ openai_limit = gum.rate_limit("60/m")
 @gum.job(
     retries=5,
     timeout="5m",
+    cpu=2,
     memory="1gb",
     rate_limit=openai_limit,
     concurrency=5,
@@ -41,6 +42,7 @@ Gum keeps the public API small:
 
 - `retries`: how many retry attempts Gum may spend
 - `timeout`: how long one attempt may run
+- `cpu`: how many vCPU cores one attempt needs
 - `memory`: how much memory one attempt needs
 - `rate_limit`: how quickly a function or shared dependency may start work
 - `concurrency`: how many runs of one function may execute at once

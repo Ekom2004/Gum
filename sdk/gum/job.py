@@ -24,6 +24,7 @@ class JobPolicy:
     timeout: str = "5m"
     rate_limit: str | None = None
     concurrency: int | None = None
+    cpu: int | None = None
     memory: str | None = None
     key: str | None = None
     compute_class: str | None = None
@@ -39,6 +40,7 @@ class GumJob(Generic[P, R]):
         timeout: str,
         rate_limit: str | RateLimit | None,
         concurrency: int | None,
+        cpu: int | None,
         memory: str | None,
         key: str | None,
         compute: str | None,
@@ -57,6 +59,7 @@ class GumJob(Generic[P, R]):
             timeout=timeout,
             rate_limit=_normalize_rate_limit(rate_limit),
             concurrency=concurrency,
+            cpu=cpu,
             memory=memory,
             key=key,
             compute_class=compute,
@@ -88,6 +91,7 @@ def job(
     timeout: str = "5m",
     rate_limit: str | RateLimit | None = None,
     concurrency: int | None = None,
+    cpu: int | None = None,
     memory: str | None = None,
     key: str | None = None,
     compute: str | None = None,
@@ -101,6 +105,7 @@ def job(
             timeout=timeout,
             rate_limit=rate_limit,
             concurrency=concurrency,
+            cpu=cpu,
             memory=memory,
             key=key,
             compute=compute,

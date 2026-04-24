@@ -36,6 +36,7 @@ pub struct JobRecord {
     pub timeout_secs: u32,
     pub rate_limit_spec: Option<String>,
     pub concurrency_limit: Option<u32>,
+    pub cpu_cores: Option<u32>,
     pub memory_mb: Option<u32>,
     pub key_field: Option<String>,
     pub compute_class: Option<String>,
@@ -92,6 +93,7 @@ pub struct LeaseRecord {
 pub struct RunnerRecord {
     pub id: String,
     pub compute_class: String,
+    pub cpu_cores: u32,
     pub memory_mb: u32,
     pub max_concurrent_leases: u32,
     pub heartbeat_timeout_secs: u64,
@@ -185,7 +187,9 @@ pub struct LeaseStateRecord {
 pub struct RunnerStatusRecord {
     pub id: String,
     pub compute_class: String,
+    pub cpu_cores: u32,
     pub memory_mb: u32,
+    pub active_cpu_cores: u32,
     pub active_memory_mb: u32,
     pub max_concurrent_leases: u32,
     pub last_heartbeat_at_epoch_ms: i64,

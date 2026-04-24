@@ -321,6 +321,8 @@ def format_job_policy(job) -> str:
         parts.append(f"every={job.schedule_expr}")
     parts.append(f"retries={job.retries}")
     parts.append(f"timeout={job.timeout_secs}s")
+    if getattr(job, "cpu_cores", None):
+        parts.append(f"cpu={job.cpu_cores}")
     if job.memory_mb:
         parts.append(f"memory={job.memory_mb}mb")
     if job.rate_limit_spec:
@@ -421,10 +423,10 @@ def render_run_table(runs: list[RunRecord]) -> str:
 def render_runner_table(runners: list[RunnerStatus]) -> str:
     if not runners:
         return "No runners found."
-    lines = ["RUNNERS", "ID                   CLASS       MEMORY       ACTIVE/MAX  HEARTBEAT(ms)"]
+    lines = ["RUNNERS", "ID                   CLASS       CPU       MEMORY       ACTIVE/MAX  HEARTBEAT(ms)"]
     for runner in runners:
         lines.append(
-            f"{runner.id:<20} {runner.compute_class:<11} {runner.active_memory_mb}/{runner.memory_mb:<8} {runner.active_lease_count}/{runner.max_concurrent_leases:<9} {runner.last_heartbeat_at_epoch_ms}"
+            f"{runner.id:<20} {runner.compute_class:<11} {runner.active_cpu_cores}/{runner.cpu_cores:<8} {runner.active_memory_mb}/{runner.memory_mb:<8} {runner.active_lease_count}/{runner.max_concurrent_leases:<9} {runner.last_heartbeat_at_epoch_ms}"
         )
     return "\n".join(lines)
 
@@ -730,13 +732,13 @@ def render_runs_panel(runs: list[RunRecord], selected_index: int) -> list[str]:
 
 
 def render_runners_panel(runners: list[RunnerStatus], selected_index: int) -> list[str]:
-    lines = ["id                   class       memory      active/max  heartbeat(ms)"]
+    lines = ["id                   class       cpu       memory      active/max  heartbeat(ms)"]
     if not runners:
         return lines + ["No runners found."]
     for index, runner in enumerate(runners[:20]):
         marker = ">" if index == selected_index else " "
         lines.append(
-            f"{marker} {runner.id:<20} {runner.compute_class:<11} {runner.active_memory_mb}/{runner.memory_mb:<8} {runner.active_lease_count}/{runner.max_concurrent_leases:<9} {runner.last_heartbeat_at_epoch_ms}"
+            f"{marker} {runner.id:<20} {runner.compute_class:<11} {runner.active_cpu_cores}/{runner.cpu_cores:<8} {runner.active_memory_mb}/{runner.memory_mb:<8} {runner.active_lease_count}/{runner.max_concurrent_leases:<9} {runner.last_heartbeat_at_epoch_ms}"
         )
     return lines
 
@@ -775,6 +777,7 @@ def render_detail_panel(state: AdminConsoleState, snapshot: AdminSnapshot) -> li
         return [
             f"runner:   {runner.id}",
             f"class:    {runner.compute_class}",
+            f"cpu:      {runner.active_cpu_cores}/{runner.cpu_cores} cores",
             f"memory:   {runner.active_memory_mb}/{runner.memory_mb} MB",
             f"active:   {runner.active_lease_count}/{runner.max_concurrent_leases}",
             f"seen:     {runner.last_heartbeat_at_epoch_ms}",

@@ -50,6 +50,7 @@ class DiscoveredJob:
     timeout_secs: int
     rate_limit_spec: str | None
     concurrency_limit: int | None
+    cpu_cores: int | None
     memory_mb: int | None
     key_field: str | None
     compute_class: str | None
@@ -73,6 +74,7 @@ class _AstJobConfig:
     timeout: str = "5m"
     rate_limit: str | None = None
     concurrency: int | None = None
+    cpu: int | None = None
     memory: str | None = None
     key: str | None = None
     compute: str | None = None
@@ -111,6 +113,7 @@ def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
                     timeout_secs=_parse_timeout_secs(config.timeout),
                     rate_limit_spec=config.rate_limit,
                     concurrency_limit=config.concurrency,
+                    cpu_cores=_parse_cpu_cores(config.cpu) if config.cpu is not None else None,
                     memory_mb=_parse_memory_mb(config.memory) if config.memory else None,
                     key_field=config.key,
                     compute_class=config.compute,
@@ -175,6 +178,7 @@ def deploy_project(
                 "timeout_secs": job.timeout_secs,
                 "rate_limit_spec": job.rate_limit_spec,
                 "concurrency_limit": job.concurrency_limit,
+                "cpu_cores": job.cpu_cores,
                 "memory_mb": job.memory_mb,
                 "key_field": job.key_field,
                 "compute_class": job.compute_class,
@@ -345,6 +349,8 @@ def _parse_decorator_keywords(node: ast.Call, bindings: _ModuleBindings) -> _Ast
             config.rate_limit = value
         elif keyword.arg == "concurrency":
             config.concurrency = int(value)
+        elif keyword.arg == "cpu":
+            config.cpu = int(value)
         elif keyword.arg == "memory":
             config.memory = str(value)
         elif keyword.arg == "key":
@@ -442,6 +448,12 @@ def _parse_memory_mb(raw: str) -> int:
     if value <= 0:
         raise DeployError("memory must be positive")
     return value * multiplier
+
+
+def _parse_cpu_cores(raw: int) -> int:
+    if raw <= 0:
+        raise DeployError("cpu must be positive")
+    return raw
 
 
 def _validate_rate_limit_pools(jobs: list[DiscoveredJob]) -> None:
