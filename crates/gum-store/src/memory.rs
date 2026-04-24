@@ -1010,7 +1010,7 @@ impl GumStore for MemoryStore {
             scheduled_at_epoch_ms: now_epoch_ms,
             failure_reason: None,
             failure_class: None,
-            retry_after_epoch_ms: None,
+            retry_after_epoch_ms: params.delay_ms.map(|delay_ms| now_epoch_ms + delay_ms),
             waiting_for_provider_slug: None,
             replay_of_run_id: None,
         };

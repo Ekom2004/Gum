@@ -394,6 +394,7 @@ def render_run_record(run: RunRecord) -> str:
         f"Replay:   {run.replay_of or '--'}",
         f"Failure:  {run.failure_reason or '--'}",
         f"Waiting:  {run.waiting_reason or '--'}",
+        f"Ready At: {run.retry_after_epoch_ms or '--'}",
     ]
     return "\n".join(lines)
 

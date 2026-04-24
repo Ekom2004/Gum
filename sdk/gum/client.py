@@ -141,8 +141,11 @@ class GumClient:
     def admin(self) -> AdminAPI:
         return AdminAPI(self)
 
-    def enqueue(self, job_id: str, payload: dict[str, Any]) -> RunRef:
-        body = self._request("POST", f"/v1/jobs/{job_id}/runs", {"input": payload})
+    def enqueue(self, job_id: str, payload: dict[str, Any], *, delay: str | None = None) -> RunRef:
+        request_body: dict[str, Any] = {"input": payload}
+        if delay is not None:
+            request_body["delay"] = delay
+        body = self._request("POST", f"/v1/jobs/{job_id}/runs", request_body)
         return _run_ref_from_payload(body)
 
     def register_deploy(self, payload: dict[str, Any]) -> DeployRef:

@@ -214,6 +214,88 @@ fn failed_attempt_requeues_when_retries_remain() {
 }
 
 #[test]
+fn enqueue_with_delay_marks_run_waiting_on_delay() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            jobs: vec![RegisteredJob {
+                id: "job_sync_customer".to_string(),
+                name: "sync_customer".to_string(),
+                handler_ref: "jobs:sync_customer".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 1,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                key_field: None,
+                compute_class: None,
+            }],
+        },
+    )
+    .expect("register deploy should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            memory_mb: 1024,
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+
+    let run = service::enqueue_run_with_delay(
+        &store,
+        "proj_1",
+        "job_sync_customer",
+        EnqueueRunRequest {
+            input: json!({ "customer_id": "cus_123" }),
+        },
+        Some("10m"),
+    )
+    .expect("enqueue should work");
+    assert_eq!(run.status, RunStatus::Queued);
+
+    let fetched = service::get_run(&store, &run.id)
+        .expect("get run should work")
+        .expect("run should exist");
+    assert_eq!(fetched.waiting_reason.as_deref(), Some("waiting_on_delay"));
+    assert!(fetched.retry_after_epoch_ms.is_some());
+
+    let leased = service::lease_run(
+        &store,
+        LeaseRunRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 30,
+        },
+    )
+    .expect("lease should work");
+    assert!(
+        leased.is_none(),
+        "delayed run should not lease before ready time"
+    );
+}
+
+#[test]
 fn function_health_blocks_retry_without_provider_config() {
     let store = MemoryStore::default();
     store

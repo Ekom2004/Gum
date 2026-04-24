@@ -69,8 +69,8 @@ class GumJob(Generic[P, R]):
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         return self._func(*args, **kwargs)
 
-    def enqueue(self, **payload: object) -> RunRef:
-        return self._gum_client().enqueue(self.id, payload)
+    def enqueue(self, *, delay: str | None = None, **payload: object) -> RunRef:
+        return self._gum_client().enqueue(self.id, payload, delay=delay)
 
     def backfill(self, items: list[dict[str, object]]) -> BackfillRef:
         return self._gum_client().backfill(self.id, items)

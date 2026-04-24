@@ -3,7 +3,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::app_state::AppState;
 use crate::routes::{
@@ -50,6 +51,13 @@ struct ErrorBody {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnqueueRunPayload {
+    input: Value,
+    #[serde(default)]
+    delay: Option<String>,
 }
 
 impl ApiError {
@@ -109,13 +117,22 @@ pub async fn enqueue_run(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(job_id): Path<String>,
-    Json(payload): Json<EnqueueRunRequest>,
+    Json(payload): Json<EnqueueRunPayload>,
 ) -> Result<Json<crate::routes::EnqueueRunResponse>, ApiError> {
     require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
     let store = state.store.clone();
     let project_id = state.project_id.clone();
+    let request = EnqueueRunRequest {
+        input: payload.input,
+    };
     let result = tokio::task::spawn_blocking(move || {
-        service::enqueue_run(&store, &project_id, &job_id, payload)
+        service::enqueue_run_with_delay(
+            &store,
+            &project_id,
+            &job_id,
+            request,
+            payload.delay.as_deref(),
+        )
     })
     .await
     .map_err(|error| ApiError::internal(format!("enqueue task failed: {error}")))?;

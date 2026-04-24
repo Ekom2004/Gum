@@ -41,6 +41,7 @@ pub struct EnqueueRunParams {
     pub deploy_id: String,
     pub input_json: Value,
     pub dedupe_key_value: Option<String>,
+    pub delay_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

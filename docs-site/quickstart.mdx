@@ -63,6 +63,9 @@ Call `.enqueue(...)` from application code.
 ```python
 run = sync_customer.enqueue(customer_id="cus_123")
 print(run.id, run.status)
+
+# delay execution by 10 minutes
+sync_customer.enqueue(customer_id="cus_123", delay="10m")
 ```
 
 If another enqueue uses the same `customer_id` while the key is active, Gum returns the existing run instead of creating duplicate work.

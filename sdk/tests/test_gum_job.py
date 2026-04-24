@@ -15,11 +15,11 @@ from gum.client import BackfillRef, RunRef
 
 class _FakeClient:
     def __init__(self) -> None:
-        self.enqueued: list[tuple[str, dict[str, object]]] = []
+        self.enqueued: list[tuple[str, dict[str, object], str | None]] = []
         self.backfills: list[tuple[str, list[dict[str, object]]]] = []
 
-    def enqueue(self, job_id: str, payload: dict[str, object]) -> RunRef:
-        self.enqueued.append((job_id, payload))
+    def enqueue(self, job_id: str, payload: dict[str, object], *, delay: str | None = None) -> RunRef:
+        self.enqueued.append((job_id, payload, delay))
         return RunRef(id="run_123", status="queued")
 
     def backfill(self, job_id: str, items: list[dict[str, object]]) -> BackfillRef:
@@ -66,7 +66,22 @@ class GumJobTests(unittest.TestCase):
 
         self.assertEqual(run.id, "run_123")
         self.assertFalse(run.deduped)
-        self.assertEqual(client.enqueued, [("job_sync_customer", {"customer_id": "cus_123"})])
+        self.assertEqual(client.enqueued, [("job_sync_customer", {"customer_id": "cus_123"}, None)])
+
+    def test_enqueue_supports_delay(self) -> None:
+        client = _FakeClient()
+
+        @gum.job(client=client)
+        def send_reminder(user_id: str) -> None:
+            raise AssertionError("job body should not run during enqueue")
+
+        run = send_reminder.enqueue(user_id="usr_1", delay="10m")
+
+        self.assertEqual(run.id, "run_123")
+        self.assertEqual(
+            client.enqueued,
+            [("job_send_reminder", {"user_id": "usr_1"}, "10m")],
+        )
 
     def test_backfill_passes_items_through(self) -> None:
         client = _FakeClient()

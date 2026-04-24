@@ -1426,13 +1426,15 @@ impl GumStore for PostgresStore {
         }
 
         let run_id = self.next_id("run");
+        let now_epoch_ms = now_epoch_ms();
+        let retry_after_epoch_ms = params.delay_ms.map(|delay_ms| now_epoch_ms + delay_ms);
         let max_attempts = retries + 1;
         let inserted = tx
             .query_one(
                 "INSERT INTO runs (
                     id, project_id, job_id, deploy_id, trigger_type, status,
-                    input_json, attempt_count, max_attempts, scheduled_at
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, NOW())
+                    input_json, attempt_count, max_attempts, scheduled_at, retry_after_epoch_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, NOW(), $9)
                  RETURNING *, (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms",
                 &[
                     &run_id,
@@ -1443,12 +1445,13 @@ impl GumStore for PostgresStore {
                     &run_status_to_str(RunStatus::Queued),
                     &params.input_json,
                     &max_attempts,
+                    &retry_after_epoch_ms,
                 ],
             )
             .map_err(|error| format!("failed to enqueue run: {error}"))?;
         let run = run_from_row(inserted)?;
         if let Some(key_value) = params.dedupe_key_value {
-            let expires_at_epoch_ms = now_epoch_ms() + key_retention_ms();
+            let expires_at_epoch_ms = now_epoch_ms + key_retention_ms();
             tx.execute(
                 "INSERT INTO run_keys (
                     project_id, job_id, key_value, run_id, expires_at

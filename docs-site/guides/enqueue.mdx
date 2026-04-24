@@ -16,6 +16,12 @@ The payload must use keyword arguments.
 sync_customer.enqueue(customer_id="cus_123", source="webhook")
 ```
 
+You can delay a run directly at enqueue time.
+
+```python
+sync_customer.enqueue(customer_id="cus_123", delay="10m")
+```
+
 ## Return value
 
 Enqueue returns a run reference.

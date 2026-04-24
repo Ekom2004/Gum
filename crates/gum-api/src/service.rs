@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use gum_store::models::{ConcurrencyStatusRecord, LogRecord, ProviderHealthState, RunRecord};
 use gum_store::queries::{
-    parse_rate_limit_spec, CancelRunParams, CompleteAttemptParams, EnqueueRunParams, GumStore,
-    HeartbeatRunnerParams, LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams,
-    RegisterRunnerParams, ReplayRunParams,
+    parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
+    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
+    RegisterDeployParams, RegisterJobParams, RegisterRunnerParams, ReplayRunParams,
 };
 use gum_types::AttemptStatus;
 use serde_json::Value;
@@ -64,6 +64,17 @@ pub fn enqueue_run<S: GumStore>(
     job_id: &str,
     request: EnqueueRunRequest,
 ) -> Result<EnqueueRunResponse, String> {
+    enqueue_run_with_delay(store, project_id, job_id, request, None)
+}
+
+pub fn enqueue_run_with_delay<S: GumStore>(
+    store: &S,
+    project_id: &str,
+    job_id: &str,
+    request: EnqueueRunRequest,
+    delay: Option<&str>,
+) -> Result<EnqueueRunResponse, String> {
+    let delay_ms = delay.map(parse_schedule_interval_ms).transpose()?;
     let job = store
         .get_job(job_id)?
         .ok_or_else(|| "job not found".to_string())?;
@@ -74,6 +85,7 @@ pub fn enqueue_run<S: GumStore>(
         deploy_id: job.deploy_id,
         input_json: request.input,
         dedupe_key_value,
+        delay_ms,
     })?;
     Ok(EnqueueRunResponse {
         id: enqueued.run.id,
@@ -466,7 +478,10 @@ fn derive_waiting_reason(
         return Some("waiting_for_function_health".to_string());
     }
     if run.retry_after_epoch_ms.is_some() {
-        return None;
+        if run.attempt_count == 0 {
+            return Some("waiting_on_delay".to_string());
+        }
+        return Some("waiting_on_retry_delay".to_string());
     }
     if let Some(concurrency) = concurrency {
         if concurrency.active_run_ids.len() as u32 >= concurrency.concurrency_limit {

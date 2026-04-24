@@ -14,4 +14,5 @@ def sync_customer(customer_id: str):
     ...
 
 sync_customer.enqueue(customer_id="cus_123")
+sync_customer.enqueue(customer_id="cus_123", delay="10m")
 ```
