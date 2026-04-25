@@ -211,7 +211,7 @@ export function HeroCodePanel() {
               <button
                 type="button"
                 onClick={showCode}
-                className="inline-flex items-center rounded border border-zinc-700 px-2 py-0.5 font-mono text-[11px] text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
+                className="inline-flex cursor-pointer items-center rounded border border-zinc-700 px-2 py-0.5 font-mono text-[11px] text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
               >
                 py
               </button>
@@ -219,7 +219,7 @@ export function HeroCodePanel() {
             <button
               type="button"
               onClick={startTerminalDemo}
-              className="inline-flex items-center rounded border border-zinc-700 px-2 py-0.5 font-mono text-[11px] text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
+              className="inline-flex cursor-pointer items-center rounded border border-zinc-700 px-2 py-0.5 font-mono text-[11px] text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
             >
               &gt;_
             </button>

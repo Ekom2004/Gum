@@ -1,0 +1,121 @@
+---
+title: "Zero To Production"
+description: "One path from first Gum function to day-2 operations."
+---
+
+Use this when you want one continuous flow instead of jumping across multiple pages.
+
+## 1. Install and initialize
+
+```bash
+pip install usegum
+gum init --project-id proj_live --api-base-url https://api.your-gum-cloud.com
+export GUM_API_KEY="gum_live_..."
+```
+
+`gum init` creates:
+
+- `gum.toml` (project defaults)
+- `.env.example`
+- `pyproject.toml` (if missing)
+- `jobs.py`
+
+## 2. Write one real function
+
+```python
+import gum
+
+openai_limit = gum.rate_limit("60/m")
+
+@gum.job(retries=5, timeout="5m", cpu=2, memory="1gb", rate_limit=openai_limit, concurrency=5, key="customer_id")
+def sync_customer(customer_id: str):
+    crm.sync(customer_id)
+```
+
+Public knobs you can use now:
+
+- `retries`
+- `timeout`
+- `cpu`
+- `memory`
+- `rate_limit`
+- `concurrency`
+- `every`
+- `key`
+
+## 3. Deploy
+
+```bash
+gum deploy
+```
+
+Deploy scans your Python files for `@gum.job(...)`, packages the project, and registers active jobs.
+
+## 4. Enqueue work
+
+```python
+run = sync_customer.enqueue(customer_id="cus_123")
+print(run.id, run.status, run.deduped)
+```
+
+Delayed enqueue:
+
+```python
+sync_customer.enqueue(customer_id="cus_123", delay="10m")
+```
+
+If `key="customer_id"` is set and the same key is already active, Gum returns the existing run (`deduped=True`) instead of creating duplicate work.
+
+## 5. Inspect one run
+
+```bash
+gum get run_123
+gum logs run_123
+gum replay run_123
+gum cancel run_123
+```
+
+## 6. Run operator workflows
+
+Open the admin console:
+
+```bash
+gum admin
+```
+
+Or use direct commands:
+
+```bash
+gum admin runs list
+gum admin runs get run_123
+gum admin logs run_123
+gum admin runners list
+gum admin leases list
+```
+
+In the interactive admin console, press `/` to filter the current view.
+
+## 7. Set runner capacity for production
+
+```bash
+export GUM_INTERNAL_KEY="gum_internal_..."
+export GUM_RUNNER_CPU_CORES="4"
+export GUM_RUNNER_MEMORY_MB="8192"
+export GUM_RUNNER_MAX_CONCURRENT_LEASES="4"
+```
+
+Gum uses CPU + memory + concurrency + rate-limit + compute-class constraints to decide lease placement.
+
+## 8. Typical production pattern
+
+```python
+import gum
+
+provider_limit = gum.rate_limit("openai:60/m")
+
+@gum.job(retries=5, timeout="10m", cpu=2, memory="2gb", rate_limit=provider_limit, concurrency=8, key="document_id")
+def summarize_document(document_id: str):
+    ai.summarize(document_id)
+```
+
+This gives you one decorator contract and one enqueue call, while Gum handles retries, timeout recovery, dedupe, and operator visibility.

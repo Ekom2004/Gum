@@ -48,7 +48,7 @@ export default function Home() {
                 </p>
 
                 <div className="flex flex-wrap items-center justify-center gap-4 lg:justify-start">
-                  <button className="gum-primary inline-flex h-11 items-center justify-center gap-3 rounded-md bg-white px-6 py-3 text-sm font-medium text-black transition-colors hover:bg-zinc-200">
+                  <button className="gum-primary inline-flex h-11 cursor-pointer items-center justify-center gap-3 rounded-md bg-white px-6 py-3 text-sm font-medium text-black transition-colors hover:bg-zinc-200">
                     <span>Start building</span>
                     <span aria-hidden="true" className="text-[0.95em] text-zinc-600">
                       →
@@ -112,7 +112,7 @@ export default function Home() {
                 Write the function. Gum runs it reliably.
               </p>
               <div className="mt-10 flex flex-wrap gap-4">
-                <button className="gum-primary inline-flex h-11 items-center gap-3 rounded-md bg-white px-6 py-3 text-sm font-medium text-black transition-colors hover:bg-zinc-200">
+                <button className="gum-primary inline-flex h-11 cursor-pointer items-center gap-3 rounded-md bg-white px-6 py-3 text-sm font-medium text-black transition-colors hover:bg-zinc-200">
                   <span>Start building</span>
                   <span aria-hidden="true" className="text-[0.95em] text-zinc-600">
                     →
