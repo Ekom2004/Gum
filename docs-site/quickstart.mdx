@@ -9,30 +9,36 @@ description: "Define, deploy, enqueue, and inspect your first Gum job."
 pip install usegum
 ```
 
-## 2. Initialize a Gum project
+## 2. Log in once
+
+```bash
+gum login
+```
+
+This stores your API key locally for the CLI/SDK.
+
+## 3. Initialize a Gum project
 
 Run `gum init` from the project root. It creates `gum.toml`, `.env.example`, a minimal `pyproject.toml` if one does not exist, and a starter `jobs.py`.
 
 ```bash
-gum init --project-id proj_live --api-base-url https://api.your-gum-cloud.com
+gum init --project-id proj_live
 ```
 
 `gum.toml` stores non-secret project defaults.
 
 ```toml
 project_id = "proj_live"
-api_base_url = "https://api.your-gum-cloud.com"
+api_base_url = "https://api.gum.cloud"
 ```
 
-Set your API key separately.
+You can still override API URL per-project:
 
 ```bash
-export GUM_API_KEY="gum_live_..."
+gum init --project-id proj_live --api-base-url https://api.your-gum-cloud.com
 ```
 
-For local development, Gum defaults to `http://127.0.0.1:8000`.
-
-## 3. Write a function
+## 4. Write a function
 
 Create `jobs.py`.
 
@@ -46,7 +52,7 @@ def sync_customer(customer_id: str):
     crm.sync(customer_id)
 ```
 
-## 4. Deploy to Gum
+## 5. Deploy to Gum
 
 Run deploy from the project root.
 
@@ -56,7 +62,7 @@ gum deploy
 
 Gum discovers decorated functions, packages your code, and registers the deploy.
 
-## 5. Enqueue work
+## 6. Enqueue work
 
 Call `.enqueue(...)` from application code.
 
@@ -70,7 +76,7 @@ sync_customer.enqueue(customer_id="cus_123", delay="10m")
 
 If another enqueue uses the same `customer_id` while the key is active, Gum returns the existing run instead of creating duplicate work.
 
-## 6. Inspect the run
+## 7. Inspect the run
 
 ```bash
 gum get run_123

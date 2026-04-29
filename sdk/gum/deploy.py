@@ -10,7 +10,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .auth import default_admin_key, default_api_key
 from .client import DeployRef, GumClient, default_client
+from .provisioning import build_runner_capacity_plan, provisioner_from_env
 
 
 class DeployError(RuntimeError):
@@ -19,7 +21,7 @@ class DeployError(RuntimeError):
 
 CONFIG_FILE_NAME = "gum.toml"
 DEFAULT_PROJECT_ID = "proj_dev"
-DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_API_BASE_URL = "https://api.gum.cloud"
 
 
 @dataclass(slots=True)
@@ -70,6 +72,8 @@ class DeployResult:
 @dataclass(slots=True)
 class _AstJobConfig:
     every: str | None = None
+    cron: str | None = None
+    timezone: str | None = None
     retries: int = 0
     timeout: str = "5m"
     rate_limit: str | None = None
@@ -107,8 +111,8 @@ def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
                     id=f"job_{node.name}",
                     name=node.name,
                     handler_ref=f"{module_name}:{node.name}",
-                    trigger_mode="schedule" if config.every else "manual",
-                    schedule_expr=config.every,
+                    trigger_mode="schedule" if (config.every or config.cron) else "manual",
+                    schedule_expr=_resolve_schedule_expr(config),
                     retries=config.retries,
                     timeout_secs=_parse_timeout_secs(config.timeout),
                     rate_limit_spec=config.rate_limit,
@@ -187,6 +191,7 @@ def deploy_project(
         ],
     }
     deploy = deploy_client.register_deploy(payload)
+    _maybe_auto_sync_runner_capacity(jobs)
     return DeployResult(
         project_root=root,
         project_id=resolved_project_id,
@@ -195,6 +200,47 @@ def deploy_project(
         jobs=jobs,
         deploy=deploy,
     )
+
+
+def _maybe_auto_sync_runner_capacity(jobs: list[DiscoveredJob]) -> None:
+    auto_raw = os.environ.get("GUM_AUTO_SYNC_RUNNER_CAPACITY")
+    auto_enabled = auto_raw is not None and auto_raw.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    auto_disabled = auto_raw is not None and auto_raw.strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if auto_disabled:
+        return
+
+    try:
+        provisioner = provisioner_from_env()
+    except RuntimeError as exc:
+        if auto_enabled:
+            raise DeployError(f"runner capacity auto-sync failed: {exc}") from exc
+        return
+
+    parallelism_raw = os.environ.get("GUM_RUNNER_PARALLELISM", "1").strip()
+    if not parallelism_raw.isdigit() or int(parallelism_raw) <= 0:
+        raise DeployError("GUM_RUNNER_PARALLELISM must be a positive integer")
+    parallelism = int(parallelism_raw)
+    compute_class = os.environ.get("GUM_RUNNER_COMPUTE_CLASS", "standard")
+
+    plan = build_runner_capacity_plan(
+        jobs,
+        compute_class=compute_class,
+        parallelism=parallelism,
+    )
+    try:
+        provisioner.sync(plan)
+    except RuntimeError as exc:
+        raise DeployError(f"runner capacity auto-sync failed: {exc}") from exc
 
 
 def _inline_bundle_url(bundle_path: Path) -> str:
@@ -313,8 +359,8 @@ def client_from_project(
         return default_client()
     return GumClient(
         base_url=resolve_api_base_url(project_root, api_base_url),
-        api_key=os.environ.get("GUM_API_KEY"),
-        admin_key=os.environ.get("GUM_ADMIN_KEY"),
+        api_key=default_api_key(),
+        admin_key=default_admin_key(),
     )
 
 
@@ -341,6 +387,10 @@ def _parse_decorator_keywords(node: ast.Call, bindings: _ModuleBindings) -> _Ast
         value = _literal_value(keyword.value, bindings)
         if keyword.arg == "every":
             config.every = value
+        elif keyword.arg == "cron":
+            config.cron = str(value)
+        elif keyword.arg == "timezone":
+            config.timezone = str(value)
         elif keyword.arg == "retries":
             config.retries = int(value)
         elif keyword.arg == "timeout":
@@ -358,6 +408,24 @@ def _parse_decorator_keywords(node: ast.Call, bindings: _ModuleBindings) -> _Ast
         elif keyword.arg == "compute":
             config.compute = value
     return config
+
+
+def _resolve_schedule_expr(config: _AstJobConfig) -> str | None:
+    if config.every and config.cron:
+        raise DeployError("only one of every or cron may be set")
+    if config.timezone and not config.cron:
+        raise DeployError("timezone requires cron")
+    if config.cron:
+        cron = str(config.cron).strip()
+        if not cron:
+            raise DeployError("cron must not be empty")
+        if config.timezone is not None:
+            timezone = str(config.timezone).strip()
+            if not timezone:
+                raise DeployError("timezone must not be empty")
+            return f"cron:tz={timezone};{cron}"
+        return f"cron:{cron}"
+    return config.every
 
 
 def _collect_module_bindings(tree: ast.Module) -> _ModuleBindings:
@@ -507,7 +575,7 @@ def _render_gum_toml(*, project_id: str, api_base_url: str) -> str:
 
 def _render_env_example(*, api_base_url: str, project_id: str) -> str:
     return (
-        f'GUM_API_BASE_URL="{api_base_url}"\n'
+        f'# GUM_API_BASE_URL="{api_base_url}"\n'
         f'GUM_PROJECT_ID="{project_id}"\n'
         'GUM_API_KEY="gum_live_..."\n'
     )

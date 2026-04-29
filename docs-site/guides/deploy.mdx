@@ -12,17 +12,18 @@ gum deploy
 Run the command from a project root that has a `pyproject.toml`. The fastest way to create the project files is:
 
 ```bash
-gum init --project-id proj_live --api-base-url https://api.your-gum-cloud.com
+gum login
+gum init --project-id proj_live
 ```
 
 `gum init` writes a local `gum.toml`:
 
 ```toml
 project_id = "proj_live"
-api_base_url = "https://api.your-gum-cloud.com"
+api_base_url = "https://api.gum.cloud"
 ```
 
-Keep secrets out of `gum.toml`; set `GUM_API_KEY` in your shell or deployment environment.
+Keep secrets out of `gum.toml`; use `gum login` (recommended) or set `GUM_API_KEY` in your shell or deployment environment.
 
 ## What deploy does
 
@@ -39,7 +40,7 @@ Project settings are resolved in this order:
 - CLI flags: `gum deploy --project-id proj_live --api-base-url https://api.your-gum-cloud.com`
 - environment: `GUM_PROJECT_ID`, `GUM_API_BASE_URL`
 - local config: `gum.toml`
-- development defaults: `proj_dev`, `http://127.0.0.1:8000`
+- defaults: `proj_dev`, `https://api.gum.cloud`
 
 ## Example
 

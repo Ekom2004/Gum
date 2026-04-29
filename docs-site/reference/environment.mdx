@@ -14,7 +14,7 @@ export GUM_API_BASE_URL="https://api.your-gum-cloud.com"
 Default:
 
 ```bash
-http://127.0.0.1:8000
+https://api.gum.cloud
 ```
 
 You can also store this non-secret value in `gum.toml`.
@@ -45,7 +45,13 @@ API key used for normal SDK and CLI requests.
 export GUM_API_KEY="gum_live_..."
 ```
 
-Keep this secret out of `gum.toml` and out of git. Use shell env vars or an ignored local `.env`.
+Keep this secret out of `gum.toml` and out of git. Use shell env vars, an ignored local `.env`, or `gum login`.
+
+You can also store user credentials locally:
+
+```bash
+gum login
+```
 
 ## `GUM_ADMIN_KEY`
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import json
 from pathlib import Path
 
 
@@ -10,8 +11,51 @@ class AdminAuthError(RuntimeError):
     pass
 
 
+class UserAuthError(RuntimeError):
+    pass
+
+
 def default_admin_key() -> str | None:
     return os.environ.get("GUM_ADMIN_KEY")
+
+
+def default_api_key() -> str | None:
+    value = os.environ.get("GUM_API_KEY")
+    if value:
+        return value
+    return load_stored_api_key()
+
+
+def default_api_base_url(default_base_url: str) -> str:
+    value = os.environ.get("GUM_API_BASE_URL")
+    if value:
+        return value
+    profile = _load_profile()
+    stored = profile.get("api_base_url")
+    if isinstance(stored, str) and stored.strip():
+        return stored.strip()
+    return default_base_url
+
+
+def store_api_credentials(api_key: str, *, api_base_url: str | None = None) -> None:
+    normalized_key = api_key.strip()
+    if not normalized_key:
+        raise UserAuthError("api key cannot be empty")
+    profile = _load_profile()
+    profile["api_key"] = normalized_key
+    if api_base_url is not None and api_base_url.strip():
+        profile["api_base_url"] = api_base_url.strip()
+    _store_profile(profile)
+
+
+def clear_api_credentials() -> bool:
+    profile = _load_profile()
+    had_key = "api_key" in profile
+    if not had_key:
+        return False
+    profile.pop("api_key", None)
+    _store_profile(profile)
+    return True
 
 
 def store_admin_key(admin_key: str, passphrase: str) -> None:
@@ -90,10 +134,14 @@ def clear_admin_key() -> bool:
 
 
 def admin_credentials_path() -> Path:
+    return gum_config_root() / "admin.enc"
+
+
+def gum_config_root() -> Path:
     root = os.environ.get("GUM_HOME")
     if root:
-        return Path(root).expanduser() / "admin.enc"
-    return Path.home() / ".config" / "gum" / "admin.enc"
+        return Path(root).expanduser()
+    return Path.home() / ".config" / "gum"
 
 
 def _openssl_path() -> str:
@@ -101,3 +149,35 @@ def _openssl_path() -> str:
     if openssl is None:
         raise AdminAuthError("openssl is required for admin credential storage")
     return openssl
+
+
+def profile_path() -> Path:
+    return gum_config_root() / "profile.json"
+
+
+def _load_profile() -> dict[str, object]:
+    path = profile_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise UserAuthError("stored user profile is invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise UserAuthError("stored user profile is invalid")
+    return data
+
+
+def _store_profile(profile: dict[str, object]) -> None:
+    path = profile_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def load_stored_api_key() -> str | None:
+    profile = _load_profile()
+    value = profile.get("api_key")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None

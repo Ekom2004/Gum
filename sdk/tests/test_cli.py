@@ -100,6 +100,9 @@ class CliTests(unittest.TestCase):
         self._old_default_client = gum_cli.default_client
         self._old_store_admin_key = gum_cli.store_admin_key
         self._old_clear_admin_key = gum_cli.clear_admin_key
+        self._old_store_api_credentials = gum_cli.store_api_credentials
+        self._old_clear_api_credentials = gum_cli.clear_api_credentials
+        self._old_default_api_base_url = gum_cli.default_api_base_url
         self._old_load_admin_key = gum_cli.load_admin_key
         self._old_default_admin_key = gum_cli.default_admin_key
         self._old_getpass = gum_cli.getpass.getpass
@@ -111,6 +114,9 @@ class CliTests(unittest.TestCase):
         gum_cli.default_client = self._old_default_client
         gum_cli.store_admin_key = self._old_store_admin_key
         gum_cli.clear_admin_key = self._old_clear_admin_key
+        gum_cli.store_api_credentials = self._old_store_api_credentials
+        gum_cli.clear_api_credentials = self._old_clear_api_credentials
+        gum_cli.default_api_base_url = self._old_default_api_base_url
         gum_cli.load_admin_key = self._old_load_admin_key
         gum_cli.default_admin_key = self._old_default_admin_key
         gum_cli.getpass.getpass = self._old_getpass
@@ -206,6 +212,26 @@ class CliTests(unittest.TestCase):
             exit_code = gum_cli.main(["admin", "logout"])
         self.assertEqual(exit_code, 0)
         self.assertIn("Cleared stored admin credentials.", stdout.getvalue())
+
+    def test_login_stores_user_credentials(self) -> None:
+        stored: list[tuple[str, str | None]] = []
+        gum_cli.store_api_credentials = lambda api_key, api_base_url=None: stored.append((api_key, api_base_url))
+        gum_cli.default_api_base_url = lambda _default: "https://api.gum.cloud"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["login", "--api-key", "gum_live_test"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stored, [("gum_live_test", None)])
+        self.assertIn("Stored Gum API credentials.", stdout.getvalue())
+        self.assertIn("API: https://api.gum.cloud", stdout.getvalue())
+
+    def test_logout_clears_user_credentials(self) -> None:
+        gum_cli.clear_api_credentials = lambda: True
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["logout"])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Cleared stored Gum API credentials.", stdout.getvalue())
 
     def test_admin_dashboard_unlocks_before_requesting_admin_data(self) -> None:
         gum_cli.load_admin_key = lambda passphrase: "admin-secret" if passphrase == "1234" else ""

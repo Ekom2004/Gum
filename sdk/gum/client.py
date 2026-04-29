@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 from urllib import error, request
 
+from .auth import default_admin_key, default_api_base_url, default_api_key
+
+
+DEFAULT_API_BASE_URL = "https://api.gum.cloud"
+
 
 class GumAPIError(RuntimeError):
     pass
@@ -198,9 +203,9 @@ class GumClient:
 
 def default_client() -> GumClient:
     return GumClient(
-        base_url=os.environ.get("GUM_API_BASE_URL", "http://127.0.0.1:8000"),
-        api_key=os.environ.get("GUM_API_KEY"),
-        admin_key=os.environ.get("GUM_ADMIN_KEY"),
+        base_url=default_api_base_url(DEFAULT_API_BASE_URL),
+        api_key=default_api_key(),
+        admin_key=default_admin_key(),
     )
 
 

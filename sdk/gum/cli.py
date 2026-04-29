@@ -12,8 +12,27 @@ import time
 from dataclasses import dataclass
 from typing import Iterable
 
-from .auth import AdminAuthError, clear_admin_key, default_admin_key, load_admin_key, store_admin_key
-from .client import GumAPIError, GumClient, LeaseStatus, LogLine, RunRecord, RunnerStatus, default_client
+from .auth import (
+    AdminAuthError,
+    UserAuthError,
+    clear_admin_key,
+    clear_api_credentials,
+    default_admin_key,
+    default_api_base_url,
+    load_admin_key,
+    store_admin_key,
+    store_api_credentials,
+)
+from .client import (
+    DEFAULT_API_BASE_URL,
+    GumAPIError,
+    GumClient,
+    LeaseStatus,
+    LogLine,
+    RunRecord,
+    RunnerStatus,
+    default_client,
+)
 
 
 TERMINAL_RUN_STATUSES = {"succeeded", "failed", "timed_out", "canceled"}
@@ -43,9 +62,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gum")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    login_parser = subparsers.add_parser("login", help="store Gum API credentials locally")
+    login_parser.add_argument("--api-key")
+    login_parser.add_argument("--api-base-url")
+
+    subparsers.add_parser("logout", help="remove stored Gum API credentials")
+
     init_parser = subparsers.add_parser("init", help="create Gum project config")
     init_parser.add_argument("--project-id", default="proj_dev")
-    init_parser.add_argument("--api-base-url", default="http://127.0.0.1:8000")
+    init_parser.add_argument("--api-base-url", default=DEFAULT_API_BASE_URL)
     init_parser.add_argument("--force", action="store_true")
 
     deploy_parser = subparsers.add_parser("deploy", help="package and register the current project")
@@ -106,6 +131,40 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.command == "login":
+        try:
+            raw_api_key = args.api_key or os.environ.get("GUM_API_KEY")
+            if raw_api_key is None:
+                raw_api_key = getpass.getpass("API key: ")
+            api_key = raw_api_key.strip()
+            if not api_key:
+                raise UserAuthError("api key cannot be empty")
+            api_base_url = args.api_base_url or os.environ.get("GUM_API_BASE_URL")
+            store_api_credentials(api_key, api_base_url=api_base_url)
+            resolved_base_url = default_api_base_url(DEFAULT_API_BASE_URL)
+        except UserAuthError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print("Stored Gum API credentials.")
+        print(f"API: {resolved_base_url}")
+        print("")
+        print("Next:")
+        print("  1. Add @gum.job(...) functions to jobs.py.")
+        print("  2. Run: gum deploy")
+        return 0
+
+    if args.command == "logout":
+        try:
+            cleared = clear_api_credentials()
+        except UserAuthError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if cleared:
+            print("Cleared stored Gum API credentials.")
+        else:
+            print("No stored Gum API credentials.")
+        return 0
+
     if args.command == "init":
         from .deploy import DeployError, init_project
 
@@ -134,9 +193,8 @@ def main(argv: list[str] | None = None) -> int:
         print(render_deploy_summary(result))
         return 0
 
-    client = default_client()
-
     try:
+        client = default_client()
         if args.command == "list":
             admin_client = require_admin_client(client)
             runs = admin_client.runs.list()[: args.limit]
@@ -181,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "admin":
             return handle_admin_command(args, client)
-    except (GumAPIError, AdminAuthError) as exc:
+    except (GumAPIError, AdminAuthError, UserAuthError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -279,7 +337,7 @@ def render_init_summary(result) -> str:
         [
             "",
             "Next:",
-            "  1. Set GUM_API_KEY in your shell or .env.",
+            "  1. Run: gum login",
             "  2. Add @gum.job(...) functions to jobs.py.",
             "  3. Run: gum deploy",
         ]
@@ -318,7 +376,20 @@ def render_deploy_summary(result) -> str:
 def format_job_policy(job) -> str:
     parts = [job.trigger_mode]
     if job.schedule_expr:
-        parts.append(f"every={job.schedule_expr}")
+        if str(job.schedule_expr).startswith("cron:"):
+            cron_spec = str(job.schedule_expr)[5:]
+            timezone = None
+            cron_expr = cron_spec
+            if cron_spec.startswith("tz="):
+                tz_spec, sep, expr = cron_spec.partition(";")
+                if sep and expr:
+                    timezone = tz_spec[3:]
+                    cron_expr = expr
+            parts.append(f"cron={cron_expr}")
+            if timezone:
+                parts.append(f"timezone={timezone}")
+        else:
+            parts.append(f"every={job.schedule_expr}")
     parts.append(f"retries={job.retries}")
     parts.append(f"timeout={job.timeout_secs}s")
     if getattr(job, "cpu_cores", None):
