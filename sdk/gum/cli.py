@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import curses
 import getpass
 import os
 from pathlib import Path
@@ -11,6 +10,11 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Iterable
+
+try:
+    import curses
+except ModuleNotFoundError:  # pragma: no cover - exercised on Windows CI
+    curses = None  # type: ignore[assignment]
 
 from .auth import (
     AdminAuthError,
@@ -560,6 +564,8 @@ def admin_live_view(*, client: GumClient, interval_secs: float, once: bool) -> i
 
 
 def run_admin_console(*, client: GumClient, interval_secs: float) -> int:
+    if curses is None:
+        raise AdminAuthError("interactive console requires curses (not available on this platform)")
     state = AdminConsoleState()
     return curses.wrapper(lambda screen: _admin_console_loop(screen, client, interval_secs, state))
 
