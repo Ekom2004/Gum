@@ -30,4 +30,4 @@ jobs:
         run: python -c "import gum; print('gum import ok')"
 
       - name: Run SDK unit tests
-        run: python -m unittest sdk.tests.test_cli sdk.tests.test_deploy sdk.tests.test_provisioning
+        run: python -m unittest discover -s sdk/tests -p "test_*.py"
