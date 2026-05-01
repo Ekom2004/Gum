@@ -19,9 +19,13 @@ Two workflows are available:
 
 Configure trusted publishing on PyPI for this GitHub repo/environment:
 
-1. In PyPI project `usegum`, add a trusted publisher for this repository.
-2. Use environment `pypi` for production releases.
-3. Optional: configure `testpypi` environment for TestPyPI.
+1. In PyPI project `usegum`, add a GitHub Actions trusted publisher with:
+   - repository owner: `Ekom2004`
+   - repository name: `Gum`
+   - workflow filename: `release-pypi.yml`
+   - environment: `pypi`
+2. If this repo was previously configured under an older owner/name such as `ekomotu/gum`, update or remove that old publisher entry first.
+3. Optional: configure a second trusted publisher for TestPyPI using the same owner/repo/workflow and environment `testpypi`.
 
 ### Release by tag
 
