@@ -1,0 +1,11 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Gum Reliability Mark Balanced</title>
+  <desc id="desc">Rounded square container with queue lanes, a routed job dot, and check path.</desc>
+  <rect x="18" y="18" width="92" height="92" rx="14" stroke="#FFFFFF" stroke-width="5"/>
+  <path d="M34 46H94" stroke="#3F3F46" stroke-width="5" stroke-linecap="round"/>
+  <path d="M34 64H94" stroke="#3F3F46" stroke-width="5" stroke-linecap="round"/>
+  <path d="M34 82H94" stroke="#3F3F46" stroke-width="5" stroke-linecap="round"/>
+  <path d="M48 64H68" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="74" cy="64" r="6" fill="#FFFFFF"/>
+  <path d="M82 64L90 72L104 56" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

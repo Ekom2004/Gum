@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import ast
 import base64
+import getpass
 import hashlib
 import os
+import re
+import sys
 import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+import tomllib
 
 from .auth import default_admin_key, default_api_key
 from .client import DeployRef, GumClient, default_client
@@ -22,6 +27,15 @@ class DeployError(RuntimeError):
 CONFIG_FILE_NAME = "gum.toml"
 DEFAULT_PROJECT_ID = "proj_dev"
 DEFAULT_API_BASE_URL = "https://api.gum.cloud"
+DEFAULT_SECRET_ENV = "prod"
+
+_PROVIDER_SECRET_MAP = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "resend": "RESEND_API_KEY",
+    "stripe": "STRIPE_API_KEY",
+}
+_SECRET_NAME_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 
 
 @dataclass(slots=True)
@@ -56,6 +70,7 @@ class DiscoveredJob:
     memory_mb: int | None
     key_field: str | None
     compute_class: str | None
+    required_secret_names: list[str]
     module_path: str
 
 
@@ -67,6 +82,13 @@ class DeployResult:
     bundle_path: Path
     jobs: list[DiscoveredJob]
     deploy: DeployRef
+
+
+@dataclass(slots=True)
+class RuntimeSpec:
+    python_version: str
+    deps_mode: str | None
+    deps_hash: str | None
 
 
 @dataclass(slots=True)
@@ -82,6 +104,7 @@ class _AstJobConfig:
     memory: str | None = None
     key: str | None = None
     compute: str | None = None
+    compute_class: str | None = None
 
 
 @dataclass(slots=True)
@@ -100,6 +123,9 @@ def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
         bindings = _collect_module_bindings(tree)
+        module_required_secrets = sorted(
+            _discover_provider_required_secrets(tree) | _discover_env_secret_names(tree)
+        )
         for node in tree.body:
             if not isinstance(node, ast.FunctionDef):
                 continue
@@ -120,7 +146,8 @@ def discover_jobs(project_root: Path) -> list[DiscoveredJob]:
                     cpu_cores=_parse_cpu_cores(config.cpu) if config.cpu is not None else None,
                     memory_mb=_parse_memory_mb(config.memory) if config.memory else None,
                     key_field=config.key,
-                    compute_class=config.compute,
+                    compute_class=config.compute_class or config.compute,
+                    required_secret_names=list(module_required_secrets),
                     module_path=module_path,
                 )
             )
@@ -155,12 +182,20 @@ def deploy_project(
     root = Path(project_root or os.getcwd()).resolve()
     resolved_project_id = resolve_project_id(root, project_id)
     resolved_api_base_url = resolve_api_base_url(root, api_base_url)
+    deploy_client = client or client_from_project(root, api_base_url=api_base_url)
     jobs = discover_jobs(root)
     if not jobs:
         raise DeployError("no gum jobs found")
 
+    _ensure_required_secrets(
+        root,
+        jobs,
+        deploy_client,
+        project_id=resolved_project_id,
+    )
+    runtime_spec = discover_runtime_spec(root)
+
     bundle_path = package_project(root)
-    deploy_client = client or client_from_project(root, api_base_url=api_base_url)
     version = f"dev-{int(time.time())}"
     bundle_sha256 = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
     entrypoint = jobs[0].module_path
@@ -171,6 +206,9 @@ def deploy_project(
         "bundle_sha256": bundle_sha256,
         "sdk_language": "python",
         "entrypoint": entrypoint,
+        "python_version": runtime_spec.python_version,
+        "deps_mode": runtime_spec.deps_mode,
+        "deps_hash": runtime_spec.deps_hash,
         "jobs": [
             {
                 "id": job.id,
@@ -186,12 +224,14 @@ def deploy_project(
                 "memory_mb": job.memory_mb,
                 "key_field": job.key_field,
                 "compute_class": job.compute_class,
+                "required_secret_names": job.required_secret_names,
             }
             for job in jobs
         ],
     }
     deploy = deploy_client.register_deploy(payload)
     _maybe_auto_sync_runner_capacity(jobs)
+    _maybe_request_runtime_prepare(deploy_client, deploy.id, runtime_spec)
     return DeployResult(
         project_root=root,
         project_id=resolved_project_id,
@@ -200,6 +240,237 @@ def deploy_project(
         jobs=jobs,
         deploy=deploy,
     )
+
+
+def discover_runtime_spec(project_root: Path) -> RuntimeSpec:
+    pyproject_path = project_root / "pyproject.toml"
+    pyproject_text = pyproject_path.read_text(encoding="utf-8")
+    pyproject = tomllib.loads(pyproject_text)
+    python_version = _resolve_python_version(pyproject)
+
+    uv_lock_path = project_root / "uv.lock"
+    if uv_lock_path.exists():
+        return RuntimeSpec(
+            python_version=python_version,
+            deps_mode="uv_lock",
+            deps_hash=hashlib.sha256(uv_lock_path.read_bytes()).hexdigest(),
+        )
+
+    requirements_path = project_root / "requirements.txt"
+    if requirements_path.exists():
+        return RuntimeSpec(
+            python_version=python_version,
+            deps_mode="requirements_txt",
+            deps_hash=hashlib.sha256(requirements_path.read_bytes()).hexdigest(),
+        )
+
+    return RuntimeSpec(
+        python_version=python_version,
+        deps_mode=None,
+        deps_hash=None,
+    )
+
+
+def _resolve_python_version(pyproject: dict[str, object]) -> str:
+    project = pyproject.get("project")
+    if not isinstance(project, dict):
+        return "3.11"
+    requires_python = project.get("requires-python")
+    if not isinstance(requires_python, str):
+        return "3.11"
+    match = re.search(r"([0-9]+)\\.([0-9]+)", requires_python)
+    if not match:
+        return "3.11"
+    return f"{match.group(1)}.{match.group(2)}"
+
+
+def _maybe_request_runtime_prepare(
+    client: GumClient, deploy_id: str, runtime_spec: RuntimeSpec
+) -> None:
+    enabled = os.environ.get("GUM_PREWARM_RUNTIME", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return
+    if runtime_spec.deps_mode is None or runtime_spec.deps_hash is None:
+        return
+    try:
+        client.prepare_deploy_runtime(deploy_id)
+        print("remote runtime prepare requested")
+    except Exception as exc:
+        print(f"remote runtime prepare skipped: {exc}")
+
+def _ensure_required_secrets(
+    project_root: Path,
+    jobs: list[DiscoveredJob],
+    client: GumClient,
+    *,
+    project_id: str,
+) -> None:
+    required = discover_required_secrets(project_root, [job.module_path for job in jobs])
+    if not required:
+        return
+    environment = resolve_secret_environment()
+    existing_names = {
+        metadata.name for metadata in client.secrets.list(environment=environment)
+    }
+    missing = [name for name in required if name not in existing_names]
+    if not missing:
+        return
+
+    unresolved: list[str] = []
+    for name in missing:
+        env_name = f"GUM_SECRET_{name}"
+        env_value = os.environ.get(env_name)
+        if env_value is None or not env_value.strip():
+            unresolved.append(name)
+            continue
+        client.secrets.set(name, env_value.strip(), environment=environment)
+
+    if not unresolved:
+        return
+
+    if _stdin_is_tty():
+        for name in unresolved:
+            value = getpass.getpass(
+                f"Missing secret {name} (env={environment}). Enter value (input hidden): "
+            ).strip()
+            if not value:
+                raise DeployError(f"secret {name} cannot be empty")
+            client.secrets.set(name, value, environment=environment)
+        return
+
+    joined = ", ".join(unresolved)
+    hints = "\n".join(
+        [f"  - export GUM_SECRET_{name}='<value>'" for name in unresolved]
+    )
+    raise DeployError(
+        f"missing required secrets for project={project_id} env={environment}: {joined}\n"
+        "Provide them in CI before deploy, for example:\n"
+        f"{hints}"
+    )
+
+
+def discover_required_secrets(project_root: Path, module_paths: list[str]) -> list[str]:
+    root = project_root.resolve()
+    required: set[str] = set()
+    for module_path in sorted(set(module_paths)):
+        path = root / module_path
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        required.update(_discover_provider_required_secrets(tree))
+        required.update(_discover_env_secret_names(tree))
+    return sorted(required)
+
+
+def resolve_secret_environment() -> str:
+    raw = os.environ.get("GUM_SECRET_ENV", DEFAULT_SECRET_ENV).strip()
+    if not raw:
+        return DEFAULT_SECRET_ENV
+    return raw
+
+
+def _discover_provider_required_secrets(tree: ast.Module) -> set[str]:
+    required: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                provider = alias.name.split(".", 1)[0]
+                secret_name = _PROVIDER_SECRET_MAP.get(provider)
+                if secret_name:
+                    required.add(secret_name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is None:
+                continue
+            provider = node.module.split(".", 1)[0]
+            secret_name = _PROVIDER_SECRET_MAP.get(provider)
+            if secret_name:
+                required.add(secret_name)
+    return required
+
+
+def _discover_env_secret_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        name = _secret_name_from_environ_subscript(node)
+        if name and _looks_like_secret_name(name):
+            names.add(name)
+            continue
+        name = _secret_name_from_environ_get(node)
+        if name and _looks_like_secret_name(name):
+            names.add(name)
+            continue
+        name = _secret_name_from_getenv(node)
+        if name and _looks_like_secret_name(name):
+            names.add(name)
+    return names
+
+
+def _secret_name_from_environ_subscript(node: ast.AST) -> str | None:
+    if not isinstance(node, ast.Subscript):
+        return None
+    if not _is_os_environ(node.value):
+        return None
+    return _literal_string(node.slice)
+
+
+def _secret_name_from_environ_get(node: ast.AST) -> str | None:
+    if not isinstance(node, ast.Call):
+        return None
+    target = node.func
+    if not isinstance(target, ast.Attribute):
+        return None
+    if target.attr != "get":
+        return None
+    if not _is_os_environ(target.value):
+        return None
+    if not node.args:
+        return None
+    return _literal_string(node.args[0])
+
+
+def _secret_name_from_getenv(node: ast.AST) -> str | None:
+    if not isinstance(node, ast.Call):
+        return None
+    target = node.func
+    if not isinstance(target, ast.Attribute):
+        return None
+    if target.attr != "getenv":
+        return None
+    if not isinstance(target.value, ast.Name) or target.value.id != "os":
+        return None
+    if not node.args:
+        return None
+    return _literal_string(node.args[0])
+
+
+def _is_os_environ(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
+
+
+def _literal_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _looks_like_secret_name(name: str) -> bool:
+    if not _SECRET_NAME_PATTERN.fullmatch(name):
+        return False
+    return (
+        name.endswith("_KEY")
+        or name.endswith("_TOKEN")
+        or name.endswith("_SECRET")
+        or name.endswith("_PASSWORD")
+    )
+
+
+def _stdin_is_tty() -> bool:
+    return bool(getattr(sys.stdin, "isatty", lambda: False)())
 
 
 def _maybe_auto_sync_runner_capacity(jobs: list[DiscoveredJob]) -> None:
@@ -405,8 +676,12 @@ def _parse_decorator_keywords(node: ast.Call, bindings: _ModuleBindings) -> _Ast
             config.memory = str(value)
         elif keyword.arg == "key":
             config.key = str(value)
+        elif keyword.arg == "compute_class":
+            config.compute_class = str(value)
         elif keyword.arg == "compute":
-            config.compute = value
+            config.compute = str(value)
+    if config.compute is not None and config.compute_class is not None:
+        raise DeployError("only one of compute_class or compute may be set")
     return config
 
 

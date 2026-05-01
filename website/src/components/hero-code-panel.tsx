@@ -11,110 +11,91 @@ type HeroViewMode = "code" | "terminal";
 
 const codeLines: ReactNode[] = [
   <>
+    <span className="text-[#c586c0]">from</span>{" "}
+    <span className="text-[#9cdcfe]">usegum</span>{" "}
     <span className="text-[#c586c0]">import</span>{" "}
     <span className="text-[#9cdcfe]">gum</span>
   </>,
-  "",
+  <>
+    <span className="text-[#c586c0]">import</span>{" "}
+    <span className="text-[#9cdcfe]">resend</span>
+  </>,
   <>
     <span className="text-zinc-500">
-      # Process Stripe events once, even when Stripe retries delivery.
+      {
+        "# Weekly digest runs every Monday at 09:00 New York time; retries recover transient failures and concurrency=1 prevents overlap."
+      }
     </span>
   </>,
-  "",
   <>
     <span className="text-[#dcdcaa]">@gum.job</span>
     <span className="text-zinc-300">(</span>
-    <span className="text-[#9cdcfe]">retries</span>
+    <span className="text-[#9cdcfe]">cron</span>
     <span className="text-zinc-500">=</span>
-    <span className="text-[#b5cea8]">5</span>
+    <span className="text-[#ce9178]">&quot;0 9 * * 1&quot;</span>
     <span className="text-zinc-300">,</span>
-    <span className="text-[#9cdcfe]">timeout</span>
+    <span className="text-[#9cdcfe]">timezone</span>
     <span className="text-zinc-500">=</span>
-    <span className="text-[#ce9178]">&quot;5m&quot;</span>
+    <span className="text-[#ce9178]">&quot;America/New_York&quot;</span>
     <span className="text-zinc-300">,</span>
     <span className="text-[#9cdcfe]">concurrency</span>
     <span className="text-zinc-500">=</span>
-    <span className="text-[#b5cea8]">5</span>
+    <span className="text-[#b5cea8]">1</span>
     <span className="text-zinc-300">,</span>
-    <span className="text-[#9cdcfe]">key</span>
+    <span className="text-[#9cdcfe]">retries</span>
     <span className="text-zinc-500">=</span>
-    <span className="text-[#ce9178]">&quot;event_id&quot;</span>
+    <span className="text-[#b5cea8]">5</span>
     <span className="text-zinc-300">)</span>
   </>,
   <>
     <span className="text-[#c586c0]">def</span>{" "}
-    <span className="text-[#dcdcaa]">process_stripe_event</span>
-    <span className="text-zinc-300">(</span>
-    <span className="text-[#9cdcfe]">event_id</span>
-    <span className="text-zinc-300">: </span>
-    <span className="text-[#4ec9b0]">str</span>
-    <span className="text-zinc-300">, </span>
-    <span className="text-[#9cdcfe]">event</span>
-    <span className="text-zinc-300">: </span>
-    <span className="text-[#4ec9b0]">dict</span>
-    <span className="text-zinc-300">):</span>
+    <span className="text-[#dcdcaa]">send_weekly_digest</span>
+    <span className="text-zinc-300">():</span>
   </>,
   <>
     {"    "}
-    <span className="text-[#c586c0]">if</span>{" "}
-    <span className="text-[#9cdcfe]">event</span>
-    <span className="text-zinc-300">[</span>
-    <span className="text-[#ce9178]">&quot;type&quot;</span>
-    <span className="text-zinc-300">] == </span>
-    <span className="text-[#ce9178]">&quot;payment_intent.succeeded&quot;</span>
-    <span className="text-zinc-300">:</span>
-  </>,
-  <>
-    {"        "}
-    <span className="text-[#9cdcfe]">customer_id</span>
+    <span className="text-[#9cdcfe]">stats</span>
     <span className="text-zinc-500"> = </span>
-    <span className="text-[#9cdcfe]">event</span>
+    <span className="text-[#9cdcfe]">db</span>
+    <span className="text-zinc-300">.</span>
+    <span className="text-[#dcdcaa]">get_weekly_metrics</span>
+    <span className="text-zinc-300">()</span>
+  </>,
+  <>
+    {"    "}
+    <span className="text-[#9cdcfe]">resend</span>
+    <span className="text-zinc-300">.</span>
+    <span className="text-[#dcdcaa]">emails</span>
+    <span className="text-zinc-300">.</span>
+    <span className="text-[#dcdcaa]">send</span>
     <span className="text-zinc-300">(</span>
-    <span className="text-zinc-300">[</span>
-    <span className="text-[#ce9178]">&quot;data&quot;</span>
-    <span className="text-zinc-300">][</span>
-    <span className="text-[#ce9178]">&quot;object&quot;</span>
-    <span className="text-zinc-300">][</span>
-    <span className="text-[#ce9178]">&quot;customer&quot;</span>
-    <span className="text-zinc-300">]</span>
   </>,
   <>
     {"        "}
-    <span className="text-[#dcdcaa]">grant_access</span>
+    <span className="text-[#9cdcfe]">from_</span>
+    <span className="text-zinc-500">=</span>
+    <span className="text-[#ce9178]">&quot;ops@acme.com&quot;</span>
+    <span className="text-zinc-300">, </span>
+    <span className="text-[#9cdcfe]">to</span>
+    <span className="text-zinc-500">=</span>
+    <span className="text-[#ce9178]">&quot;team@acme.com&quot;</span>
+    <span className="text-zinc-300">,</span>
+  </>,
+  <>
+    {"        "}
+    <span className="text-[#9cdcfe]">subject</span>
+    <span className="text-zinc-500">=</span>
+    <span className="text-[#ce9178]">&quot;Weekly Performance Digest&quot;</span>
+    <span className="text-zinc-300">, </span>
+    <span className="text-[#9cdcfe]">html</span>
+    <span className="text-zinc-500">=</span>
+    <span className="text-[#dcdcaa]">render_template</span>
     <span className="text-zinc-300">(</span>
-    <span className="text-[#9cdcfe]">customer_id</span>
+    <span className="text-[#9cdcfe]">stats</span>
     <span className="text-zinc-300">)</span>
   </>,
   <>
     {"    "}
-    <span className="text-[#c586c0]">return</span>{" "}
-    <span className="text-zinc-300">{"{"}</span>
-    <span className="text-[#ce9178]">&quot;event_id&quot;</span>
-    <span className="text-zinc-300">: </span>
-    <span className="text-[#9cdcfe]">event_id</span>
-    <span className="text-zinc-300">, </span>
-    <span className="text-[#ce9178]">&quot;status&quot;</span>
-    <span className="text-zinc-300">: </span>
-    <span className="text-[#ce9178]">&quot;processed&quot;</span>
-    <span className="text-zinc-300">{"}"}</span>
-  </>,
-  "",
-  <>
-    <span className="text-[#dcdcaa]">process_stripe_event</span>
-    <span className="text-zinc-300">.</span>
-    <span className="text-[#dcdcaa]">enqueue</span>
-    <span className="text-zinc-300">(</span>
-    <span className="text-[#9cdcfe]">event_id</span>
-    <span className="text-zinc-500">=</span>
-    <span className="text-[#ce9178]">&quot;evt_123&quot;</span>
-    <span className="text-zinc-300">,</span>
-    <span className="text-[#9cdcfe]">event</span>
-    <span className="text-zinc-500">=</span>
-    <span className="text-zinc-300">{"{"}</span>
-    <span className="text-[#ce9178]">&quot;type&quot;</span>
-    <span className="text-zinc-300">: </span>
-    <span className="text-[#ce9178]">&quot;payment_intent.succeeded&quot;</span>
-    <span className="text-zinc-300">{"}"}</span>
     <span className="text-zinc-300">)</span>
   </>,
 ];
@@ -126,19 +107,17 @@ const deployLines: TerminalLine[] = [
   { text: "API: https://api.gum.cloud", tone: "muted" },
   { text: "Found 1 function", tone: "muted" },
   {
-    text: "- process_stripe_event [retries=5 timeout=300s concurrency=5 key=event_id]",
+    text: '- send_weekly_digest [cron="0 9 * * 1" timezone=America/New_York concurrency=1 retries=5]',
   },
   { text: "Deploy: dep_7Qp9a2" },
   { text: "Status: active", tone: "ok" },
-  { text: "Next: gum run process_stripe_event --event-id evt_123", tone: "hint" },
+  { text: "Next run: Mon 09:00 America/New_York", tone: "hint" },
 ];
 
 const idleLines: TerminalLine[] = [
   { text: "Click >_ to run a live deploy demo", tone: "hint" },
   { text: "$ gum deploy", tone: "muted" },
 ];
-
-const FIXED_ROWS = 12;
 
 export function HeroCodePanel() {
   const [mode, setMode] = useState<HeroViewMode>("code");
@@ -157,7 +136,7 @@ export function HeroCodePanel() {
       setVisibleCount((current) => current + 1);
     }, 140);
     return () => window.clearTimeout(timer);
-  }, [running, visibleCount]);
+  }, [running, visibleCount, mode]);
 
   const startTerminalDemo = () => {
     setMode("terminal");
@@ -172,14 +151,6 @@ export function HeroCodePanel() {
   };
 
   const visibleTerminalLines = visibleCount > 0 ? deployLines.slice(0, visibleCount) : idleLines;
-  const paddedCodeLines = [...codeLines];
-  while (paddedCodeLines.length < FIXED_ROWS) {
-    paddedCodeLines.push("");
-  }
-  const paddedTerminalLines = [...visibleTerminalLines];
-  while (paddedTerminalLines.length < FIXED_ROWS) {
-    paddedTerminalLines.push({ text: "" });
-  }
 
   const lineToneClass = (tone?: TerminalLine["tone"]) => {
     if (tone === "ok") {
@@ -194,82 +165,75 @@ export function HeroCodePanel() {
     return "text-zinc-200";
   };
 
+  const terminalGlyph = (line: TerminalLine) => {
+    if (line.text.startsWith("$")) {
+      return "$";
+    }
+    if (line.tone === "ok") {
+      return "●";
+    }
+    if (line.tone === "muted") {
+      return "·";
+    }
+    return "›";
+  };
+
+  const terminalGlyphClass = (tone?: TerminalLine["tone"], text?: string) => {
+    if (text?.startsWith("$")) {
+      return "text-zinc-400";
+    }
+    if (tone === "ok") {
+      return "text-emerald-300";
+    }
+    if (tone === "muted") {
+      return "text-zinc-600";
+    }
+    return "text-zinc-500";
+  };
+
   return (
-    <div className="w-full max-w-[620px] text-left">
-      <div className="gum-code-surface relative w-full overflow-hidden rounded-sm border border-zinc-800 bg-black text-left">
-        <div className="flex h-10 items-center justify-between border-b border-zinc-800 bg-zinc-900 px-3">
-          <div className="flex items-center gap-2">
-            <span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]"></span>
-            <span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]"></span>
-            <span className="h-2.5 w-2.5 rounded-full bg-[#28c840]"></span>
-            <span className="ml-2 text-xs font-mono text-zinc-500">
-              {mode === "code" ? "worker.py" : "terminal"}
-            </span>
-          </div>
-          <div className="inline-flex items-center gap-2">
-            {mode === "terminal" ? (
-              <button
-                type="button"
-                onClick={showCode}
-                className="inline-flex cursor-pointer items-center rounded border border-zinc-700 px-2 py-0.5 font-mono text-[11px] text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
-              >
-                py
-              </button>
-            ) : null}
-            <button
-              type="button"
-              onClick={startTerminalDemo}
-              className="inline-flex cursor-pointer items-center rounded border border-zinc-700 px-2 py-0.5 font-mono text-[11px] text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
-            >
-              &gt;_
-            </button>
-          </div>
+    <div className="w-full max-w-[680px] text-left">
+      <div className="relative overflow-hidden rounded-sm border border-zinc-800 bg-zinc-950">
+        <div className="flex h-11 items-center border-b border-zinc-800 bg-zinc-900/90 px-4">
+          <span className="font-mono text-xs text-zinc-500">{mode === "code" ? "worker.py" : "terminal"}</span>
         </div>
-        <div
-          className={`gum-code-body h-[380px] px-4 pt-5 pb-5 font-mono text-[13px] leading-7 text-zinc-200 md:text-sm text-left ${
-            mode === "code"
-              ? "overflow-x-auto overflow-y-hidden gum-scrollbar-none"
-              : "overflow-hidden"
-          }`}
-        >
+
+        <div className="h-[29rem] overflow-hidden bg-black px-5 py-6 font-mono text-[13px] leading-8">
           <div className="space-y-0.5">
             {mode === "code"
-              ? paddedCodeLines.map((line, index) => (
-                  <div
-                    key={`code-${index}`}
-                    className="gum-code-line grid grid-cols-[28px_minmax(0,1fr)] gap-3"
-                  >
+              ? codeLines.map((line, index) => (
+                  <div key={`code-${index}`} className="grid grid-cols-[28px_minmax(0,1fr)] gap-3">
                     <span className="gum-code-gutter select-none text-right text-xs">{index + 1}</span>
-                    <div className="min-w-max text-left whitespace-nowrap">
+                    <div
+                      className={`text-left ${index === 3 ? "whitespace-nowrap tracking-[-0.01em]" : ""}`}
+                    >
                       {line || <span>&nbsp;</span>}
                     </div>
                   </div>
                 ))
-              : paddedTerminalLines.map((line, index) => (
-                  <div
-                    key={`terminal-${index}`}
-                    className="gum-code-line grid grid-cols-[28px_minmax(0,1fr)] gap-3"
-                  >
-                    <span className="gum-code-gutter select-none text-right text-xs">{index + 1}</span>
+              : visibleTerminalLines.map((line, index) => (
+                  <div key={`terminal-${index}`} className="grid grid-cols-[14px_minmax(0,1fr)] gap-3">
+                    <span
+                      className={`select-none text-right text-xs ${terminalGlyphClass(line.tone, line.text)}`}
+                    >
+                      {terminalGlyph(line)}
+                    </span>
                     <div className={`text-left transition-opacity ${lineToneClass(line.tone)}`}>
                       {line.text || <span>&nbsp;</span>}
                     </div>
                   </div>
                 ))}
-            {mode === "terminal" && running ? (
-              <div className="mt-2 text-left text-zinc-500">...</div>
-            ) : null}
+            {mode === "terminal" && running ? <div className="mt-2 text-left text-zinc-500">...</div> : null}
           </div>
-          {mode === "code" ? (
-            <div className="mt-4 text-[11px] uppercase tracking-[0.14em] text-zinc-500">
-              Click &gt;_ to run deploy demo
-            </div>
-          ) : (
-            <div className="mt-4 text-[11px] uppercase tracking-[0.14em] text-zinc-500">
-              Click py to return to code
-            </div>
-          )}
         </div>
+
+        <button
+          type="button"
+          onClick={mode === "code" ? startTerminalDemo : showCode}
+          className="absolute right-3 bottom-3 inline-flex h-9 items-center justify-center rounded-sm border border-zinc-700 bg-zinc-950/95 px-3 font-mono text-[11px] text-zinc-200 transition-colors hover:bg-zinc-900"
+        >
+          {mode === "code" ? ">_ Terminal" : "< back to code"}
+        </button>
       </div>
     </div>
   );

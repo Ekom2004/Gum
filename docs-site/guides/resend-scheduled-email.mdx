@@ -1,0 +1,108 @@
+---
+title: "Scheduled Resend Email"
+description: "Run a real scheduled Resend email job in Gum as a customer."
+---
+
+Use this guide to prove the full customer flow end to end:
+
+1. install SDK
+2. login
+3. deploy one scheduled job
+4. watch Gum execute it and inspect logs
+
+## 1. Create a clean project
+
+```bash
+mkdir gum-resend-demo
+cd gum-resend-demo
+python -m venv .venv
+source .venv/bin/activate
+pip install usegum resend
+```
+
+## 2. Authenticate like a customer
+
+```bash
+gum login
+```
+
+Paste your `gum_live_...` API key when prompted.
+
+## 3. Initialize Gum config
+
+```bash
+gum init --project-id proj_live
+```
+
+If you are testing on staging:
+
+```bash
+gum init --project-id proj_stg --api-base-url https://gum-api-stg.fly.dev
+```
+
+## 4. Add the scheduled Resend job
+
+Create `jobs.py`:
+
+```python
+import os
+import gum
+import resend
+
+resend.api_key = os.environ["RESEND_API_KEY"]
+
+# Sends every 5 minutes so you can verify quickly.
+# Switch to "0 9 * * 1" when moving to weekly Monday 09:00.
+@gum.job(cron="*/5 * * * *", timezone="America/New_York", retries=5, timeout="2m", concurrency=1)
+def send_weekly_digest():
+    resend.emails.send(
+        from_="ops@yourdomain.com",
+        to="you@yourdomain.com",
+        subject="Gum scheduled email test",
+        html="<p>This email was scheduled and executed by Gum.</p>",
+    )
+```
+
+## 5. Set Resend key and deploy
+
+```bash
+export RESEND_API_KEY="re_..."
+gum deploy
+```
+
+## 6. Verify execution
+
+List recent runs:
+
+```bash
+gum list --limit 20
+```
+
+Inspect one run:
+
+```bash
+gum get run_123
+gum logs run_123
+```
+
+`succeeded` + logs + inbox delivery confirms the loop is working.
+
+## 7. Move to production schedule
+
+After validation, update the decorator:
+
+```python
+@gum.job(cron="0 9 * * 1", timezone="America/New_York", retries=5, timeout="2m", concurrency=1)
+```
+
+Then deploy again:
+
+```bash
+gum deploy
+```
+
+## Notes
+
+- `timezone` is optional. If omitted, cron runs in UTC.
+- `concurrency=1` prevents overlapping sends.
+- Scheduled runs are normal Gum runs, so `get`, `logs`, `replay`, and `cancel` all work the same way.

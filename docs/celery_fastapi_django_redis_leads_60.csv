@@ -1,0 +1,61 @@
+company,signal_type,signal_summary,fit_tier,outreach_angle,source_url
+DataPOEM,hiring,"Job post mentions FastAPI + Celery + Redis",A,"You already run Celery+Redis; Gum removes broker/worker ops with @gum.job",https://in.linkedin.com/jobs/view/full-stack-engineer-%E2%80%93-team-lead-backend-focus-python-fastapi-aws-at-data-poem-4363402433
+DriveU,hiring,"Python role lists Django, RabbitMQ, Celery, FastAPI",A,"Keep Python app flow, replace queue plumbing with decorator + enqueue",https://wellfound.com/jobs/3476255-python-developer
+Urban SDK,hiring,"Senior Python role centered on FastAPI microservices",B,"Use Gum for retries/timeouts/rate-limits around geospatial background workloads",https://www.linkedin.com/jobs/view/senior-python-engineer-fastapi-microservices-at-urban-sdk-4234252834
+Orbion Infotech,hiring,"Backend role emphasizes Python FastAPI APIs",B,"Pitch managed background execution for API-triggered long tasks",https://in.linkedin.com/jobs/view/backend%2B-python-fastapi-mongodb-aws-eng-4-yrs-at-orbion-infotech-4360080384
+INSTAVIV AI,hiring,"Role requires FastAPI + background tasks (Celery/RQ)",A,"They already expose background task pain; Gum is near drop-in for Python functions",https://in.linkedin.com/jobs/view/backend-%2B-frontend-python-fastapi-%E2%80%93-mandatory-at-instaviv-ai-4376977368
+Mave Health,hiring,"Senior backend role: Django + FastAPI + Redis + Celery",A,"Direct Celery replacement narrative with less infra burden",https://wellfound.com/jobs/3318453-senior-backend-developer-django-fastapi
+Arivihan Technologies,hiring,"Python role includes Django, Redis, Celery",A,"Show one-line job wrapper and built-in retries/rate limits",https://wellfound.com/jobs/3547809-python-developer
+CirclePe,hiring,"Backend role asks for FastAPI/Flask/Django",B,"Position Gum as simple background layer for async workflows",https://wellfound.com/jobs/3372575-backend-developer-python-fastapi-flask-django
+Kraftbase,hiring,"Python backend role uses FastAPI and Redis",A,"Pitch Gum for durable background processing without queue ops",https://wellfound.com/jobs/3173143-python-backend-engineer-fastapi
+Two Point One,hiring,"Backend role includes Django and Redis",A,"Use Gum to offload long-running backend tasks cleanly",https://wellfound.com/jobs/3180116-software-developer-backend-python
+QOVES,hiring,"Senior backend role asks for Python/FastAPI/Django",B,"Sell managed jobs for AI/report generation workflows",https://wellfound.com/jobs/3541963-senior-backend-engineer-python-fastapi-django
+Stackera,hiring,"Backend role lists Redis, Celery, FastAPI",A,"Strong replacement fit: existing Celery users can migrate incrementally",https://wellfound.com/jobs/3300767-backend-python-developer
+GenieX,hiring,"FastAPI contract role lists Celery and Dramatiq",A,"Compare Gum to Celery/Dramatiq: fewer moving parts for similar control",https://wellfound.com/jobs/3737885-fastapi-backend-developer-contract-role
+FOXO,hiring,"Backend role centered on Python + FastAPI distributed systems",B,"Pitch queue/retry/timeout defaults for production reliability",https://wellfound.com/jobs/3543087-software-development-engineer-python-fastapi
+Kernel Intelligence,hiring,"Senior backend systems role uses Python/FastAPI",B,"Gum for long-running document/AI tasks with safe retries",https://wellfound.com/jobs/3541646-backend-systems-engineer-freelance-contract-us-based
+Textify,hiring,"Backend intern role: Python FastAPI + deployment",C,"Developer-first onboarding: pip install, deploy, enqueue",https://wellfound.com/jobs/2833644-back-end-intern-python-fastapi-and-mongodb
+BestAround,hiring,"Full stack role includes Django + Redis",B,"Position Gum for scheduled jobs and notification pipelines",https://wellfound.com/jobs/3537525-full-stack-developer-flutter-django-early-stage-startup
+Civitos,hiring,"Engineer role: Django + React",B,"Pitch background job workflows for document/title processing",https://wellfound.com/jobs/3543245-engineer-full-stack-django-react-gcp
+Aevis,hiring,"Django developer role at AI operations startup",B,"Use Gum for queueing heavy browser/automation tasks",https://wellfound.com/jobs/3829089-django-developer
+Fleek,hiring,"Senior backend role: FastAPI + Django",A,"AI-heavy workflows need robust retries and backpressure; Gum fits",https://wellfound.com/jobs/3336634-senior-backend-engineer-python-django-odoo-fastapi
+Wrnly,hiring,"Full-stack role includes FastAPI",C,"Simple async processing for hiring/email/report tasks",https://wellfound.com/jobs/3617318-full-stack-engineer
+Mirvie,hiring,"Software engineer role: Python/Django",B,"Healthcare workflows often need durable async processing",https://wellfound.com/jobs/3883220-software-engineer-python-django
+M76 Analytics,hiring,"Python/Django developer role",B,"Pitch for analytics batch jobs and scheduled processing",https://wellfound.com/jobs/2138639-python-django-developer
+Artikate Studio,hiring,"Backend role lists Celery, Redis, FastAPI",A,"High-fit Celery replacement with lower ops overhead",https://wellfound.com/jobs/3134638-backend-developer-python-django
+Letstream,hiring,"Backend/full-stack role emphasizes Django APIs",B,"Use Gum to decouple long tasks from request lifecycle",https://wellfound.com/jobs/3069092-backend-full-stack-developer-django-4-years
+Apna Mart,hiring,"Backend engineer role: Python/Django",B,"Pitch order/inventory async jobs with retries and idempotency",https://wellfound.com/jobs/1870311-backend-engineer-python-django
+Assystant,hiring,"Python developer role focused on Django",B,"Introduce managed background jobs without infra migration",https://wellfound.com/jobs/2877588-python-developer-django
+Serava,hiring,"Full-stack role includes Python + Django + PostgreSQL",B,"Useful for report generation and async data enrichment",https://wellfound.com/jobs/3534683-full-stack-developer-python-django-react
+Pragma (formerly Logisy),hiring,"Python Django role also mentions FastAPI",A,"Strong fit for e-commerce async workflows and retries",https://wellfound.com/jobs/2697276-software-engineer-python-django-developer
+Bluelight Consulting,hiring,"Senior fullstack role: Python Django",C,"Agency teams can standardize background jobs across clients",https://wellfound.com/jobs/3604853-fullstack-developer-senior-python-django-react-remote-latin-america
+Zerocater,hiring,"Senior backend role focused on Django APIs",B,"Good fit for scheduled/menu/ops background processing",https://wellfound.com/jobs/3548129-senior-software-engineer-backend-python-django
+Fulfil,hiring,"Lead role lists Django, Redis, RabbitMQ, Celery, FastAPI",A,"Immediate Celery pain-replacement positioning",https://wellfound.com/jobs/3802489-lead-engineer-finance-python-backend-ai
+Chaotix AI,hiring,"Fullstack role includes Django + Celery",A,"Game/content pipelines benefit from durable async workers",https://wellfound.com/jobs/3269686-fullstack-developer
+Kredily,hiring,"Backend role references Django/Celery/Kubernetes stack",A,"Pitch managed execution to reduce worker infra toil",https://wellfound.com/jobs/3320903-senior-backend-engineer-ml-ai-exposure
+Newcode.ai,hiring,"FastAPI posting references Redis and Celery",A,"High signal for pain around async/distributed jobs",https://www.ziprecruiter.com/Jobs/Fastapi-Python/--in-California
+PELICON SOFTWARE SOLUTIONS,hiring,"Backend posting mentions Python FastAPI + Django",B,"Position Gum as managed queueing/execution layer",https://www.hirist.tech/j/backend-developer-python-django-1620115
+A TO Z CONGLOMERATE MCHJ,hiring,"Backend-focused role lists FastAPI/Django/Celery",B,"Early-stage platform with queue complexity; Gum simplification pitch",https://talanto.work/jobs/99767d1f-022a-45a9-a35f-9e943f02f50b
+Udemy,usage,"Public stack shows Celery + Django + Redis",A,"Enterprise-scale proof: show reliability + no Redis ops for teams",https://stackshare.io/udemy
+Soylent,usage,"Public stack shows Celery + Django + RabbitMQ",A,"Migration story from classic queue setup to managed execution",https://stackshare.io/soylent
+Codecov,usage,"CTO notes Celery used for long-running async tasks",A,"Direct pain narrative around task timeouts, retries, queue hygiene",https://stackshare.io/tools/celery
+Sentry,usage,"Ops note references Django + Celery + Redis",A,"SRE-heavy teams value stability and observability-first job infra",https://stackshare.io/tools/celery
+Cloudify,usage,"Discussion notes Celery + RabbitMQ orchestration",B,"Pitch simpler orchestration for Python task workers",https://stackshare.io/tools/celery
+nrise,usage,"CTO discussion references Celery/Celerybeat workflows",B,"Emphasize cron + background jobs in one API",https://stackshare.io/tools/celery
+Postmates,usage,"Listed as popular company using Celery",A,"Logistics workloads map to high-volume async execution",https://stackshare.io/stackups/celery-vs-opm
+Ansible,usage,"Listed as popular company using Celery",A,"Infra-oriented teams appreciate deterministic retries + queue controls",https://stackshare.io/stackups/celery-vs-kue
+OpenLabel,usage,"Listed as popular company using Celery",B,"Show lower operational burden versus DIY worker stack",https://stackshare.io/stackups/celery-vs-kue
+Gigster,usage,"Kue comparison lists Gigster in background job stacks",C,"Services firms can standardize async infra with Gum",https://stackshare.io/stackups/celery-vs-kue
+Greenkeeper,usage,"Kue comparison lists Greenkeeper",C,"Small teams benefit from no-broker setup and sane defaults",https://stackshare.io/stackups/celery-vs-kue
+Fraeber Labs Pvt Ltd,usage,"Kue comparison lists Fraeber Labs",C,"Simple migration path from queue libraries to managed jobs",https://stackshare.io/stackups/celery-vs-kue
+LemonStand,usage,"Comparison snippet lists as Open PostgreSQL Monitoring user",C,"DB/ops-aware teams can adopt managed job execution",https://stackshare.io/stackups/celery-vs-opm
+Helpful,usage,"Comparison snippet lists as Open PostgreSQL Monitoring user",C,"Position Gum as low-maintenance background execution",https://stackshare.io/stackups/celery-vs-opm
+Icalia Labs,usage,"Comparison snippet lists as Open PostgreSQL Monitoring user",C,"Agency/product studio fit for standardizing async tasks",https://stackshare.io/stackups/celery-vs-opm
+8PERCENT,usage,"Public stack shows Django + Redis + Celery",A,"Fintech async workloads: retries, rate-limits, and schedules",https://stackshare.io/8percent/8percent
+Lifesum,usage,"Public stack shows Django + Redis + Celery",A,"Health app event processing and messaging are async-heavy",https://stackshare.io/lifesum/lifesum
+Practo,usage,"Public stack includes Celery (utilities section)",A,"Healthcare operations + messaging fit durable background jobs",https://stackshare.io/practo/practo
+FreshBooks,usage,"Public stack shows Python/Redis + Celery",A,"SMB SaaS invoicing/notifications map cleanly to job workflows",https://stackshare.io/freshbooks/freshbooks
+Net Power & Light,usage,"Public stack lists Redis + Celery + RabbitMQ",B,"Infra-heavy stack can reduce worker management overhead",https://stackshare.io/net-power-and-light/net-power-and-light
+HackerRank (DataScience stack),usage,"Public stack lists Django + Redis + Celery",B,"Data pipelines and async scoring jobs are strong Gum fit",https://stackshare.io/hackerrank/datascience
+Bitbucket,usage,"Company appears in Celery tool adoption companies",B,"Large dev org angle: centralized reliability controls",https://stackshare.io/celery
+Zapier,usage,"Company appears in Celery tool adoption companies",B,"Workflow-centric teams value retries, limits, and idempotency",https://stackshare.io/celery

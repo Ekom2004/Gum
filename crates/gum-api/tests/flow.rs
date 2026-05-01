@@ -1,6 +1,7 @@
 use gum_api::routes::{
     AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
-    RegisterDeployRequest, RegisterRunnerRequest, RegisteredJob, RunnerHeartbeatRequest,
+    LeaseRuntimePrepareRequest, RegisterDeployRequest, RegisterRunnerRequest, RegisteredJob,
+    RunnerHeartbeatRequest,
 };
 use gum_api::service;
 use gum_store::memory::MemoryStore;
@@ -10,7 +11,7 @@ use gum_store::models::{
 use gum_store::queries::{
     GumStore, RecordProviderCheckParams, SetProviderHealthParams, UpsertProviderTargetParams,
 };
-use gum_types::{AttemptStatus, RunStatus};
+use gum_types::{AttemptStatus, DeployStatus, RunStatus, TriggerType};
 use serde_json::json;
 
 #[test]
@@ -34,6 +35,9 @@ fn enqueue_lease_complete_replay_flow_works() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_sync_customer".to_string(),
                 name: "sync_customer".to_string(),
@@ -48,6 +52,7 @@ fn enqueue_lease_complete_replay_flow_works() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -123,6 +128,82 @@ fn enqueue_lease_complete_replay_flow_works() {
 }
 
 #[test]
+fn runtime_prepare_flow_marks_deploy_ready_after_runner_prepare() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+    service::register_runner(
+        &store,
+        RegisterRunnerRequest {
+            runner_id: "runner_1".to_string(),
+            compute_class: "standard".to_string(),
+            memory_mb: 1024,
+            cpu_cores: 1,
+            max_concurrent_leases: 1,
+            heartbeat_timeout_secs: 30,
+        },
+    )
+    .expect("register runner should work");
+
+    let deploy = service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "inline://Zm9v".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: Some("uv_lock".to_string()),
+            deps_hash: Some("deps123".to_string()),
+            jobs: vec![RegisteredJob {
+                id: "job_sync_customer".to_string(),
+                name: "sync_customer".to_string(),
+                handler_ref: "jobs:sync_customer".to_string(),
+                trigger_mode: "manual".to_string(),
+                schedule_expr: None,
+                retries: 1,
+                timeout_secs: 300,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                cpu_cores: None,
+                key_field: None,
+                compute_class: None,
+                required_secret_names: vec![],
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let requested = service::request_runtime_prepare(&store, &deploy.id)
+        .expect("runtime prepare request should work");
+    assert_eq!(requested.status, DeployStatus::Warming);
+
+    let leased = service::lease_runtime_prepare(
+        &store,
+        LeaseRuntimePrepareRequest {
+            runner_id: "runner_1".to_string(),
+            lease_ttl_secs: 60,
+        },
+    )
+    .expect("runtime prepare lease should work")
+    .expect("deploy should be leased for runtime prepare");
+    assert_eq!(leased.deploy_id, deploy.id);
+
+    let completed = service::complete_runtime_prepare(&store, &deploy.id, true)
+        .expect("runtime prepare completion should work");
+    assert_eq!(completed.status, DeployStatus::Ready);
+}
+
+#[test]
 fn failed_attempt_requeues_when_retries_remain() {
     let store = MemoryStore::default();
     store
@@ -143,6 +224,9 @@ fn failed_attempt_requeues_when_retries_remain() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_sync_customer".to_string(),
                 name: "sync_customer".to_string(),
@@ -157,6 +241,7 @@ fn failed_attempt_requeues_when_retries_remain() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -238,6 +323,9 @@ fn enqueue_with_delay_marks_run_waiting_on_delay() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_sync_customer".to_string(),
                 name: "sync_customer".to_string(),
@@ -252,6 +340,7 @@ fn enqueue_with_delay_marks_run_waiting_on_delay() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -321,6 +410,9 @@ fn function_health_blocks_retry_without_provider_config() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_generate_summary".to_string(),
                 name: "generate_summary".to_string(),
@@ -335,6 +427,7 @@ fn function_health_blocks_retry_without_provider_config() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -482,6 +575,9 @@ fn user_code_failures_do_not_consume_retry_budget_as_requeues() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -496,6 +592,7 @@ fn user_code_failures_do_not_consume_retry_budget_as_requeues() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -587,6 +684,9 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_sync_customer".to_string(),
                 name: "sync_customer".to_string(),
@@ -601,6 +701,7 @@ fn rate_limit_blocks_second_lease_within_the_same_window() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -712,6 +813,9 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![
                 RegisteredJob {
                     id: "job_summarize".to_string(),
@@ -727,6 +831,7 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
                     cpu_cores: None,
                     key_field: None,
                     compute_class: None,
+                    required_secret_names: vec![],
                 },
                 RegisteredJob {
                     id: "job_embed".to_string(),
@@ -742,6 +847,7 @@ fn shared_pool_rate_limit_blocks_other_jobs_using_the_same_pool() {
                     cpu_cores: None,
                     key_field: None,
                     compute_class: None,
+                    required_secret_names: vec![],
                 },
             ],
         },
@@ -858,6 +964,9 @@ fn conflicting_shared_rate_limit_pool_definitions_are_rejected() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![
                 RegisteredJob {
                     id: "job_summarize".to_string(),
@@ -873,6 +982,7 @@ fn conflicting_shared_rate_limit_pool_definitions_are_rejected() {
                     cpu_cores: None,
                     key_field: None,
                     compute_class: None,
+                    required_secret_names: vec![],
                 },
                 RegisteredJob {
                     id: "job_embed".to_string(),
@@ -888,6 +998,7 @@ fn conflicting_shared_rate_limit_pool_definitions_are_rejected() {
                     cpu_cores: None,
                     key_field: None,
                     compute_class: None,
+                    required_secret_names: vec![],
                 },
             ],
         },
@@ -921,6 +1032,9 @@ fn canceling_a_queued_run_marks_it_canceled() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_export".to_string(),
                 name: "export".to_string(),
@@ -935,6 +1049,7 @@ fn canceling_a_queued_run_marks_it_canceled() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -978,6 +1093,9 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_export".to_string(),
                 name: "export".to_string(),
@@ -992,6 +1110,7 @@ fn canceling_a_running_run_requests_revocation_and_requires_canceled_completion(
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -1092,6 +1211,9 @@ fn admin_views_expose_runs_runners_leases_and_concurrency() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_export".to_string(),
                 name: "export".to_string(),
@@ -1106,6 +1228,7 @@ fn admin_views_expose_runs_runners_leases_and_concurrency() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: Some("high-mem".to_string()),
+                required_secret_names: vec![],
             }],
         },
     )
@@ -1215,6 +1338,9 @@ fn register_concurrency_test_fixture(store: &MemoryStore, retries: u32) {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_export".to_string(),
                 name: "export".to_string(),
@@ -1229,6 +1355,7 @@ fn register_concurrency_test_fixture(store: &MemoryStore, retries: u32) {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -1698,6 +1825,9 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_send_followup".to_string(),
                 name: "send_followup".to_string(),
@@ -1712,6 +1842,7 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -1761,6 +1892,172 @@ fn scheduled_jobs_tick_into_normal_queued_runs_without_duplicates() {
 }
 
 #[test]
+fn cron_scheduled_jobs_tick_and_dedupe_fire_times() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
+            jobs: vec![RegisteredJob {
+                id: "job_refresh_index".to_string(),
+                name: "refresh_index".to_string(),
+                handler_ref: "jobs:refresh_index".to_string(),
+                trigger_mode: "schedule".to_string(),
+                schedule_expr: Some("cron:tz=America/New_York;*/15 * * * *".to_string()),
+                retries: 1,
+                timeout_secs: 60,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                cpu_cores: None,
+                key_field: None,
+                compute_class: None,
+                required_secret_names: vec![],
+            }],
+        },
+    )
+    .expect("register deploy should work");
+
+    let job = store
+        .get_job("job_refresh_index")
+        .expect("job lookup should work")
+        .expect("job should exist");
+    let now_epoch_ms = job.created_at_epoch_ms + (60 * 60 * 1000);
+
+    let created =
+        service::tick_schedules(&store, now_epoch_ms).expect("scheduler tick should work");
+    assert!(!created.is_empty(), "cron schedule should create due runs");
+    for run in &created {
+        assert_eq!(run.status, RunStatus::Queued);
+    }
+    let scheduled_runs = store
+        .list_recent_runs(128)
+        .expect("run listing should work")
+        .into_iter()
+        .filter(|run| {
+            run.job_id == "job_refresh_index" && run.trigger_type == TriggerType::Schedule
+        })
+        .collect::<Vec<_>>();
+    for run in &scheduled_runs {
+        let minute = (run.scheduled_at_epoch_ms / 60_000).rem_euclid(60);
+        assert_eq!(minute % 15, 0, "scheduled fire minute should align to cron");
+    }
+
+    let created_again =
+        service::tick_schedules(&store, now_epoch_ms).expect("second scheduler tick should work");
+    assert_eq!(created_again.len(), 0);
+}
+
+#[test]
+fn register_deploy_rejects_invalid_cron_schedule_expr() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    let error = service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
+            jobs: vec![RegisteredJob {
+                id: "job_invalid_schedule".to_string(),
+                name: "invalid_schedule".to_string(),
+                handler_ref: "jobs:invalid_schedule".to_string(),
+                trigger_mode: "schedule".to_string(),
+                schedule_expr: Some("cron:*/0 * * * *".to_string()),
+                retries: 1,
+                timeout_secs: 60,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                cpu_cores: None,
+                key_field: None,
+                compute_class: None,
+                required_secret_names: vec![],
+            }],
+        },
+    )
+    .expect_err("invalid cron expression should fail deploy registration");
+    assert!(error.contains("step"), "unexpected error: {error}");
+}
+
+#[test]
+fn register_deploy_rejects_invalid_cron_timezone() {
+    let store = MemoryStore::default();
+    store
+        .insert_project(ProjectRecord {
+            id: "proj_1".to_string(),
+            name: "Acme".to_string(),
+            slug: "acme".to_string(),
+            api_key_hash: "hash".to_string(),
+        })
+        .expect("project insert should work");
+
+    let error = service::register_deploy(
+        &store,
+        RegisterDeployRequest {
+            project_id: "proj_1".to_string(),
+            version: "v1".to_string(),
+            bundle_url: "s3://gum/bundles/v1.tar.gz".to_string(),
+            bundle_sha256: "abc123".to_string(),
+            sdk_language: "python".to_string(),
+            entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
+            jobs: vec![RegisteredJob {
+                id: "job_invalid_schedule_tz".to_string(),
+                name: "invalid_schedule_tz".to_string(),
+                handler_ref: "jobs:invalid_schedule_tz".to_string(),
+                trigger_mode: "schedule".to_string(),
+                schedule_expr: Some("cron:tz=Not/A_Zone;0 9 * * 1".to_string()),
+                retries: 1,
+                timeout_secs: 60,
+                rate_limit_spec: None,
+                concurrency_limit: None,
+                memory_mb: None,
+                cpu_cores: None,
+                key_field: None,
+                compute_class: None,
+                required_secret_names: vec![],
+            }],
+        },
+    )
+    .expect_err("invalid cron timezone should fail deploy registration");
+    assert!(error.contains("timezone"), "unexpected error: {error}");
+}
+
+#[test]
 fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
     let store = MemoryStore::default();
     store
@@ -1781,6 +2078,9 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_export_workspace".to_string(),
                 name: "export_workspace".to_string(),
@@ -1795,6 +2095,7 @@ fn expired_lease_is_recovered_and_heartbeat_keeps_active_lease_alive() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: Some("high-mem".to_string()),
+                required_secret_names: vec![],
             }],
         },
     )
@@ -1932,6 +2233,9 @@ fn expired_lease_cannot_commit_completion_before_recovery_runs() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_export".to_string(),
                 name: "export".to_string(),
@@ -1946,6 +2250,7 @@ fn expired_lease_cannot_commit_completion_before_recovery_runs() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2034,6 +2339,9 @@ fn compute_class_and_runner_capacity_drive_placement() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![
                 RegisteredJob {
                     id: "job_export_workspace".to_string(),
@@ -2049,6 +2357,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
                     cpu_cores: None,
                     key_field: None,
                     compute_class: Some("high-mem".to_string()),
+                    required_secret_names: vec![],
                 },
                 RegisteredJob {
                     id: "job_sync_customer".to_string(),
@@ -2064,6 +2373,7 @@ fn compute_class_and_runner_capacity_drive_placement() {
                     cpu_cores: None,
                     key_field: None,
                     compute_class: None,
+                    required_secret_names: vec![],
                 },
             ],
         },
@@ -2194,6 +2504,9 @@ fn memory_requirement_drives_runner_placement() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_render_video".to_string(),
                 name: "render_video".to_string(),
@@ -2208,6 +2521,7 @@ fn memory_requirement_drives_runner_placement() {
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2295,6 +2609,9 @@ fn cpu_requirement_drives_runner_placement() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_embed_batch".to_string(),
                 name: "embed_batch".to_string(),
@@ -2309,6 +2626,7 @@ fn cpu_requirement_drives_runner_placement() {
                 cpu_cores: Some(4),
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2448,6 +2766,9 @@ fn keyed_enqueue_returns_existing_run_for_duplicate_payload() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -2462,6 +2783,7 @@ fn keyed_enqueue_returns_existing_run_for_duplicate_payload() {
                 cpu_cores: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2512,6 +2834,9 @@ fn keyed_enqueue_dedupes_by_key_even_when_payload_differs() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -2526,6 +2851,7 @@ fn keyed_enqueue_dedupes_by_key_even_when_payload_differs() {
                 cpu_cores: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2577,6 +2903,9 @@ fn keyed_enqueue_does_not_collide_across_functions() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![
                 RegisteredJob {
                     id: "job_process_webhook".to_string(),
@@ -2592,6 +2921,7 @@ fn keyed_enqueue_does_not_collide_across_functions() {
                     cpu_cores: None,
                     key_field: Some("event_id".to_string()),
                     compute_class: None,
+                    required_secret_names: vec![],
                 },
                 RegisteredJob {
                     id: "job_sync_webhook".to_string(),
@@ -2607,6 +2937,7 @@ fn keyed_enqueue_does_not_collide_across_functions() {
                     cpu_cores: None,
                     key_field: Some("event_id".to_string()),
                     compute_class: None,
+                    required_secret_names: vec![],
                 },
             ],
         },
@@ -2658,6 +2989,9 @@ fn replay_bypasses_key_dedupe() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -2672,6 +3006,7 @@ fn replay_bypasses_key_dedupe() {
                 cpu_cores: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2713,6 +3048,9 @@ fn lease_run_includes_execution_context_fields() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -2727,6 +3065,7 @@ fn lease_run_includes_execution_context_fields() {
                 cpu_cores: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2813,6 +3152,9 @@ fn keyed_enqueue_requires_the_configured_field() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -2827,6 +3169,7 @@ fn keyed_enqueue_requires_the_configured_field() {
                 cpu_cores: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2865,6 +3208,9 @@ fn keyed_enqueue_requires_scalar_key_value() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -2879,6 +3225,7 @@ fn keyed_enqueue_requires_scalar_key_value() {
                 cpu_cores: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -2917,6 +3264,9 @@ fn keyed_enqueue_accepts_numeric_key_values() {
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_process_webhook".to_string(),
                 name: "process_webhook".to_string(),
@@ -2931,6 +3281,7 @@ fn keyed_enqueue_accepts_numeric_key_values() {
                 cpu_cores: None,
                 key_field: Some("event_id".to_string()),
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )

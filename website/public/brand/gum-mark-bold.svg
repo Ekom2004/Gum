@@ -1,0 +1,11 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Gum Reliability Mark Bold</title>
+  <desc id="desc">High-contrast reliability mark with frame, lanes, and resolved check signal.</desc>
+  <rect x="16" y="16" width="96" height="96" rx="16" fill="#09090B" stroke="#FFFFFF" stroke-width="6"/>
+  <path d="M32 44H96" stroke="#52525B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M32 64H96" stroke="#52525B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M32 84H96" stroke="#52525B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M38 64H64" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="72" cy="64" r="7" fill="#FFFFFF"/>
+  <path d="M82 64L90 72L106 54" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

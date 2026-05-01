@@ -2,28 +2,37 @@ use std::collections::{HashMap, HashSet};
 
 use gum_store::models::{ConcurrencyStatusRecord, LogRecord, ProviderHealthState, RunRecord};
 use gum_store::queries::{
-    parse_rate_limit_spec, parse_schedule_interval_ms, CancelRunParams, CompleteAttemptParams,
-    EnqueueRunParams, GumStore, HeartbeatRunnerParams, LeaseNextAttemptParams,
-    RegisterDeployParams, RegisterJobParams, RegisterRunnerParams, ReplayRunParams,
+    parse_rate_limit_spec, parse_schedule_interval_ms, validate_recurring_schedule_expr,
+    CancelRunParams, CompleteAttemptParams, ControlLeaseParams, EnqueueRunParams, GumStore,
+    HeartbeatRunnerParams, LeaseNextAttemptParams, RegisterDeployParams, RegisterJobParams,
+    RegisterRunnerParams, ReplayRunParams, SetDeployStatusParams,
 };
-use gum_types::AttemptStatus;
+use gum_types::{AttemptStatus, DeployStatus};
 use serde_json::Value;
 
 use crate::routes::{
     AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, ConcurrencyListResponse,
     ConcurrencyStatusResponse, EnqueueRunRequest, EnqueueRunResponse, LeaseRunRequest,
-    LeaseRunResponse, LeaseStateResponse, LeaseStatusResponse, LeasesListResponse, LogLine,
+    LeaseRunResponse, LeaseRuntimePrepareRequest, LeaseRuntimePrepareResponse, LeaseStateResponse,
+    LeaseStatusResponse, LeasesListResponse, LogLine, PrepareDeployRuntimeResponse,
     ProviderHealthListResponse, ProviderHealthResponse, RateLimitListResponse,
     RateLimitStatusResponse, RegisterDeployRequest, RegisterDeployResponse, RegisterRunnerRequest,
     ReplayRunResponse, RunResponse, RunnerHeartbeatRequest, RunnerStatusResponse,
     RunnersListResponse, RunsListResponse,
 };
 
+const RUNTIME_PREPARE_CANDIDATE_LIMIT: usize = 20;
+
 pub fn register_deploy<S: GumStore>(
     store: &S,
     request: RegisterDeployRequest,
 ) -> Result<RegisterDeployResponse, String> {
     validate_rate_limit_pools(&request.jobs)?;
+    for job in &request.jobs {
+        if let Some(schedule_expr) = &job.schedule_expr {
+            validate_recurring_schedule_expr(schedule_expr)?;
+        }
+    }
     let params = RegisterDeployParams {
         project_id: request.project_id,
         version: request.version,
@@ -31,6 +40,9 @@ pub fn register_deploy<S: GumStore>(
         bundle_sha256: request.bundle_sha256,
         sdk_language: request.sdk_language,
         entrypoint: request.entrypoint,
+        python_version: request.python_version,
+        deps_mode: request.deps_mode,
+        deps_hash: request.deps_hash,
         jobs: request
             .jobs
             .into_iter()
@@ -48,6 +60,7 @@ pub fn register_deploy<S: GumStore>(
                 memory_mb: job.memory_mb,
                 key_field: job.key_field,
                 compute_class: job.compute_class,
+                required_secret_names: job.required_secret_names,
             })
             .collect(),
     };
@@ -56,6 +69,84 @@ pub fn register_deploy<S: GumStore>(
     Ok(RegisterDeployResponse {
         id: deploy.id,
         registered_jobs: jobs.len(),
+    })
+}
+
+pub fn request_runtime_prepare<S: GumStore>(
+    store: &S,
+    deploy_id: &str,
+) -> Result<PrepareDeployRuntimeResponse, String> {
+    let deploy = store
+        .get_deploy(deploy_id)?
+        .ok_or_else(|| "deploy not found".to_string())?;
+    let next_status =
+        if deploy.deps_mode.as_deref().is_some() && deploy.deps_hash.as_deref().is_some() {
+            DeployStatus::Warming
+        } else {
+            DeployStatus::Ready
+        };
+    let updated = store.set_deploy_status(SetDeployStatusParams {
+        deploy_id: deploy_id.to_string(),
+        status: next_status,
+    })?;
+    Ok(PrepareDeployRuntimeResponse {
+        id: updated.id,
+        status: updated.status,
+    })
+}
+
+pub fn lease_runtime_prepare<S: GumStore>(
+    store: &S,
+    request: LeaseRuntimePrepareRequest,
+) -> Result<Option<LeaseRuntimePrepareResponse>, String> {
+    let candidates =
+        store.list_deploys_by_status(DeployStatus::Warming, RUNTIME_PREPARE_CANDIDATE_LIMIT)?;
+    for deploy in candidates {
+        if deploy.deps_mode.as_deref().is_none() || deploy.deps_hash.as_deref().is_none() {
+            let _ = store.set_deploy_status(SetDeployStatusParams {
+                deploy_id: deploy.id.clone(),
+                status: DeployStatus::Ready,
+            });
+            continue;
+        }
+        let acquired = store.try_acquire_control_lease(ControlLeaseParams {
+            lease_name: runtime_prepare_lease_name(&deploy.id),
+            holder_id: request.runner_id.clone(),
+            ttl_secs: request.lease_ttl_secs,
+            now_epoch_ms: now_epoch_ms(),
+        })?;
+        if !acquired {
+            continue;
+        }
+        return Ok(Some(LeaseRuntimePrepareResponse {
+            deploy_id: deploy.id,
+            bundle_url: deploy.bundle_url,
+            entrypoint: deploy.entrypoint,
+            python_version: deploy.python_version,
+            deps_mode: deploy.deps_mode,
+            deps_hash: deploy.deps_hash,
+        }));
+    }
+    Ok(None)
+}
+
+pub fn complete_runtime_prepare<S: GumStore>(
+    store: &S,
+    deploy_id: &str,
+    success: bool,
+) -> Result<PrepareDeployRuntimeResponse, String> {
+    let status = if success {
+        DeployStatus::Ready
+    } else {
+        DeployStatus::WarmupFailed
+    };
+    let updated = store.set_deploy_status(SetDeployStatusParams {
+        deploy_id: deploy_id.to_string(),
+        status,
+    })?;
+    Ok(PrepareDeployRuntimeResponse {
+        id: updated.id,
+        status: updated.status,
     })
 }
 
@@ -299,10 +390,15 @@ pub fn lease_run<S: GumStore>(
         input: run.input_json,
         bundle_url: deploy.bundle_url,
         entrypoint: deploy.entrypoint,
+        python_version: deploy.python_version,
+        deps_mode: deploy.deps_mode,
+        deps_hash: deploy.deps_hash,
         handler_ref: job.handler_ref,
         timeout_secs: job.timeout_secs,
         cpu_cores: job.cpu_cores,
         memory_mb: job.memory_mb,
+        required_secret_names: job.required_secret_names,
+        resolved_secrets: HashMap::new(),
         lease_ttl_secs: request.lease_ttl_secs,
     }))
 }
@@ -498,6 +594,10 @@ fn derive_waiting_reason(
         return Some("waiting_on_rate_limit".to_string());
     }
     None
+}
+
+fn runtime_prepare_lease_name(deploy_id: &str) -> String {
+    format!("runtime_prepare:{deploy_id}")
 }
 
 fn provider_health_state_to_str(state: ProviderHealthState) -> &'static str {

@@ -29,7 +29,7 @@ Status legend: `todo`, `in_progress`, `done`
 | P0 | Key/idempotency matrix (dedupe, replay semantics, retention) | Ekomotu (Runtime) | 2026-04-25 | `done` |
 | P0 | Concurrency slot lifecycle matrix (all release paths + restart) | Ekomotu (Runtime) | 2026-04-25 | `done` |
 | P0 | Admin auth baseline + secrets hygiene pass | Ekomotu (Runtime/Security) | 2026-04-25 | `done` |
-| P0 | Ops checks (migration, backup/restore drill, rollback runbook) | Ekomotu (Ops) | 2026-04-27 | `todo` |
+| P0 | Ops checks (migration, backup/restore drill, rollback runbook) | Ekomotu (Ops) | 2026-04-27 | `done` |
 | P0 | 24h staging soak and blocker triage | Ekomotu (Runtime/Ops) | 2026-04-27 | `todo` |
 | P0 | Beta support channel, owner, and response window published | Ekomotu (Support) | 2026-04-28 | `todo` |
 | P1 | Observability pass (waiting reasons, retry_after, failure_class clarity) | Ekomotu (Runtime) | 2026-04-26 | `todo` |
@@ -37,7 +37,7 @@ Status legend: `todo`, `in_progress`, `done`
 | P1 | Site/docs/CLI example consistency pass | Ekomotu (Product/Docs) | 2026-04-26 | `in_progress` |
 | P1 | Optional `gum run <function>` DX shortcut | Ekomotu (Runtime/SDK) | 2026-04-29 | `todo` |
 
-## Current snapshot (as of April 23, 2026)
+## Current snapshot (as of April 27, 2026)
 
 - `done`: scope freeze and "not in beta" list published in this doc.
 - `done`: onboarding path acceptance checks are locked with a repeatable smoke script and validated end-to-end.
@@ -48,6 +48,7 @@ Status legend: `todo`, `in_progress`, `done`
 - `done`: admin auth baseline and secrets hygiene pass completed (auth edge cases covered, CLI unlock/error flow verified, docs/examples secret scan enforced).
 - `in_progress`: docs foundation exists (quickstart/deploy/environment) and needs final troubleshooting/known-limits pass.
 - `in_progress`: website hero example consistency work is active and should be locked before docs freeze.
+- `done`: BETA-008 ops checks completed; local migration+backup/restore+rollback drill passed, staging manual backup/restore probe passed, staging migration columns verified in `gum_api_stg`, rollback runbook documented.
 
 ## Issue list (execution IDs)
 
@@ -60,7 +61,7 @@ Status legend: `todo`, `in_progress`, `done`
 | BETA-005 | P0 | Key/idempotency matrix execution | Ekomotu | 2026-04-25 | `done` |
 | BETA-006 | P0 | Concurrency slot lifecycle matrix execution | Ekomotu | 2026-04-25 | `done` |
 | BETA-007 | P0 | Admin auth + secrets hygiene pass | Ekomotu | 2026-04-25 | `done` |
-| BETA-008 | P0 | Ops checks: migration, backup/restore, rollback | Ekomotu | 2026-04-27 | `todo` |
+| BETA-008 | P0 | Ops checks: migration, backup/restore, rollback | Ekomotu | 2026-04-27 | `done` |
 | BETA-009 | P0 | 24h staging soak + blocker triage | Ekomotu | 2026-04-27 | `todo` |
 | BETA-010 | P0 | Support channel + response window published | Ekomotu | 2026-04-28 | `todo` |
 | BETA-011 | P1 | Observability pass | Ekomotu | 2026-04-26 | `todo` |
@@ -149,6 +150,21 @@ Executed on April 23, 2026.
 | Docs/examples secret hygiene scan (no embedded live-like keys) | `python3.11 -m unittest sdk.tests.test_secrets_hygiene` | pass |
 | Docs explicitly warn against committing API/admin secrets | `docs-site/reference/environment.mdx` + `docs-site/guides/admin-cli.mdx` | pass |
 
+## BETA-008 evidence (ops checks: migration, backup/restore, rollback)
+
+Executed on April 27, 2026.
+
+| Scenario | Command | Result |
+| --- | --- | --- |
+| Local migration apply check via API startup on fresh Postgres | `KEEP_OPS_ARTIFACTS=1 ./scripts/ops_checks_local.sh` | pass |
+| Local backup/restore drill preserves sentinel row | `restore_sentinel_count=1` from `scripts/ops_checks_local.sh` output | pass |
+| Local rollback drill removes post-backup mutation after restore | `rollback_mutated_count_after_restore=0` from `scripts/ops_checks_local.sh` output | pass |
+| Staging Postgres machine scaled to backup-required memory | `flyctl machine update 8d10e3c5420698 -a gum-pg-stg --vm-memory 512 --yes` | pass |
+| Staging backup/restore probe via direct pg tools on cluster | `flyctl ssh console -a gum-pg-stg ... pg_dump/pg_restore ...` (`/data/gum_ops_20260427_181315.dump`, restore probe count `1`) | pass |
+| Staging migration columns present in live DB | `flyctl postgres connect -a gum-pg-stg -d gum_api_stg` + `SELECT ... FROM information_schema.columns ...` (rows: `jobs.cpu_cores`, `jobs.memory_mb`, `runners.cpu_cores`, `runners.memory_mb`) | pass |
+| Fly managed backup toggle path | `flyctl postgres backup enable/create` | inconsistent control-plane state (`enable` reports already enabled while `create/list` report not enabled); tracked as platform issue |
+| Rollback procedure documented | `docs/GUM_OPS_RUNBOOK.md` | pass |
+
 ## Must-ship checklist
 
 - [x] Freeze beta scope and publish a "not in beta" list.
@@ -172,9 +188,9 @@ Executed on April 23, 2026.
 - [ ] run status, failure class, retry_after, waiting reason visible
 - [ ] function health visibility in API/admin path
 - [ ] Ops guardrails:
-- [ ] backup and restore drill done once
-- [ ] migrations apply cleanly on staging
-- [ ] rollback procedure documented
+- [x] backup and restore drill done once
+- [x] migrations apply cleanly on staging
+- [x] rollback procedure documented
 - [ ] Docs readiness:
 - [ ] quickstart
 - [ ] deploy guide

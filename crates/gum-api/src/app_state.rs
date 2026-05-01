@@ -1,9 +1,13 @@
 use gum_store::models::ProjectRecord;
 use gum_store::pg::PostgresStore;
+use std::sync::Arc;
+
+use crate::secret_store::{secret_store_from_env, SecretStore};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: PostgresStore,
+    pub secrets: Arc<dyn SecretStore>,
     pub project_id: String,
     pub api_key: String,
     pub admin_key: String,
@@ -27,6 +31,7 @@ impl AppState {
 
         Ok(Self {
             store,
+            secrets: secret_store_from_env(&database_url)?,
             project_id: "proj_dev".to_string(),
             api_key: std::env::var("GUM_API_KEY").unwrap_or_else(|_| "dev".to_string()),
             admin_key: std::env::var("GUM_ADMIN_KEY")

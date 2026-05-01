@@ -1,0 +1,4 @@
+ALTER TABLE deploys
+    ADD COLUMN IF NOT EXISTS python_version TEXT,
+    ADD COLUMN IF NOT EXISTS deps_mode TEXT,
+    ADD COLUMN IF NOT EXISTS deps_hash TEXT;

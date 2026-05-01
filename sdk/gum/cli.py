@@ -81,6 +81,18 @@ def main(argv: list[str] | None = None) -> int:
     deploy_parser.add_argument("--project-id")
     deploy_parser.add_argument("--api-base-url")
 
+    secrets_parser = subparsers.add_parser("secrets", help="manage project secrets")
+    secrets_subparsers = secrets_parser.add_subparsers(dest="secrets_command", required=True)
+    secrets_set_parser = secrets_subparsers.add_parser("set", help="set one secret value")
+    secrets_set_parser.add_argument("name")
+    secrets_set_parser.add_argument("--value")
+    secrets_set_parser.add_argument("--env")
+    secrets_list_parser = secrets_subparsers.add_parser("list", help="list secret names")
+    secrets_list_parser.add_argument("--env")
+    secrets_delete_parser = secrets_subparsers.add_parser("delete", help="delete one secret")
+    secrets_delete_parser.add_argument("name")
+    secrets_delete_parser.add_argument("--env")
+
     list_parser = subparsers.add_parser("list", help="show recent runs")
     list_parser.add_argument("--limit", type=int, default=20)
 
@@ -214,6 +226,31 @@ def main(argv: list[str] | None = None) -> int:
             logs = client.runs.logs(args.run_id)
             print(render_logs(logs, attempt_id=args.attempt))
             return 0
+
+        if args.command == "secrets":
+            environment = args.env if hasattr(args, "env") else None
+            if args.secrets_command == "set":
+                value = args.value
+                if value is None:
+                    value = getpass.getpass(f"{args.name}: ")
+                if not str(value).strip():
+                    raise UserAuthError("secret value cannot be empty")
+                metadata = client.secrets.set(
+                    args.name,
+                    str(value),
+                    environment=environment,
+                )
+                print(render_secret_set(metadata))
+                return 0
+            if args.secrets_command == "list":
+                secrets = client.secrets.list(environment=environment)
+                print(render_secret_table(secrets))
+                return 0
+            if args.secrets_command == "delete":
+                client.secrets.delete(args.name, environment=environment)
+                target_env = environment or "prod"
+                print(f"Deleted secret {args.name} (env={target_env})")
+                return 0
 
         if args.command == "cancel":
             run = client.runs.cancel(args.run_id)
@@ -374,6 +411,28 @@ def render_deploy_summary(result) -> str:
             "  3. Stream logs with: gum logs <run_id>",
         ]
     )
+    return "\n".join(lines)
+
+
+def render_secret_set(metadata) -> str:
+    return (
+        "Secret saved\n"
+        f"Name: {metadata.name}\n"
+        f"Env:  {metadata.environment}\n"
+        f"Store:{metadata.backend}\n"
+        f"At:   {metadata.updated_at_epoch_ms}"
+    )
+
+
+def render_secret_table(secrets: list) -> str:
+    if not secrets:
+        return "No secrets found."
+    lines = ["NAME                     ENV        BACKEND      UPDATED(ms)       LAST_USED(ms)"]
+    for secret in secrets:
+        last_used = secret.last_used_at_epoch_ms if secret.last_used_at_epoch_ms is not None else "--"
+        lines.append(
+            f"{secret.name:<24} {secret.environment:<10} {secret.backend:<12} {secret.updated_at_epoch_ms:<16} {last_used}"
+        )
     return "\n".join(lines)
 
 

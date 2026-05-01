@@ -1,0 +1,22 @@
+company,region_focus,signal_summary,source_url
+Urban SDK,US,Senior Python role centered on FastAPI microservices,https://www.linkedin.com/jobs/view/senior-python-engineer-fastapi-microservices-at-urban-sdk-4234252834
+QOVES,EU (UK),Senior backend role asks for Python/FastAPI/Django,https://wellfound.com/jobs/3541963-senior-backend-engineer-python-fastapi-django
+Kernel Intelligence,US (Remote),Senior backend systems role uses Python/FastAPI,https://wellfound.com/jobs/3541646-backend-systems-engineer-freelance-contract-us-based
+Civitos,US,Engineer role: Django + React,https://wellfound.com/jobs/3543245-engineer-full-stack-django-react-gcp
+Fleek,Remote (US HQ),Senior backend role: FastAPI + Django,https://wellfound.com/jobs/3336634-senior-backend-engineer-python-django-odoo-fastapi
+Wrnly,Remote (Global),Full-stack role includes FastAPI,https://wellfound.com/jobs/3617318-full-stack-engineer
+Mirvie,US,Software engineer role: Python/Django,https://wellfound.com/jobs/3883220-software-engineer-python-django
+Serava,Remote (Includes North America),Full-stack role includes Python + Django + PostgreSQL,https://wellfound.com/jobs/3534683-full-stack-developer-python-django-react
+Newcode.ai,US,FastAPI posting references Redis and Celery,https://www.ziprecruiter.com/Jobs/Fastapi-Python/--in-California
+Udemy,US,Public stack shows Celery + Django + Redis,https://stackshare.io/udemy
+Soylent,US,Public stack shows Celery + Django + RabbitMQ,https://stackshare.io/soylent
+Codecov,US,CTO notes Celery used for long-running async tasks,https://stackshare.io/tools/celery
+Sentry,US,Ops note references Django + Celery + Redis,https://stackshare.io/tools/celery
+Postmates,US,Listed as popular company using Celery,https://stackshare.io/stackups/celery-vs-opm
+Ansible,US,Listed as popular company using Celery,https://stackshare.io/stackups/celery-vs-kue
+LemonStand,North America,Comparison snippet lists as Open PostgreSQL Monitoring user,https://stackshare.io/stackups/celery-vs-opm
+FreshBooks,North America,Public stack shows Python/Redis + Celery,https://stackshare.io/freshbooks/freshbooks
+Net Power & Light,US,Public stack lists Redis + Celery + RabbitMQ,https://stackshare.io/net-power-and-light/net-power-and-light
+HackerRank (DataScience stack),US,Public stack lists Django + Redis + Celery,https://stackshare.io/hackerrank/datascience
+Bitbucket,Global (Non-India target),Company appears in Celery tool adoption companies,https://stackshare.io/celery
+Zapier,US,Company appears in Celery tool adoption companies,https://stackshare.io/celery

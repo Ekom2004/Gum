@@ -11,6 +11,10 @@ PG_APP="${FLY_PG_APP:-gum-pg-stg}"
 PG_VM_SIZE="${FLY_PG_VM_SIZE:-shared-cpu-1x}"
 PG_VOLUME_GB="${FLY_PG_VOLUME_GB:-20}"
 API_URL="${FLY_API_URL:-https://${API_APP}.fly.dev}"
+RUNNER_COMPUTE_CLASS="${GUM_RUNNER_COMPUTE_CLASS:-standard}"
+RUNNER_CPU_CORES="${GUM_RUNNER_CPU_CORES:-1}"
+RUNNER_MEMORY_MB="${GUM_RUNNER_MEMORY_MB:-512}"
+RUNNER_MAX_CONCURRENT_LEASES="${GUM_RUNNER_MAX_CONCURRENT_LEASES:-2}"
 
 if ! command -v fly >/dev/null 2>&1; then
   echo "fly CLI is required (https://fly.io/docs/flyctl/install/)" >&2
@@ -98,9 +102,10 @@ echo "setting runner secrets"
 fly secrets set -a "${RUNNER_APP}" \
   GUM_API_BASE_URL="${API_URL}" \
   GUM_INTERNAL_KEY="${INTERNAL_KEY}" \
-  GUM_RUNNER_COMPUTE_CLASS="standard" \
-  GUM_RUNNER_MEMORY_MB="1024" \
-  GUM_RUNNER_MAX_CONCURRENT_LEASES="2"
+  GUM_RUNNER_COMPUTE_CLASS="${RUNNER_COMPUTE_CLASS}" \
+  GUM_RUNNER_CPU_CORES="${RUNNER_CPU_CORES}" \
+  GUM_RUNNER_MEMORY_MB="${RUNNER_MEMORY_MB}" \
+  GUM_RUNNER_MAX_CONCURRENT_LEASES="${RUNNER_MAX_CONCURRENT_LEASES}"
 
 echo "deploying api"
 fly deploy -c "${REPO_ROOT}/deploy/fly/api.fly.toml" --app "${API_APP}" --remote-only

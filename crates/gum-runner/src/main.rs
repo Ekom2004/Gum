@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use gum_runner::runner_loop::{
-    AppendLogRequest, CompleteAttemptRequest, LeaseRunRequest, LeaseStateResponse, LeasedRun,
+    AppendLogRequest, CompleteAttemptRequest, CompleteRuntimePrepareRequest, LeaseRunRequest,
+    LeaseRuntimePrepareRequest, LeaseStateResponse, LeasedRun, LeasedRuntimePrepare,
     RegisterRunnerRequest, RunnerHeartbeatRequest, RunnerLoopConfig,
 };
 use gum_types::AttemptStatus;
@@ -25,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         internal_key: std::env::var("GUM_INTERNAL_KEY")
             .unwrap_or_else(|_| "gum-dev-internal".to_string()),
     };
+    let runtime_prepare_lease_ttl_secs = env_u64("GUM_RUNTIME_PREPARE_LEASE_TTL_SECS", 600);
     let client = reqwest::Client::new();
     let base_url = match std::env::var("GUM_API_BASE_URL") {
         Ok(value) => value,
@@ -105,8 +107,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
             Ok(None) => {
-                heartbeat_once(&client, &base_url, &config, Vec::new()).await?;
-                tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+                match lease_runtime_prepare_once(
+                    &client,
+                    &base_url,
+                    &config,
+                    runtime_prepare_lease_ttl_secs,
+                )
+                .await
+                {
+                    Ok(Some(prepare)) => {
+                        tracing::info!(deploy_id = %prepare.deploy_id, "leased runtime prepare");
+                        let (heartbeat_stop_tx, heartbeat_stop_rx) = oneshot::channel();
+                        let heartbeat_task = tokio::spawn(heartbeat_loop(
+                            client.clone(),
+                            base_url.clone(),
+                            config.clone(),
+                            Vec::new(),
+                            heartbeat_stop_rx,
+                        ));
+                        let prepare_result = gum_runner::execution::prepare_runtime(&prepare).await;
+                        let _ = heartbeat_stop_tx.send(());
+                        let _ = heartbeat_task.await;
+                        complete_runtime_prepare_once(
+                            &client,
+                            &base_url,
+                            &config,
+                            &prepare,
+                            prepare_result,
+                        )
+                        .await?;
+                    }
+                    Ok(None) => {
+                        heartbeat_once(&client, &base_url, &config, Vec::new()).await?;
+                        tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+                    }
+                    Err(error) => {
+                        tracing::error!("runtime prepare lease error: {}", error);
+                        let _ = heartbeat_once(&client, &base_url, &config, Vec::new()).await;
+                        tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+                    }
+                }
             }
             Err(error) => {
                 tracing::error!("runner loop error: {}", error);
@@ -121,6 +161,14 @@ fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
 }
@@ -195,6 +243,45 @@ async fn lease_once(
         .await
         .map(Some)
         .map_err(|error| format!("failed to decode leased run: {error}"))
+}
+
+async fn lease_runtime_prepare_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    config: &RunnerLoopConfig,
+    lease_ttl_secs: u64,
+) -> Result<Option<LeasedRuntimePrepare>, String> {
+    let response = client
+        .post(format!(
+            "{}/internal/runtime-prepares/lease",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&config.internal_key)
+        .json(&LeaseRuntimePrepareRequest {
+            runner_id: config.runner_id.clone(),
+            lease_ttl_secs,
+        })
+        .send()
+        .await
+        .map_err(|error| format!("failed to request runtime prepare lease: {error}"))?;
+
+    if response.status() == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("failed to read runtime prepare lease error body: {error}"))?;
+        return Err(format!("runtime prepare lease request failed: {body}"));
+    }
+
+    response
+        .json::<LeasedRuntimePrepare>()
+        .await
+        .map(Some)
+        .map_err(|error| format!("failed to decode runtime prepare lease: {error}"))
 }
 
 async fn heartbeat_loop(
@@ -421,6 +508,41 @@ async fn complete_once(
         .await
         .map_err(|error| format!("failed to read completion error body: {error}"))?;
     Err(format!("attempt completion failed: {body}"))
+}
+
+async fn complete_runtime_prepare_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    config: &RunnerLoopConfig,
+    prepare: &LeasedRuntimePrepare,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    if let Err(error) = &result {
+        tracing::error!(deploy_id = %prepare.deploy_id, "runtime prepare failed: {}", error);
+    }
+    let response = client
+        .post(format!(
+            "{}/internal/runtime-prepares/{}/complete",
+            base_url.trim_end_matches('/'),
+            prepare.deploy_id
+        ))
+        .bearer_auth(&config.internal_key)
+        .json(&CompleteRuntimePrepareRequest {
+            runner_id: config.runner_id.clone(),
+            success: result.is_ok(),
+        })
+        .send()
+        .await
+        .map_err(|error| format!("failed to complete runtime prepare: {error}"))?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let body = response.text().await.map_err(|error| {
+        format!("failed to read runtime prepare completion error body: {error}")
+    })?;
+    Err(format!("runtime prepare completion failed: {body}"))
 }
 
 fn heartbeat_interval_ms(lease_ttl_secs: u64) -> u64 {

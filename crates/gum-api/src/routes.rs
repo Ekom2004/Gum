@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
-use gum_types::{AttemptStatus, RunStatus};
+use gum_types::{AttemptStatus, DeployStatus, RunStatus};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegisterDeployRequest {
@@ -11,6 +12,12 @@ pub struct RegisterDeployRequest {
     pub bundle_sha256: String,
     pub sdk_language: String,
     pub entrypoint: String,
+    #[serde(default)]
+    pub python_version: Option<String>,
+    #[serde(default)]
+    pub deps_mode: Option<String>,
+    #[serde(default)]
+    pub deps_hash: Option<String>,
     pub jobs: Vec<RegisteredJob>,
 }
 
@@ -30,12 +37,20 @@ pub struct RegisteredJob {
     pub memory_mb: Option<u32>,
     pub key_field: Option<String>,
     pub compute_class: Option<String>,
+    #[serde(default)]
+    pub required_secret_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterDeployResponse {
     pub id: String,
     pub registered_jobs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepareDeployRuntimeResponse {
+    pub id: String,
+    pub status: DeployStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +99,25 @@ pub struct LeaseRunRequest {
     pub lease_ttl_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRuntimePrepareRequest {
+    pub runner_id: String,
+    pub lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRuntimePrepareResponse {
+    pub deploy_id: String,
+    pub bundle_url: String,
+    pub entrypoint: String,
+    #[serde(default)]
+    pub python_version: Option<String>,
+    #[serde(default)]
+    pub deps_mode: Option<String>,
+    #[serde(default)]
+    pub deps_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LeaseRunResponse {
     pub lease_id: String,
@@ -96,10 +130,20 @@ pub struct LeaseRunResponse {
     pub input: Value,
     pub bundle_url: String,
     pub entrypoint: String,
+    #[serde(default)]
+    pub python_version: Option<String>,
+    #[serde(default)]
+    pub deps_mode: Option<String>,
+    #[serde(default)]
+    pub deps_hash: Option<String>,
     pub handler_ref: String,
     pub timeout_secs: u32,
     pub cpu_cores: Option<u32>,
     pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub required_secret_names: Vec<String>,
+    #[serde(default)]
+    pub resolved_secrets: HashMap<String, String>,
     pub lease_ttl_secs: u64,
 }
 
@@ -246,6 +290,12 @@ pub struct CompleteAttemptRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteRuntimePrepareRequest {
+    pub runner_id: String,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelRunRequest {
     pub reason: Option<String>,
 }
@@ -254,4 +304,26 @@ pub struct CancelRunRequest {
 pub struct AppendLogRequest {
     pub stream: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSecretRequest {
+    pub name: String,
+    pub value: String,
+    pub environment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretMetadataResponse {
+    pub project_id: String,
+    pub environment: String,
+    pub name: String,
+    pub backend: String,
+    pub updated_at_epoch_ms: i64,
+    pub last_used_at_epoch_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretsListResponse {
+    pub secrets: Vec<SecretMetadataResponse>,
 }

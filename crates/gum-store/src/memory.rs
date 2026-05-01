@@ -22,11 +22,12 @@ fn job_cpu_cores(job: &JobRecord) -> u32 {
 }
 use crate::queries::{
     compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
-    is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, parse_schedule_interval_ms,
-    provider_slug_from_job, rate_limit_scope_key, CancelRunParams, CompleteAttemptParams,
+    is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, provider_slug_from_job,
+    rate_limit_scope_key, recurring_due_times_ms, CancelRunParams, CompleteAttemptParams,
     ControlLeaseParams, EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams,
     LeaseNextAttemptParams, RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams,
-    ReplayRunParams, SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
+    ReplayRunParams, SetDeployStatusParams, SetFunctionHealthParams, SetProviderHealthParams,
+    UpsertProviderTargetParams,
 };
 
 #[derive(Default)]
@@ -446,6 +447,9 @@ impl GumStore for MemoryStore {
             bundle_sha256: params.bundle_sha256,
             sdk_language: params.sdk_language,
             entrypoint: params.entrypoint,
+            python_version: params.python_version,
+            deps_mode: params.deps_mode,
+            deps_hash: params.deps_hash,
             status: DeployStatus::Ready,
         };
         let created_at_epoch_ms = now_epoch_ms();
@@ -468,6 +472,7 @@ impl GumStore for MemoryStore {
                 memory_mb: job.memory_mb,
                 key_field: job.key_field,
                 compute_class: job.compute_class,
+                required_secret_names: job.required_secret_names,
                 enabled: true,
                 created_at_epoch_ms,
             };
@@ -723,6 +728,19 @@ impl GumStore for MemoryStore {
         Ok(state.deploys.get(deploy_id).cloned())
     }
 
+    fn set_deploy_status(&self, params: SetDeployStatusParams) -> Result<DeployRecord, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let deploy = state
+            .deploys
+            .get_mut(&params.deploy_id)
+            .ok_or_else(|| "deploy not found".to_string())?;
+        deploy.status = params.status;
+        Ok(deploy.clone())
+    }
+
     fn get_lease_state(&self, lease_id: &str) -> Result<Option<LeaseStateRecord>, String> {
         let state = self
             .state
@@ -741,6 +759,26 @@ impl GumStore for MemoryStore {
             cancel_requested: lease.revoke_requested_at_epoch_ms.is_some()
                 || attempt.cancel_requested_at_epoch_ms.is_some(),
         }))
+    }
+
+    fn list_deploys_by_status(
+        &self,
+        status: DeployStatus,
+        limit: usize,
+    ) -> Result<Vec<DeployRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut deploys: Vec<DeployRecord> = state
+            .deploys
+            .values()
+            .filter(|deploy| deploy.status == status)
+            .cloned()
+            .collect();
+        deploys.sort_by(|left, right| left.id.cmp(&right.id));
+        deploys.truncate(limit);
+        Ok(deploys)
     }
 
     fn list_recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>, String> {
@@ -1490,27 +1528,25 @@ impl GumStore for MemoryStore {
             let Some(schedule_expr) = &job.schedule_expr else {
                 continue;
             };
-            let interval_ms = parse_schedule_interval_ms(schedule_expr)?;
-
-            // Schedules are anchored to the job creation time, then advanced by whole
-            // intervals. Looking at the latest scheduled fire time lets the scheduler
-            // catch up after restarts without changing that anchor.
-            let last_scheduled_ms = state
+            let latest_scheduled_ms = state
                 .runs
                 .values()
                 .filter(|run| run.job_id == job.id && run.trigger_type == TriggerType::Schedule)
                 .map(|run| run.scheduled_at_epoch_ms)
-                .max()
-                .unwrap_or(job.created_at_epoch_ms);
-
-            let mut next_due_ms = last_scheduled_ms.saturating_add(interval_ms);
-            while next_due_ms <= now_epoch_ms {
+                .max();
+            let due_fire_times = recurring_due_times_ms(
+                schedule_expr,
+                job.created_at_epoch_ms,
+                latest_scheduled_ms,
+                now_epoch_ms,
+            )?;
+            for due_ms in due_fire_times {
                 // Dedupe is part of the scheduler contract: if two ticks cover the same
                 // fire time, we still want at most one scheduled run for that job+time.
                 let already_exists = state.runs.values().any(|run| {
                     run.job_id == job.id
                         && run.trigger_type == TriggerType::Schedule
-                        && run.scheduled_at_epoch_ms == next_due_ms
+                        && run.scheduled_at_epoch_ms == due_ms
                 });
 
                 if !already_exists {
@@ -1524,7 +1560,7 @@ impl GumStore for MemoryStore {
                         input_json: serde_json::json!({}),
                         attempt_count: 0,
                         max_attempts: job.retries + 1,
-                        scheduled_at_epoch_ms: next_due_ms,
+                        scheduled_at_epoch_ms: due_ms,
                         failure_reason: None,
                         failure_class: None,
                         retry_after_epoch_ms: None,
@@ -1534,8 +1570,6 @@ impl GumStore for MemoryStore {
                     state.runs.insert(run.id.clone(), run.clone());
                     created_runs.push(run);
                 }
-
-                next_due_ms = next_due_ms.saturating_add(interval_ms);
             }
         }
 

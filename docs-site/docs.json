@@ -30,6 +30,7 @@
           "guides/deploy",
           "guides/enqueue",
           "guides/schedules",
+          "guides/resend-scheduled-email",
           "guides/admin-cli"
         ]
       },

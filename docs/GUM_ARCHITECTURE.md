@@ -270,6 +270,26 @@ Replay creates a new run with:
 
 Backfill creates many normal runs.
 
+## Deploy Statuses
+
+Public deploy states:
+- `registering`
+- `warming`
+- `warmup_failed`
+- `ready`
+- `failed`
+
+Meaning:
+- `registering`: Gum is accepting the deploy metadata and job definitions.
+- `warming`: the deploy is registered and a runner is preparing the runtime cache for its dependency set.
+- `warmup_failed`: runtime preparation failed on the runner side; the deploy exists, but its cached runtime is not ready yet.
+- `ready`: the deploy is available for normal execution.
+- `failed`: the deploy itself failed to register or was marked unusable by the control plane.
+
+Notes:
+- `warming` is only used when the deploy has a dependency-backed runtime to prepare.
+- Older persisted values like `uploading` and `runtime_preparing` are still accepted internally for backward compatibility, but new writes use the names above.
+
 ## Retry Semantics
 
 Gum uses this rule:

@@ -15,11 +15,12 @@ use crate::models::{
 };
 use crate::queries::{
     compute_retry_disposition, function_health_hold_delay_ms, is_infrastructure_failure_class,
-    is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, parse_schedule_interval_ms,
-    provider_slug_from_job, rate_limit_scope_key, CancelRunParams, CompleteAttemptParams,
+    is_provider_failure_class, key_retention_ms, parse_rate_limit_spec, provider_slug_from_job,
+    rate_limit_scope_key, recurring_due_times_ms, CancelRunParams, CompleteAttemptParams,
     ControlLeaseParams, EnqueueRunParams, EnqueueRunResult, GumStore, HeartbeatRunnerParams,
     LeaseNextAttemptParams, RecordProviderCheckParams, RegisterDeployParams, RegisterRunnerParams,
-    ReplayRunParams, SetFunctionHealthParams, SetProviderHealthParams, UpsertProviderTargetParams,
+    ReplayRunParams, SetDeployStatusParams, SetFunctionHealthParams, SetProviderHealthParams,
+    UpsertProviderTargetParams,
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_slice1.sql");
@@ -34,6 +35,8 @@ const MIGRATION_0008: &str = include_str!("../migrations/0008_function_health.sq
 const MIGRATION_0009: &str = include_str!("../migrations/0009_run_keys.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_memory_resources.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_cpu_resources.sql");
+const MIGRATION_0012: &str = include_str!("../migrations/0012_required_secrets.sql");
+const MIGRATION_0013: &str = include_str!("../migrations/0013_deploy_runtime_spec.sql");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -86,6 +89,12 @@ impl PostgresStore {
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .batch_execute(MIGRATION_0011)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
+            .batch_execute(MIGRATION_0012)
+            .map_err(|error| format!("failed to apply migrations: {error}"))?;
+        client
+            .batch_execute(MIGRATION_0013)
             .map_err(|error| format!("failed to apply migrations: {error}"))?;
         client
             .execute(
@@ -504,14 +513,17 @@ impl GumStore for PostgresStore {
             bundle_sha256: params.bundle_sha256,
             sdk_language: params.sdk_language,
             entrypoint: params.entrypoint,
+            python_version: params.python_version,
+            deps_mode: params.deps_mode,
+            deps_hash: params.deps_hash,
             status: DeployStatus::Ready,
         };
         let created_at_epoch_ms = now_epoch_ms();
 
         tx.execute(
             "INSERT INTO deploys (
-                id, project_id, version, bundle_url, bundle_sha256, sdk_language, entrypoint, status
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                id, project_id, version, bundle_url, bundle_sha256, sdk_language, entrypoint, python_version, deps_mode, deps_hash, status
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &deploy.id,
                 &deploy.project_id,
@@ -520,6 +532,9 @@ impl GumStore for PostgresStore {
                 &deploy.bundle_sha256,
                 &deploy.sdk_language,
                 &deploy.entrypoint,
+                &deploy.python_version,
+                &deploy.deps_mode,
+                &deploy.deps_hash,
                 &deploy_status_to_str(deploy.status),
             ],
         )
@@ -543,6 +558,7 @@ impl GumStore for PostgresStore {
                 memory_mb: job.memory_mb,
                 key_field: job.key_field,
                 compute_class: job.compute_class,
+                required_secret_names: job.required_secret_names,
                 enabled: true,
                 created_at_epoch_ms,
             };
@@ -550,8 +566,8 @@ impl GumStore for PostgresStore {
             tx.execute(
                 "INSERT INTO jobs (
                     id, project_id, deploy_id, name, handler_ref, trigger_mode, schedule_expr,
-                    retries, timeout_secs, rate_limit_spec, concurrency_limit, cpu_cores, memory_mb, key_field, compute_class, enabled
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    retries, timeout_secs, rate_limit_spec, concurrency_limit, cpu_cores, memory_mb, key_field, compute_class, required_secret_names, enabled
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                  ON CONFLICT (id) DO UPDATE
                  SET project_id = EXCLUDED.project_id,
                      deploy_id = EXCLUDED.deploy_id,
@@ -567,6 +583,7 @@ impl GumStore for PostgresStore {
                      memory_mb = EXCLUDED.memory_mb,
                      key_field = EXCLUDED.key_field,
                      compute_class = EXCLUDED.compute_class,
+                     required_secret_names = EXCLUDED.required_secret_names,
                      enabled = EXCLUDED.enabled,
                      updated_at = NOW()",
                 &[
@@ -585,6 +602,7 @@ impl GumStore for PostgresStore {
                     &record.memory_mb.map(|value| value as i32),
                     &record.key_field,
                     &record.compute_class,
+                    &record.required_secret_names,
                     &record.enabled,
                 ],
             )
@@ -1042,6 +1060,21 @@ impl GumStore for PostgresStore {
         row.map(deploy_from_row).transpose()
     }
 
+    fn set_deploy_status(&self, params: SetDeployStatusParams) -> Result<DeployRecord, String> {
+        let mut client = self.connect_client()?;
+        let row = client
+            .query_opt(
+                "UPDATE deploys
+                 SET status = $2
+                 WHERE id = $1
+                 RETURNING *",
+                &[&params.deploy_id, &deploy_status_to_str(params.status)],
+            )
+            .map_err(|error| format!("failed to update deploy status: {error}"))?
+            .ok_or_else(|| "deploy not found".to_string())?;
+        deploy_from_row(row)
+    }
+
     fn get_lease_state(&self, lease_id: &str) -> Result<Option<LeaseStateRecord>, String> {
         let mut client = self.connect_client()?;
         let row = client
@@ -1062,6 +1095,25 @@ impl GumStore for PostgresStore {
             attempt_id: row.get("attempt_id"),
             cancel_requested: row.get("cancel_requested"),
         }))
+    }
+
+    fn list_deploys_by_status(
+        &self,
+        status: DeployStatus,
+        limit: usize,
+    ) -> Result<Vec<DeployRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT *
+                 FROM deploys
+                 WHERE status = $1
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT $2",
+                &[&deploy_status_to_str(status), &(limit as i64)],
+            )
+            .map_err(|error| format!("failed to list deploys by status: {error}"))?;
+        rows.into_iter().map(deploy_from_row).collect()
     }
 
     fn list_recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>, String> {
@@ -2199,11 +2251,6 @@ impl GumStore for PostgresStore {
             let retries: i32 = row.get("retries");
             let schedule_expr: String = row.get("schedule_expr");
             let created_at_epoch_ms: i64 = row.get("created_at_epoch_ms");
-            let interval_ms = parse_schedule_interval_ms(&schedule_expr)?;
-
-            // Schedules stay anchored to the original job creation time. The latest
-            // scheduled run tells us which fire time was last materialized, so a new
-            // scheduler process can catch up without drifting the schedule.
             let latest_scheduled_ms = client
                 .query_opt(
                     "SELECT (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms
@@ -2215,11 +2262,15 @@ impl GumStore for PostgresStore {
                     &[&job_id],
                 )
                 .map_err(|error| format!("failed to load latest scheduled run: {error}"))?
-                .map(|latest| latest.get::<_, i64>("scheduled_at_epoch_ms"))
-                .unwrap_or(created_at_epoch_ms);
+                .map(|latest| latest.get::<_, i64>("scheduled_at_epoch_ms"));
 
-            let mut next_due_ms = latest_scheduled_ms.saturating_add(interval_ms);
-            while next_due_ms <= now_epoch_ms {
+            let due_fire_times = recurring_due_times_ms(
+                &schedule_expr,
+                created_at_epoch_ms,
+                latest_scheduled_ms,
+                now_epoch_ms,
+            )?;
+            for due_ms in due_fire_times {
                 let run_id = self.next_id("run");
                 let inserted = client
                     .query_opt(
@@ -2238,7 +2289,7 @@ impl GumStore for PostgresStore {
                             &job_id,
                             &deploy_id,
                             &(retries + 1),
-                            &(next_due_ms as f64),
+                            &(due_ms as f64),
                         ],
                     )
                     .map_err(|error| format!("failed to insert scheduled run: {error}"))?;
@@ -2246,8 +2297,6 @@ impl GumStore for PostgresStore {
                 if let Some(row) = inserted {
                     created_runs.push(run_from_row(row)?);
                 }
-
-                next_due_ms = next_due_ms.saturating_add(interval_ms);
             }
         }
 
@@ -2297,6 +2346,9 @@ fn deploy_from_row(row: Row) -> Result<DeployRecord, String> {
         bundle_sha256: row.get("bundle_sha256"),
         sdk_language: row.get("sdk_language"),
         entrypoint: row.get("entrypoint"),
+        python_version: row.get("python_version"),
+        deps_mode: row.get("deps_mode"),
+        deps_hash: row.get("deps_hash"),
         status: deploy_status_from_str(row.get("status"))?,
     })
 }
@@ -2327,6 +2379,7 @@ fn job_from_row(row: Row) -> Result<JobRecord, String> {
         memory_mb: memory_mb.map(|value| value as u32),
         key_field: row.get("key_field"),
         compute_class: row.get("compute_class"),
+        required_secret_names: row.get("required_secret_names"),
         enabled: row.get("enabled"),
         created_at_epoch_ms,
     })
@@ -2488,7 +2541,9 @@ fn log_from_row(row: Row) -> Result<LogRecord, String> {
 
 fn deploy_status_to_str(value: DeployStatus) -> &'static str {
     match value {
-        DeployStatus::Uploading => "uploading",
+        DeployStatus::Registering => "registering",
+        DeployStatus::Warming => "warming",
+        DeployStatus::WarmupFailed => "warmup_failed",
         DeployStatus::Ready => "ready",
         DeployStatus::Failed => "failed",
     }
@@ -2496,7 +2551,9 @@ fn deploy_status_to_str(value: DeployStatus) -> &'static str {
 
 fn deploy_status_from_str(value: String) -> Result<DeployStatus, String> {
     match value.as_str() {
-        "uploading" => Ok(DeployStatus::Uploading),
+        "registering" | "uploading" => Ok(DeployStatus::Registering),
+        "warming" | "runtime_preparing" => Ok(DeployStatus::Warming),
+        "warmup_failed" | "runtime_prepare_failed" => Ok(DeployStatus::WarmupFailed),
         "ready" => Ok(DeployStatus::Ready),
         "failed" => Ok(DeployStatus::Failed),
         _ => Err(format!("unknown deploy status: {value}")),

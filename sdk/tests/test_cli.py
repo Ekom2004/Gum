@@ -63,6 +63,7 @@ class _FakeClient:
     def __init__(self) -> None:
         self.runs = _FakeRunsAPI()
         self.admin = _FakeAdminAPI()
+        self.secrets = _FakeSecretsAPI()
 
 
 class _FakeAdminAPI:
@@ -93,6 +94,56 @@ class _FakeAdminAPI:
             )
         ]
 
+
+class _FakeSecretsAPI:
+    def __init__(self) -> None:
+        self._values = {
+            ("prod", "RESEND_API_KEY"): "re_test",
+        }
+        self.set_calls: list[tuple[str, str, str | None]] = []
+        self.delete_calls: list[tuple[str, str | None]] = []
+
+    def set(self, name: str, value: str, *, environment: str | None = None):
+        env = environment or "prod"
+        self._values[(env, name)] = value
+        self.set_calls.append((name, value, environment))
+        return type(
+            "SecretMetadata",
+            (),
+            {
+                "name": name,
+                "environment": env,
+                "backend": "memory",
+                "updated_at_epoch_ms": 123,
+                "last_used_at_epoch_ms": None,
+            },
+        )()
+
+    def list(self, *, environment: str | None = None):
+        env = environment or "prod"
+        out = []
+        for (secret_env, secret_name), _ in sorted(self._values.items()):
+            if secret_env != env:
+                continue
+            out.append(
+                type(
+                    "SecretMetadata",
+                    (),
+                    {
+                        "name": secret_name,
+                        "environment": secret_env,
+                        "backend": "memory",
+                        "updated_at_epoch_ms": 123,
+                        "last_used_at_epoch_ms": None,
+                    },
+                )()
+            )
+        return out
+
+    def delete(self, name: str, *, environment: str | None = None) -> bool:
+        env = environment or "prod"
+        self.delete_calls.append((name, environment))
+        return self._values.pop((env, name), None) is not None
 
 class CliTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -158,6 +209,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(self.client.runs.cancelled, ["run_123"])
         self.assertIn("Canceled run_123 (canceled)", stdout.getvalue())
+
+    def test_secrets_set_uses_hidden_prompt_when_value_missing(self) -> None:
+        gum_cli.getpass.getpass = lambda _prompt: "re_new_secret"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["secrets", "set", "RESEND_API_KEY"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            self.client.secrets.set_calls,
+            [("RESEND_API_KEY", "re_new_secret", None)],
+        )
+        self.assertIn("Secret saved", stdout.getvalue())
+
+    def test_secrets_list_prints_metadata_table(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["secrets", "list"])
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("NAME", output)
+        self.assertIn("RESEND_API_KEY", output)
+
+    def test_secrets_delete_prints_confirmation(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = gum_cli.main(["secrets", "delete", "RESEND_API_KEY"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(self.client.secrets.delete_calls, [("RESEND_API_KEY", None)])
+        self.assertIn("Deleted secret RESEND_API_KEY (env=prod)", stdout.getvalue())
 
     def test_live_once_renders_live_frame(self) -> None:
         stdout = io.StringIO()
@@ -359,6 +439,7 @@ class CliTests(unittest.TestCase):
                         memory_mb=1024,
                         key_field="customer_id",
                         compute_class=None,
+                        required_secret_names=[],
                         module_path="jobs.py",
                     )
                 ],

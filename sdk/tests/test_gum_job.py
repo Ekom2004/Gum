@@ -49,6 +49,7 @@ class GumJobTests(unittest.TestCase):
         self.assertEqual(send_followup.id, "job_send_followup")
         self.assertEqual(send_followup.policy.id, "job_send_followup")
         self.assertEqual(send_followup.policy.every, "20d")
+        self.assertIsNone(send_followup.policy.cron)
         self.assertEqual(send_followup.policy.retries, 5)
         self.assertEqual(send_followup.policy.timeout, "5m")
         self.assertEqual(send_followup.policy.rate_limit, "500/h")
@@ -56,6 +57,40 @@ class GumJobTests(unittest.TestCase):
         self.assertEqual(send_followup.policy.cpu, 2)
         self.assertEqual(send_followup.policy.memory, "2gb")
         self.assertEqual(send_followup.policy.key, "event_id")
+
+    def test_decorator_accepts_cron_policy(self) -> None:
+        @gum.job(cron="*/15 * * * *", timezone="America/New_York")
+        def refresh_index() -> None:
+            return None
+
+        self.assertEqual(refresh_index.policy.cron, "*/15 * * * *")
+        self.assertEqual(refresh_index.policy.timezone, "America/New_York")
+        self.assertIsNone(refresh_index.policy.every)
+
+    def test_decorator_accepts_compute_class(self) -> None:
+        @gum.job(compute_class="gpu")
+        def train_model() -> None:
+            return None
+
+        self.assertEqual(train_model.policy.compute_class, "gpu")
+
+    def test_decorator_rejects_every_and_cron_together(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only one of every or cron may be set"):
+            @gum.job(every="5m", cron="*/5 * * * *")
+            def invalid_job() -> None:
+                return None
+
+    def test_decorator_rejects_timezone_without_cron(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timezone requires cron"):
+            @gum.job(timezone="America/New_York")
+            def invalid_timezone_only() -> None:
+                return None
+
+    def test_decorator_rejects_compute_alias_conflict(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only one of compute_class or compute may be set"):
+            @gum.job(compute="standard", compute_class="gpu")
+            def invalid_compute_aliases() -> None:
+                return None
 
     def test_enqueue_uses_keyword_payload_and_client(self) -> None:
         client = _FakeClient()

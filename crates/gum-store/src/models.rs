@@ -20,6 +20,9 @@ pub struct DeployRecord {
     pub bundle_sha256: String,
     pub sdk_language: String,
     pub entrypoint: String,
+    pub python_version: Option<String>,
+    pub deps_mode: Option<String>,
+    pub deps_hash: Option<String>,
     pub status: DeployStatus,
 }
 
@@ -40,6 +43,7 @@ pub struct JobRecord {
     pub memory_mb: Option<u32>,
     pub key_field: Option<String>,
     pub compute_class: Option<String>,
+    pub required_secret_names: Vec<String>,
     pub enabled: bool,
     pub created_at_epoch_ms: i64,
 }

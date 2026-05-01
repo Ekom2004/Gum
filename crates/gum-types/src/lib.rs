@@ -31,7 +31,9 @@ pub enum AttemptStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeployStatus {
-    Uploading,
+    Registering,
+    Warming,
+    WarmupFailed,
     Ready,
     Failed,
 }

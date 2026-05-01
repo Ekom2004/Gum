@@ -1,0 +1,36 @@
+company,region,score,verdict,signal,source_url
+Doorway,Remote North America + Europe,5,Needs Gum Now,Wellfound role hires remotely in Europe + North America; Django/Redis/PostgreSQL,https://wellfound.com/jobs/3079687-senior-fullstack-engineer-django-react-analytics-aws
+FreshBooks,North America,5,Needs Gum Now,StackShare stack shows Python/Redis + Celery,https://stackshare.io/freshbooks/freshbooks
+HackerRank (DataScience stack),US,5,Needs Gum Now,StackShare stack lists Django + Redis + Celery,https://stackshare.io/hackerrank/datascience
+Halian (Backend Engineer posting),US Remote,5,Needs Gum Now,"LinkedIn post: Backend Engineer, 100% Remote within US, FastAPI + Celery + Redis",https://www.linkedin.com/jobs/view/backend-engineer-at-halian-managed-services-recruitment-agency-contract-staffing-4326700953
+Newcode.ai,US,5,Needs Gum Now,"US listing references stack including FastAPI, Redis, Celery",https://www.ziprecruiter.com/Jobs/Fastapi-Python/--in-California
+Sentry,US,5,Needs Gum Now,StackShare Celery discussion references Django + Celery + Redis,https://stackshare.io/tools/celery
+Shelton AI,Remote North America,5,Needs Gum Now,"Wellfound role: Python Backend Engineer, Remote US + Canada, Django/Celery",https://wellfound.com/jobs/3527154-python-backend-engineer-3-years-experience
+Soylent,US,5,Needs Gum Now,StackShare tech stack includes Celery + Django + RabbitMQ,https://stackshare.io/soylent
+Udemy,US,5,Needs Gum Now,StackShare tech stack includes Celery + Django + Redis,https://stackshare.io/udemy
+eligible,EU UK Remote,5,Needs Gum Now,"Wellfound role: Senior Back-End Engineer, Remote United Kingdom, stack includes Django/Celery",https://wellfound.com/jobs/3428171-senior-back-end-engineer
+Ansible,US,3,Maybe,StackShare comparisons list Ansible among Celery users,https://stackshare.io/stackups/celery-vs-kue
+Codecov,US,3,Maybe,StackShare Celery discussion: CTO notes Celery for long-running tasks,https://stackshare.io/tools/celery
+Net Power & Light,US,3,Maybe,StackShare stack shows Redis + Celery + RabbitMQ,https://stackshare.io/net-power-and-light/net-power-and-light
+Postmates,US,3,Maybe,StackShare comparisons list Postmates as a Celery user,https://stackshare.io/stackups/celery-vs-opm
+Zapier,US,3,Maybe,StackShare Celery adoption companies includes Zapier,https://stackshare.io/celery
+Bits of Stock,US Remote,2,Low,"Wellfound role: Senior Backend Developer, Remote United States, Django",https://wellfound.com/jobs/3402180-senior-backend-developer-take-ownership-of-our-investment-brokerage-services
+Civitos,US,2,Low,"Wellfound role: Senior Engineer (Django + React + GCP), Remote United States",https://wellfound.com/jobs/3722130-senior-engineer-full-stack-django-react-gcp
+Fleek,Remote North America,2,Low,"Wellfound role: Senior Backend Engineer FastAPI/Django, company location New York City",https://wellfound.com/jobs/3336634-senior-backend-engineer-fastapi-python-django-odoo
+Guidebook,US Remote,2,Low,"Wellfound role: Senior Backend Engineer, Remote United States, skills include Python/Django/PostgreSQL",https://wellfound.com/jobs/3851877-senior-backend-engineer
+H2 Cognitive Designs,EU UK,2,Low,Wellfound role: Backend Developer (AWS/Django) in London,https://wellfound.com/jobs/3971847-backend-developer-aws-django
+HOF Technologies,US,2,Low,"Wellfound role: Software Developer, Remote United States, Python/SQL/APIs (+ Django familiarity)",https://wellfound.com/jobs/3936467-software-developer
+Iterum,EU UK,2,Low,Wellfound London Django jobs listing includes Senior Software Engineer,https://wellfound.com/role/l/django-developer/london
+Kernel Intelligence,US Remote,2,Low,"Wellfound role: Backend Systems Engineer (Python/FastAPI), Remote United States",https://wellfound.com/jobs/3541646-backend-systems-engineer-freelance-contract-us-based
+Mirvie,US,2,Low,Wellfound role: Software Engineer (Python/Django) in South San Francisco,https://wellfound.com/jobs/3883220-software-engineer-python-django
+Photoroom,EU UK,2,Low,LinkedIn role: Senior Python Engineer (FastAPI/Python) in London,https://uk.linkedin.com/jobs/view/senior-python-engineer-fastapi-python-at-photoroom-4387477789
+QOVES,EU UK,2,Low,Wellfound role: Senior Backend Engineer (Python/FastAPI/Django) in London,https://wellfound.com/jobs/3541963-senior-backend-engineer-python-fastapi-django
+Safety Cybersecurity,US Remote,2,Low,"Wellfound role: Senior Full-stack Django Developer (US), Remote United States",https://wellfound.com/jobs/3212288-senior-full-stack-django-developer-us
+Serava,Remote North America,2,Low,Wellfound role hires remotely in North America with Python/Django/React,https://wellfound.com/jobs/3534683-full-stack-developer-python-django-react
+Slick,EU UK Remote,2,Low,"Wellfound role: Senior Backend Engineer, Remote United Kingdom, Python/Django/DRF",https://wellfound.com/jobs/3718330-senior-backend-engineer
+Urban SDK,US,2,Low,"LinkedIn role for Senior Python Engineer (FastAPI) in Jacksonville, FL",https://www.linkedin.com/jobs/view/senior-python-engineer-fastapi-microservices-at-urban-sdk-4234252834
+disguise,EU UK,2,Low,Wellfound London Django jobs listing includes Senior Full-Stack Developer - Cloud,https://wellfound.com/role/l/django-developer/london
+Axle Health,US,0,Low,"Wellfound company jobs: Senior Software Engineer, Backend in Santa Monica",https://wellfound.com/company/axle-health/jobs
+Breakroom,EU UK,0,Low,"Wellfound role: Senior Software Engineer, Backend in London",https://wellfound.com/jobs/3722877-senior-software-engineer-backend
+LemonStand,North America,0,Low,StackShare comparison snippet lists LemonStand in related usage context,https://stackshare.io/stackups/celery-vs-opm
+Pepper,Remote North America,0,Low,"Wellfound careers list: Senior Platform BE Engineer, Remote only Canada + United States",https://wellfound.com/company/usepepper

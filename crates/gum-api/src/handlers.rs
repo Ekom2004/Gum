@@ -5,22 +5,32 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::app_state::AppState;
 use crate::routes::{
-    AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, EnqueueRunRequest, LeaseRunRequest,
-    RegisterDeployRequest, RegisterRunnerRequest, RunnerHeartbeatRequest,
+    AppendLogRequest, CancelRunRequest, CompleteAttemptRequest, CompleteRuntimePrepareRequest,
+    EnqueueRunRequest, LeaseRunRequest, LeaseRuntimePrepareRequest, RegisterDeployRequest,
+    RegisterRunnerRequest, RunnerHeartbeatRequest, SecretMetadataResponse, SecretsListResponse,
+    SetSecretRequest,
 };
+use crate::secret_store::{ResolveSecretParams, SetSecretParams};
 use crate::service;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/deploys", post(register_deploy))
+        .route(
+            "/v1/deploys/:deploy_id/prepare-runtime",
+            post(prepare_runtime),
+        )
         .route("/v1/jobs/:job_id/runs", post(enqueue_run))
         .route("/v1/runs/:run_id", get(get_run))
         .route("/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/v1/runs/:run_id/replay", post(replay_run))
         .route("/v1/runs/:run_id/logs", get(get_logs))
+        .route("/v1/secrets", post(set_secret).get(list_secrets))
+        .route("/v1/secrets/:name", axum::routing::delete(delete_secret))
         .route("/internal/admin/runs", get(list_runs))
         .route("/internal/admin/runners", get(list_runners))
         .route("/internal/admin/leases", get(list_leases))
@@ -31,6 +41,14 @@ pub fn router(state: AppState) -> Router {
         .route("/internal/runners/heartbeat", post(heartbeat_runner))
         .route("/internal/leases/:lease_id", get(get_lease_state))
         .route("/internal/runs/lease", post(lease_run))
+        .route(
+            "/internal/runtime-prepares/lease",
+            post(lease_runtime_prepare),
+        )
+        .route(
+            "/internal/runtime-prepares/:deploy_id/complete",
+            post(complete_runtime_prepare),
+        )
         .route(
             "/internal/runs/:run_id/attempts/:attempt_id/logs",
             post(append_log),
@@ -58,6 +76,18 @@ pub struct EnqueueRunPayload {
     input: Value,
     #[serde(default)]
     delay: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecretsQuery {
+    #[serde(default)]
+    pub environment: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteSecretQuery {
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 impl ApiError {
@@ -139,6 +169,22 @@ pub async fn enqueue_run(
     result.map(Json).map_err(ApiError::from_message)
 }
 
+pub async fn prepare_runtime(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(deploy_id): Path<String>,
+) -> Result<Json<crate::routes::PrepareDeployRuntimeResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
+    let store = state.store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || service::request_runtime_prepare(&store, &deploy_id))
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("request runtime prepare task failed: {error}"))
+            })?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
 pub async fn get_run(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -197,6 +243,93 @@ pub async fn get_logs(
         .await
         .map_err(|error| ApiError::internal(format!("get logs task failed: {error}")))?;
     result.map(Json).map_err(ApiError::from_message)
+}
+
+pub async fn set_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SetSecretRequest>,
+) -> Result<Json<SecretMetadataResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
+    let environment = normalize_environment(payload.environment.as_deref());
+    if payload.name.trim().is_empty() {
+        return Err(ApiError::from_message(
+            "secret name cannot be empty".to_string(),
+        ));
+    }
+    if payload.value.is_empty() {
+        return Err(ApiError::from_message(
+            "secret value cannot be empty".to_string(),
+        ));
+    }
+    let secrets = state.secrets.clone();
+    let project_id = state.project_id.clone();
+    let name = payload.name.trim().to_string();
+    let value = payload.value;
+    let metadata = tokio::task::spawn_blocking(move || {
+        secrets.set_secret(SetSecretParams {
+            project_id,
+            environment,
+            name,
+            value,
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("set secret task failed: {error}")))?
+    .map_err(ApiError::from_message)?;
+    Ok(Json(secret_metadata_response(metadata)))
+}
+
+pub async fn list_secrets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<SecretsQuery>,
+) -> Result<Json<SecretsListResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
+    let environment = normalize_environment(query.environment.as_deref());
+    let secret_store = state.secrets.clone();
+    let project_id = state.project_id.clone();
+    let secrets =
+        tokio::task::spawn_blocking(move || secret_store.list_secrets(&project_id, &environment))
+            .await
+            .map_err(|error| ApiError::internal(format!("list secrets task failed: {error}")))?
+            .map_err(ApiError::from_message)?
+            .into_iter()
+            .map(secret_metadata_response)
+            .collect();
+    Ok(Json(SecretsListResponse { secrets }))
+}
+
+pub async fn delete_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DeleteSecretQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
+    if name.trim().is_empty() {
+        return Err(ApiError::from_message(
+            "secret name cannot be empty".to_string(),
+        ));
+    }
+    let environment = normalize_environment(query.environment.as_deref());
+    let secret_store = state.secrets.clone();
+    let project_id = state.project_id.clone();
+    let name = name.trim().to_string();
+    let deleted = tokio::task::spawn_blocking(move || {
+        secret_store.delete_secret(&project_id, &environment, &name)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("delete secret task failed: {error}")))?
+    .map_err(ApiError::from_message)?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "secret not found".to_string(),
+        })
+    }
 }
 
 pub async fn list_runs(
@@ -285,7 +418,51 @@ pub async fn lease_run(
         .map_err(|error| ApiError::internal(format!("lease task failed: {error}")))?
         .map_err(ApiError::from_message)?;
     match leased {
-        Some(run) => Ok(Json(run).into_response()),
+        Some(mut run) => {
+            let environment = secret_environment();
+            let secrets = state.secrets.clone();
+            let project_id = state.project_id.clone();
+            let required_secret_names = run.required_secret_names.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                let mut resolved = HashMap::new();
+                for secret_name in required_secret_names {
+                    let value = secrets.resolve_secret(ResolveSecretParams {
+                        project_id: project_id.clone(),
+                        environment: environment.clone(),
+                        name: secret_name.clone(),
+                    })?;
+                    if let Some(value) = value {
+                        resolved.insert(secret_name, value);
+                    }
+                }
+                Ok::<HashMap<String, String>, String>(resolved)
+            })
+            .await
+            .map_err(|error| ApiError::internal(format!("resolve secrets task failed: {error}")))?
+            .map_err(ApiError::from_message)?;
+            run.resolved_secrets = resolved;
+            Ok(Json(run).into_response())
+        }
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+pub async fn lease_runtime_prepare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LeaseRuntimePrepareRequest>,
+) -> Result<Response, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
+    let store = state.store.clone();
+    let leased =
+        tokio::task::spawn_blocking(move || service::lease_runtime_prepare(&store, payload))
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("lease runtime prepare task failed: {error}"))
+            })?
+            .map_err(ApiError::from_message)?;
+    match leased {
+        Some(prepare) => Ok(Json(prepare).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
@@ -341,6 +518,25 @@ pub async fn get_lease_state(
     }
 }
 
+pub async fn complete_runtime_prepare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(deploy_id): Path<String>,
+    Json(payload): Json<CompleteRuntimePrepareRequest>,
+) -> Result<Json<crate::routes::PrepareDeployRuntimeResponse>, ApiError> {
+    require_internal(&state.internal_key, &headers)?;
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _runner_id = payload.runner_id;
+        service::complete_runtime_prepare(&store, &deploy_id, payload.success)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal(format!("complete runtime prepare task failed: {error}"))
+    })?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
 pub async fn complete_attempt(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -365,6 +561,32 @@ fn require_admin(admin_key: &str, headers: &HeaderMap) -> Result<(), ApiError> {
         "missing admin authorization",
         "invalid admin authorization",
     )
+}
+
+fn normalize_environment(environment: Option<&str>) -> String {
+    let normalized = environment.unwrap_or("prod").trim();
+    if normalized.is_empty() {
+        "prod".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn secret_environment() -> String {
+    normalize_environment(std::env::var("GUM_SECRET_ENV").ok().as_deref())
+}
+
+fn secret_metadata_response(
+    metadata: crate::secret_store::SecretMetadata,
+) -> SecretMetadataResponse {
+    SecretMetadataResponse {
+        project_id: metadata.project_id,
+        environment: metadata.environment,
+        name: metadata.name,
+        backend: metadata.backend,
+        updated_at_epoch_ms: metadata.updated_at_epoch_ms,
+        last_used_at_epoch_ms: metadata.last_used_at_epoch_ms,
+    }
 }
 
 fn require_api_or_admin(

@@ -6,8 +6,11 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+base64 = "0.22"
 gum-store = { path = "../gum-store" }
 gum-types = { path = "../gum-types" }
+postgres.workspace = true
+ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

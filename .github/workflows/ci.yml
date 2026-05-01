@@ -31,3 +31,15 @@ jobs:
 
       - name: Run SDK unit tests
         run: python -m unittest discover -s sdk/tests -p "test_*.py"
+
+      - name: Install type checkers
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: python -m pip install mypy pyright
+
+      - name: Run mypy
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: mypy --config-file sdk/mypy.ini
+
+      - name: Run pyright
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: pyright --project sdk/pyrightconfig.json

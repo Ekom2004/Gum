@@ -25,3 +25,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossterm = "0.28"
 ratatui = "0.28"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = "0.10"

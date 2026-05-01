@@ -49,6 +49,9 @@ def slow_job():
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_slow".to_string(),
                 name: "slow_job".to_string(),
@@ -63,6 +66,7 @@ def slow_job():
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -171,6 +175,9 @@ def slow_job():
             bundle_sha256: "abc123".to_string(),
             sdk_language: "python".to_string(),
             entrypoint: "jobs.py".to_string(),
+            python_version: Some("3.11".to_string()),
+            deps_mode: None,
+            deps_hash: None,
             jobs: vec![RegisteredJob {
                 id: "job_cancel".to_string(),
                 name: "slow_job".to_string(),
@@ -185,6 +192,7 @@ def slow_job():
                 cpu_cores: None,
                 key_field: None,
                 compute_class: None,
+                required_secret_names: vec![],
             }],
         },
     )
@@ -304,10 +312,15 @@ fn leased_run_from_response(response: &LeaseRunResponse) -> LeasedRun {
         deploy_id: response.deploy_id.clone(),
         bundle_url: response.bundle_url.clone(),
         entrypoint: response.entrypoint.clone(),
+        python_version: response.python_version.clone(),
+        deps_mode: response.deps_mode.clone(),
+        deps_hash: response.deps_hash.clone(),
         handler_ref: response.handler_ref.clone(),
         timeout_secs: response.timeout_secs,
         cpu_cores: response.cpu_cores,
         memory_mb: response.memory_mb,
+        required_secret_names: response.required_secret_names.clone(),
+        resolved_secrets: response.resolved_secrets.clone(),
         input: response.input.clone(),
     }
 }

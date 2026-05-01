@@ -1,6 +1,7 @@
 use gum_types::AttemptStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeasedRun {
@@ -13,10 +14,20 @@ pub struct LeasedRun {
     pub deploy_id: String,
     pub bundle_url: String,
     pub entrypoint: String,
+    #[serde(default)]
+    pub python_version: Option<String>,
+    #[serde(default)]
+    pub deps_mode: Option<String>,
+    #[serde(default)]
+    pub deps_hash: Option<String>,
     pub handler_ref: String,
     pub timeout_secs: u32,
     pub cpu_cores: Option<u32>,
     pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub required_secret_names: Vec<String>,
+    #[serde(default)]
+    pub resolved_secrets: HashMap<String, String>,
     pub input: Value,
 }
 
@@ -81,4 +92,29 @@ pub struct LeaseStateResponse {
 pub struct LeaseRunRequest {
     pub runner_id: String,
     pub lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRuntimePrepareRequest {
+    pub runner_id: String,
+    pub lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeasedRuntimePrepare {
+    pub deploy_id: String,
+    pub bundle_url: String,
+    pub entrypoint: String,
+    #[serde(default)]
+    pub python_version: Option<String>,
+    #[serde(default)]
+    pub deps_mode: Option<String>,
+    #[serde(default)]
+    pub deps_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteRuntimePrepareRequest {
+    pub runner_id: String,
+    pub success: bool,
 }

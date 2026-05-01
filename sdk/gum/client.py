@@ -58,6 +58,12 @@ class DeployRef:
 
 
 @dataclass(slots=True)
+class DeployPrepareRef:
+    id: str
+    status: str
+
+
+@dataclass(slots=True)
 class RunnerStatus:
     id: str
     compute_class: str
@@ -89,6 +95,16 @@ class ConcurrencyStatus:
     queued_count: int
     active_run_ids: list[str]
     queued_run_ids: list[str]
+
+
+@dataclass(slots=True)
+class SecretMetadata:
+    project_id: str
+    environment: str
+    name: str
+    backend: str
+    updated_at_epoch_ms: int
+    last_used_at_epoch_ms: int | None = None
 
 
 class RunsAPI:
@@ -133,6 +149,37 @@ class AdminAPI:
         return [_concurrency_status_from_payload(item) for item in body.get("concurrency", [])]
 
 
+class SecretsAPI:
+    def __init__(self, client: "GumClient") -> None:
+        self._client = client
+
+    def set(self, name: str, value: str, *, environment: str | None = None) -> SecretMetadata:
+        body = self._client._request(
+            "POST",
+            "/v1/secrets",
+            {
+                "name": name,
+                "value": value,
+                "environment": environment,
+            },
+        )
+        return _secret_metadata_from_payload(body)
+
+    def list(self, *, environment: str | None = None) -> list[SecretMetadata]:
+        path = "/v1/secrets"
+        if environment:
+            path = f"{path}?environment={environment}"
+        body = self._client._request("GET", path)
+        return [_secret_metadata_from_payload(item) for item in body.get("secrets", [])]
+
+    def delete(self, name: str, *, environment: str | None = None) -> bool:
+        path = f"/v1/secrets/{name}"
+        if environment:
+            path = f"{path}?environment={environment}"
+        self._client._request("DELETE", path)
+        return True
+
+
 @dataclass(slots=True)
 class GumClient:
     base_url: str
@@ -148,6 +195,10 @@ class GumClient:
     def admin(self) -> AdminAPI:
         return AdminAPI(self)
 
+    @property
+    def secrets(self) -> SecretsAPI:
+        return SecretsAPI(self)
+
     def enqueue(self, job_id: str, payload: dict[str, Any], *, delay: str | None = None) -> RunRef:
         request_body: dict[str, Any] = {"input": payload}
         if delay is not None:
@@ -160,6 +211,13 @@ class GumClient:
         return DeployRef(
             id=body["id"],
             registered_jobs=body.get("registered_jobs", 0),
+        )
+
+    def prepare_deploy_runtime(self, deploy_id: str) -> DeployPrepareRef:
+        body = self._request("POST", f"/v1/deploys/{deploy_id}/prepare-runtime")
+        return DeployPrepareRef(
+            id=body["id"],
+            status=body["status"],
         )
 
     def backfill(self, job_id: str, items: list[dict[str, Any]]) -> BackfillRef:
@@ -274,4 +332,15 @@ def _concurrency_status_from_payload(payload: dict[str, Any]) -> ConcurrencyStat
         queued_count=payload["queued_count"],
         active_run_ids=list(payload.get("active_run_ids", [])),
         queued_run_ids=list(payload.get("queued_run_ids", [])),
+    )
+
+
+def _secret_metadata_from_payload(payload: dict[str, Any]) -> SecretMetadata:
+    return SecretMetadata(
+        project_id=payload["project_id"],
+        environment=payload["environment"],
+        name=payload["name"],
+        backend=payload["backend"],
+        updated_at_epoch_ms=payload["updated_at_epoch_ms"],
+        last_used_at_epoch_ms=payload.get("last_used_at_epoch_ms"),
     )

@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:reset": "sh ./scripts/dev-reset.sh",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"

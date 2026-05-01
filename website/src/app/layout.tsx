@@ -30,9 +30,9 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} text-white selection:bg-zinc-800 selection:text-white`}
         style={
           {
-            "--font-heading": 'var(--font-geist-sans), "Inter", "Satoshi", sans-serif',
-            "--font-body": 'var(--font-geist-sans), "Inter", "Satoshi", sans-serif',
-            "--font-sans": 'var(--font-geist-sans), "Inter", "Satoshi", sans-serif',
+            "--font-heading": 'var(--font-geist-sans), "Satoshi", "Plus Jakarta Sans", sans-serif',
+            "--font-body": 'var(--font-geist-sans), "Satoshi", "Plus Jakarta Sans", sans-serif',
+            "--font-sans": 'var(--font-geist-sans), "Satoshi", "Plus Jakarta Sans", sans-serif',
             "--font-mono": 'var(--font-geist-mono), "JetBrains Mono", "Fira Code", monospace',
           } as React.CSSProperties
         }
