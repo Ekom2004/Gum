@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
             post(prepare_runtime),
         )
         .route("/v1/jobs/:job_id/runs", post(enqueue_run))
+        .route("/v1/runs", get(list_project_runs))
         .route("/v1/runs/:run_id", get(get_run))
         .route("/v1/runs/:run_id/cancel", post(cancel_run))
         .route("/v1/runs/:run_id/replay", post(replay_run))
@@ -341,6 +342,22 @@ pub async fn list_runs(
     let result = tokio::task::spawn_blocking(move || service::list_runs(&store, 50))
         .await
         .map_err(|error| ApiError::internal(format!("list runs task failed: {error}")))?;
+    result.map(Json).map_err(ApiError::from_message)
+}
+
+pub async fn list_project_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::routes::RunsListResponse>, ApiError> {
+    require_api_or_admin(&state.api_key, &state.admin_key, &headers)?;
+    let store = state.store.clone();
+    let project_id = state.project_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || service::list_project_runs(&store, &project_id, 50))
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("list project runs task failed: {error}"))
+            })?;
     result.map(Json).map_err(ApiError::from_message)
 }
 

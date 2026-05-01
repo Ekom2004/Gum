@@ -1131,6 +1131,26 @@ impl GumStore for PostgresStore {
         rows.into_iter().map(run_from_row).collect()
     }
 
+    fn list_recent_runs_for_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, String> {
+        let mut client = self.connect_client()?;
+        let rows = client
+            .query(
+                "SELECT *,
+                        (EXTRACT(EPOCH FROM scheduled_at) * 1000)::bigint AS scheduled_at_epoch_ms
+                 FROM runs
+                 WHERE project_id = $1
+                 ORDER BY scheduled_at DESC, id DESC
+                 LIMIT $2",
+                &[&project_id, &(limit as i64)],
+            )
+            .map_err(|error| format!("failed to list recent runs for project: {error}"))?;
+        rows.into_iter().map(run_from_row).collect()
+    }
+
     fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String> {
         let mut client = self.connect_client()?;
         let rows = client

@@ -243,6 +243,28 @@ pub fn list_runs<S: GumStore>(store: &S, limit: usize) -> Result<RunsListRespons
     })
 }
 
+pub fn list_project_runs<S: GumStore>(
+    store: &S,
+    project_id: &str,
+    limit: usize,
+) -> Result<RunsListResponse, String> {
+    let concurrency = concurrency_status_map(store)?;
+    let rate_limit_waiting = rate_limit_waiting_run_ids(store)?;
+    Ok(RunsListResponse {
+        runs: store
+            .list_recent_runs_for_project(project_id, limit)?
+            .into_iter()
+            .map(|run| {
+                run_response(
+                    run.clone(),
+                    concurrency.get(&run.job_id),
+                    rate_limit_waiting.contains(&run.id),
+                )
+            })
+            .collect(),
+    })
+}
+
 pub fn list_runners<S: GumStore>(store: &S) -> Result<RunnersListResponse, String> {
     Ok(RunnersListResponse {
         runners: store

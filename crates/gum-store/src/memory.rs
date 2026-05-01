@@ -799,6 +799,33 @@ impl GumStore for MemoryStore {
         Ok(runs)
     }
 
+    fn list_recent_runs_for_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "memory store lock poisoned".to_string())?;
+        let mut runs: Vec<RunRecord> = state
+            .runs
+            .values()
+            .filter(|run| run.project_id == project_id)
+            .cloned()
+            .collect();
+        runs.sort_by(|left, right| {
+            right
+                .scheduled_at_epoch_ms
+                .cmp(&left.scheduled_at_epoch_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if runs.len() > limit {
+            runs.truncate(limit);
+        }
+        Ok(runs)
+    }
+
     fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String> {
         let state = self
             .state

@@ -140,3 +140,10 @@ Example key generation:
 ```bash
 openssl rand -hex 32
 ```
+
+## Bootstrap Guidance
+
+- Infra bootstrap scripts should treat the secret backend as an adapter choice, not a provider-specific assumption.
+- Pass `GUM_SECRET_BACKEND` explicitly from the environment when bringing up an API stack.
+- For durable backends like `postgres`, preserve the same `GUM_SECRET_MASTER_KEY` across restarts and redeploys.
+- Auto-generating a master key is acceptable only for first-time disposable environments; once secrets exist, rotating that key without migration will make existing secret values unreadable.

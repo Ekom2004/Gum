@@ -769,6 +769,11 @@ pub trait GumStore {
         limit: usize,
     ) -> Result<Vec<DeployRecord>, String>;
     fn list_recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>, String>;
+    fn list_recent_runs_for_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, String>;
     fn list_runners(&self) -> Result<Vec<RunnerStatusRecord>, String>;
     fn list_active_leases(&self) -> Result<Vec<LeaseStatusRecord>, String>;
     fn list_concurrency_status(&self) -> Result<Vec<ConcurrencyStatusRecord>, String>;

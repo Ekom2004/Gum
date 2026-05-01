@@ -25,6 +25,7 @@ class _FakeRunsAPI:
         self.replayed: list[str] = []
         self.logs_requested: list[str] = []
         self.get_requested: list[str] = []
+        self.list_admin_args: list[bool] = []
         self._run = RunRecord(
             id="run_123",
             job_id="job_export",
@@ -55,7 +56,8 @@ class _FakeRunsAPI:
         self.logs_requested.append(run_id)
         return list(self._logs)
 
-    def list(self) -> list[RunRecord]:
+    def list(self, *, admin: bool = False) -> list[RunRecord]:
+        self.list_admin_args.append(admin)
         return [self._run]
 
 
@@ -183,12 +185,11 @@ class CliTests(unittest.TestCase):
         self.assertIn("Status:   running", output)
 
     def test_list_command_prints_recent_runs(self) -> None:
-        gum_cli.load_admin_key = lambda _: "admin-secret"
-        gum_cli.getpass.getpass = lambda _: "passphrase"
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             exit_code = gum_cli.main(["list"])
         self.assertEqual(exit_code, 0)
+        self.assertEqual(self.client.runs.list_admin_args, [False])
         output = stdout.getvalue()
         self.assertIn("STATUS", output)
         self.assertIn("run_123", output)

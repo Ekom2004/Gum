@@ -29,7 +29,8 @@ This script will:
 2. create Postgres if missing
 3. attach Postgres to API (`DATABASE_URL`)
 4. set API + admin + internal runner secrets
-5. deploy API and runner
+5. configure the Gum secret backend through environment-driven adapter settings
+6. deploy API and runner
 
 Environment overrides:
 
@@ -43,10 +44,20 @@ GUM_RUNNER_COMPUTE_CLASS=standard \
 GUM_RUNNER_CPU_CORES=1 \
 GUM_RUNNER_MEMORY_MB=512 \
 GUM_RUNNER_MAX_CONCURRENT_LEASES=2 \
+GUM_SECRET_BACKEND=postgres \
+GUM_SECRET_MASTER_KEY=<32-byte key in hex/base64/raw> \
 GUM_API_KEY=your_api_key \
 GUM_ADMIN_KEY=your_admin_key \
 ./scripts/fly_staging_up.sh
 ```
+
+Secret backend notes:
+
+- `GUM_SECRET_BACKEND=postgres` is the staging default and is the recommended durable path.
+- If `GUM_SECRET_MASTER_KEY` is omitted on the first bootstrap, the script generates one and stores it in Fly secrets.
+- On later reruns, the script preserves the existing Fly-side `GUM_SECRET_MASTER_KEY` unless you explicitly provide a replacement.
+- For production or any rebuild where you might recreate the app, provide a stable `GUM_SECRET_MASTER_KEY` from your own secret manager.
+- `GUM_SECRET_BACKEND=memory` remains available for disposable dev environments, but it is not durable.
 
 Keep runner capacity aligned with actual VM size. Example:
 

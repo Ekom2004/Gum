@@ -212,8 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         client = default_client()
         if args.command == "list":
-            admin_client = require_admin_client(client)
-            runs = admin_client.runs.list()[: args.limit]
+            runs = client.runs.list()[: args.limit]
             print(render_run_table(runs))
             return 0
 
@@ -319,7 +318,7 @@ def handle_admin_command(args: argparse.Namespace, client: GumClient) -> int:
 
     if args.admin_command == "runs":
         if args.admin_runs_command == "list":
-            runs = admin_client.runs.list()[: args.limit]
+            runs = admin_client.runs.list(admin=True)[: args.limit]
             print(render_run_table(runs))
             return 0
         if args.admin_runs_command == "get":
@@ -600,7 +599,7 @@ def render_live_frame(run: RunRecord, logs: list[LogLine], *, log_lines: int, in
 
 def admin_live_view(*, client: GumClient, interval_secs: float, once: bool) -> int:
     while True:
-        runs = client.runs.list()
+        runs = client.runs.list(admin=True)
         runners = client.admin.runners()
         leases = client.admin.leases()
         frame = render_admin_live_frame(
@@ -701,7 +700,7 @@ class AdminSnapshot:
 
 
 def fetch_admin_snapshot(client: GumClient, state: AdminConsoleState) -> AdminSnapshot:
-    runs = filter_runs(client.runs.list(), state.filter_query)
+    runs = filter_runs(client.runs.list(admin=True), state.filter_query)
     runners = client.admin.runners()
     leases = client.admin.leases()
     logs: list[LogLine] = []

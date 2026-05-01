@@ -7,6 +7,7 @@ pub mod service;
 pub const EXTERNAL_ROUTES: &[&str] = &[
     "POST /v1/deploys",
     "POST /v1/jobs/{job_id}/runs",
+    "GET /v1/runs",
     "GET /v1/runs/{run_id}",
     "POST /v1/runs/{run_id}/replay",
     "GET /v1/runs/{run_id}/logs",

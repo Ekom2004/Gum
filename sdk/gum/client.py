@@ -127,8 +127,11 @@ class RunsAPI:
         body = self._client._request("GET", f"/v1/runs/{run_id}/logs")
         return [_log_line_from_payload(item) for item in body]
 
-    def list(self) -> list[RunRecord]:
-        body = self._client._request("GET", "/internal/admin/runs", use_admin_auth=True)
+    def list(self, *, admin: bool = False) -> list[RunRecord]:
+        if admin:
+            body = self._client._request("GET", "/internal/admin/runs", use_admin_auth=True)
+        else:
+            body = self._client._request("GET", "/v1/runs")
         return [_run_record_from_payload(item) for item in body.get("runs", [])]
 
 
