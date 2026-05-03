@@ -303,15 +303,18 @@ def _ensure_declared_dependencies(project_root: Path, module_paths: list[str]) -
     if not missing:
         return
 
-    lines = "\n".join(
-        f"  - {module_path} imports {import_name} but pyproject.toml does not include {distribution_name}"
-        for module_path, import_name, distribution_name in missing
-    )
-    raise DeployError(
-        "missing Python dependencies in pyproject.toml:\n"
-        f"{lines}\n"
-        "Add the missing package(s) and redeploy."
-    )
+    if _stdin_is_tty():
+        missing_distribution_names = [distribution_name for _, _, distribution_name in missing]
+        unique_distribution_names = sorted(dict.fromkeys(missing_distribution_names))
+        print(_render_missing_dependency_error(missing))
+        response = input(
+            f"Add {', '.join(unique_distribution_names)} to pyproject.toml and continue? [Y/n]: "
+        ).strip()
+        if response.lower() in {"", "y", "yes"}:
+            _add_dependencies_to_pyproject(pyproject_path, unique_distribution_names)
+            return
+
+    raise DeployError(_render_missing_dependency_error(missing))
 
 
 def _resolve_python_version(pyproject: dict[str, object]) -> str:
@@ -409,6 +412,91 @@ def _distribution_name_for_import(import_name: str) -> str:
 
 def _normalize_distribution_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _render_missing_dependency_error(missing: list[tuple[str, str, str]]) -> str:
+    lines = "\n".join(
+        f"  - {module_path} imports {import_name} but pyproject.toml does not include {distribution_name}"
+        for module_path, import_name, distribution_name in missing
+    )
+    return (
+        "missing Python dependencies in pyproject.toml:\n"
+        f"{lines}\n"
+        "Add the missing package(s) and redeploy."
+    )
+
+
+def _add_dependencies_to_pyproject(
+    pyproject_path: Path, distribution_names: list[str]
+) -> None:
+    original_text = pyproject_path.read_text(encoding="utf-8")
+    pyproject = tomllib.loads(original_text)
+    project = pyproject.get("project")
+    if not isinstance(project, dict):
+        raise DeployError("pyproject.toml is missing a [project] table")
+
+    existing_dependencies = list(_project_dependency_strings(project))
+    updated_dependencies = list(existing_dependencies)
+    existing_normalized = {
+        _normalize_distribution_name(_dependency_name(dependency))
+        for dependency in existing_dependencies
+    }
+    for distribution_name in distribution_names:
+        normalized = _normalize_distribution_name(distribution_name)
+        if normalized in existing_normalized:
+            continue
+        updated_dependencies.append(distribution_name)
+        existing_normalized.add(normalized)
+
+    updated_block = _render_dependency_block(updated_dependencies)
+    project_section_match = re.search(
+        r"(?ms)^\[project\]\n(?P<body>.*?)(?=^\[|\Z)",
+        original_text,
+    )
+    if project_section_match is None:
+        raise DeployError("pyproject.toml is missing a [project] section")
+
+    section_body = project_section_match.group("body")
+    dependencies_match = re.search(
+        r"(?ms)^dependencies\s*=\s*\[(?P<body>.*?)\]\s*$",
+        section_body,
+    )
+    if dependencies_match is not None:
+        start = project_section_match.start("body") + dependencies_match.start()
+        end = project_section_match.start("body") + dependencies_match.end()
+        updated_text = original_text[:start] + updated_block + original_text[end:]
+    else:
+        insertion_point = project_section_match.end("body")
+        prefix = "" if section_body.endswith("\n") or not section_body else "\n"
+        updated_text = (
+            original_text[:insertion_point]
+            + f"{prefix}{updated_block}\n"
+            + original_text[insertion_point:]
+        )
+
+    pyproject_path.write_text(updated_text, encoding="utf-8")
+
+
+def _project_dependency_strings(project: dict[str, object]) -> list[str]:
+    dependencies = project.get("dependencies")
+    if not isinstance(dependencies, list):
+        return []
+    return [dependency for dependency in dependencies if isinstance(dependency, str)]
+
+
+def _dependency_name(dependency: str) -> str:
+    match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", dependency)
+    if match is None:
+        return dependency.strip()
+    return match.group(1)
+
+
+def _render_dependency_block(dependencies: list[str]) -> str:
+    lines = ["dependencies = ["]
+    for dependency in dependencies:
+        lines.append(f'    "{dependency}",')
+    lines.append("]")
+    return "\n".join(lines)
 
 
 def _maybe_request_runtime_prepare(

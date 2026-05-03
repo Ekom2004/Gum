@@ -6,9 +6,9 @@ import tarfile
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 if sys.version_info < (3, 10):
     raise unittest.SkipTest("gum sdk tests require Python 3.10+")
@@ -576,7 +576,41 @@ class DeployDiscoveryTests(unittest.TestCase):
                 DeployError,
                 r"jobs\.py imports resend but pyproject\.toml does not include resend",
             ):
+                with patch.object(gum_deploy, "_stdin_is_tty", return_value=False):
+                    deploy_project(root, client=client)
+
+    def test_deploy_can_add_missing_dependency_interactively(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum']\n",
+                encoding="utf-8",
+            )
+            (root / "jobs.py").write_text(
+                textwrap.dedent(
+                    """
+                    import gum
+                    import resend
+
+                    @gum.job()
+                    def send_email():
+                        return None
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(existing_secrets=["RESEND_API_KEY"])
+
+            with patch.object(gum_deploy, "_stdin_is_tty", return_value=True), patch(
+                "builtins.input", return_value=""
+            ):
                 deploy_project(root, client=client)
+
+            pyproject_text = (root / "pyproject.toml").read_text(encoding="utf-8")
+            self.assertIn('"usegum"', pyproject_text)
+            self.assertIn('"resend"', pyproject_text)
+            self.assertIsNotNone(client.payload)
 
 
 if __name__ == "__main__":
