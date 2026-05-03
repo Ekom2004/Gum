@@ -76,7 +76,7 @@ export function SiteHeader({ current = "home", theme = "dark" }: SiteHeaderProps
               href="/docs"
               className="inline-flex h-10 items-center justify-center rounded-sm bg-zinc-50 px-4 font-mono text-[11px] uppercase tracking-[0.06em] text-black transition-colors hover:bg-zinc-200"
             >
-              Login
+              Sign in
             </Link>
             <Link
               href="/book-demo"
