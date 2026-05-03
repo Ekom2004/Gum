@@ -1,0 +1,12 @@
+app = "gum-scheduler-stg"
+primary_region = "yyz"
+
+[build]
+dockerfile = "Dockerfile.scheduler"
+
+[env]
+RUST_LOG = "info"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "256mb"

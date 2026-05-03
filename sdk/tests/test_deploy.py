@@ -226,7 +226,10 @@ class DeployDiscoveryTests(unittest.TestCase):
     def test_deploy_requests_remote_runtime_prepare_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum']\n",
+                encoding="utf-8",
+            )
             (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
             (root / "jobs.py").write_text(
                 textwrap.dedent(
@@ -253,7 +256,10 @@ class DeployDiscoveryTests(unittest.TestCase):
                 'project_id = "proj_file"\napi_base_url = "https://gum.example"\n',
                 encoding="utf-8",
             )
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum']\n",
+                encoding="utf-8",
+            )
             (root / "jobs.py").write_text(
                 textwrap.dedent(
                     """
@@ -298,7 +304,10 @@ class DeployDiscoveryTests(unittest.TestCase):
                 'project_id = "proj_file"\napi_base_url = "https://gum.example"\n',
                 encoding="utf-8",
             )
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum']\n",
+                encoding="utf-8",
+            )
             (root / "jobs.py").write_text(
                 textwrap.dedent(
                     """
@@ -352,7 +361,10 @@ class DeployDiscoveryTests(unittest.TestCase):
     def test_deploy_project_fails_when_provider_is_invalid_and_auto_sync_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum']\n",
+                encoding="utf-8",
+            )
             (root / "jobs.py").write_text(
                 textwrap.dedent(
                     """
@@ -488,7 +500,10 @@ class DeployDiscoveryTests(unittest.TestCase):
     def test_deploy_prompts_for_missing_resend_secret_in_tty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum','resend']\n",
+                encoding="utf-8",
+            )
             (root / "jobs.py").write_text(
                 textwrap.dedent(
                     """
@@ -514,7 +529,10 @@ class DeployDiscoveryTests(unittest.TestCase):
     def test_deploy_fails_when_missing_secret_non_interactive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum','resend']\n",
+                encoding="utf-8",
+            )
             (root / "jobs.py").write_text(
                 textwrap.dedent(
                     """
@@ -533,6 +551,32 @@ class DeployDiscoveryTests(unittest.TestCase):
             with patch.object(gum_deploy, "_stdin_is_tty", return_value=False):
                 with self.assertRaisesRegex(DeployError, "missing required secrets"):
                     deploy_project(root, client=client)
+
+    def test_deploy_fails_when_imported_dependency_is_missing_from_pyproject(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "jobs.py").write_text(
+                textwrap.dedent(
+                    """
+                    import gum
+                    import resend
+
+                    @gum.job()
+                    def send_email():
+                        return None
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            client = FakeClient()
+
+            with self.assertRaisesRegex(
+                DeployError,
+                r"jobs\.py imports resend but pyproject\.toml does not include resend",
+            ):
+                deploy_project(root, client=client)
 
 
 if __name__ == "__main__":

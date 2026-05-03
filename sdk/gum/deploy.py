@@ -36,6 +36,18 @@ _PROVIDER_SECRET_MAP = {
     "stripe": "STRIPE_API_KEY",
 }
 _SECRET_NAME_PATTERN = re.compile(r"^[A-Z0-9_]+$")
+_IMPORT_DISTRIBUTION_ALIASES = {
+    "gum": "usegum",
+    "PIL": "pillow",
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "jwt": "pyjwt",
+    "OpenSSL": "pyopenssl",
+    "sklearn": "scikit-learn",
+    "yaml": "pyyaml",
+}
 
 
 @dataclass(slots=True)
@@ -187,6 +199,7 @@ def deploy_project(
     if not jobs:
         raise DeployError("no gum jobs found")
 
+    _ensure_declared_dependencies(root, [job.module_path for job in jobs])
     _ensure_required_secrets(
         root,
         jobs,
@@ -271,6 +284,36 @@ def discover_runtime_spec(project_root: Path) -> RuntimeSpec:
     )
 
 
+def _ensure_declared_dependencies(project_root: Path, module_paths: list[str]) -> None:
+    pyproject_path = project_root / "pyproject.toml"
+    if not pyproject_path.exists():
+        raise DeployError("pyproject.toml not found")
+
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    declared_dependencies = _declared_dependency_names(pyproject)
+    external_imports = _discover_external_imports(project_root, module_paths)
+
+    missing: list[tuple[str, str, str]] = []
+    for module_path, import_name in external_imports:
+        distribution_name = _distribution_name_for_import(import_name)
+        if distribution_name in declared_dependencies:
+            continue
+        missing.append((module_path, import_name, distribution_name))
+
+    if not missing:
+        return
+
+    lines = "\n".join(
+        f"  - {module_path} imports {import_name} but pyproject.toml does not include {distribution_name}"
+        for module_path, import_name, distribution_name in missing
+    )
+    raise DeployError(
+        "missing Python dependencies in pyproject.toml:\n"
+        f"{lines}\n"
+        "Add the missing package(s) and redeploy."
+    )
+
+
 def _resolve_python_version(pyproject: dict[str, object]) -> str:
     project = pyproject.get("project")
     if not isinstance(project, dict):
@@ -278,10 +321,94 @@ def _resolve_python_version(pyproject: dict[str, object]) -> str:
     requires_python = project.get("requires-python")
     if not isinstance(requires_python, str):
         return "3.11"
-    match = re.search(r"([0-9]+)\\.([0-9]+)", requires_python)
+    match = re.search(r"([0-9]+)\.([0-9]+)", requires_python)
     if not match:
         return "3.11"
     return f"{match.group(1)}.{match.group(2)}"
+
+
+def _declared_dependency_names(pyproject: dict[str, object]) -> set[str]:
+    project = pyproject.get("project")
+    if not isinstance(project, dict):
+        return set()
+    dependencies = project.get("dependencies")
+    if not isinstance(dependencies, list):
+        return set()
+
+    declared: set[str] = set()
+    for dependency in dependencies:
+        if not isinstance(dependency, str):
+            continue
+        match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", dependency)
+        if not match:
+            continue
+        declared.add(_normalize_distribution_name(match.group(1)))
+    return declared
+
+
+def _discover_external_imports(
+    project_root: Path, module_paths: list[str]
+) -> list[tuple[str, str]]:
+    local_modules = _local_module_names(project_root)
+    stdlib_modules = getattr(sys, "stdlib_module_names", set())
+    found: set[tuple[str, str]] = set()
+
+    for module_path in sorted(set(module_paths)):
+        path = project_root / module_path
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for import_name in _imported_top_level_modules(tree):
+            if import_name in stdlib_modules:
+                continue
+            if import_name in local_modules:
+                continue
+            found.add((module_path, import_name))
+
+    return sorted(found)
+
+
+def _local_module_names(project_root: Path) -> set[str]:
+    local: set[str] = set()
+    for path in project_root.rglob("*.py"):
+        if path.name.startswith("."):
+            continue
+        if "__pycache__" in path.parts:
+            continue
+        relative_parts = path.relative_to(project_root).parts
+        if not relative_parts:
+            continue
+        if path.name == "__init__.py" and len(relative_parts) >= 2:
+            local.add(relative_parts[0])
+            continue
+        local.add(Path(relative_parts[0]).stem)
+    return local
+
+
+def _imported_top_level_modules(tree: ast.Module) -> set[str]:
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.add(alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                continue
+            if node.module is None:
+                continue
+            imports.add(node.module.split(".", 1)[0])
+    return imports
+
+
+def _distribution_name_for_import(import_name: str) -> str:
+    alias = _IMPORT_DISTRIBUTION_ALIASES.get(import_name)
+    if alias is not None:
+        return _normalize_distribution_name(alias)
+    return _normalize_distribution_name(import_name)
+
+
+def _normalize_distribution_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def _maybe_request_runtime_prepare(

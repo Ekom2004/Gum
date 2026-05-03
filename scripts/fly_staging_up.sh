@@ -7,6 +7,7 @@ ORG="${FLY_ORG:-gum}"
 REGION="${FLY_REGION:-yyz}"
 API_APP="${FLY_API_APP:-gum-api-stg}"
 RUNNER_APP="${FLY_RUNNER_APP:-gum-runner-stg}"
+SCHEDULER_APP="${FLY_SCHEDULER_APP:-gum-scheduler-stg}"
 PG_APP="${FLY_PG_APP:-gum-pg-stg}"
 PG_VM_SIZE="${FLY_PG_VM_SIZE:-shared-cpu-1x}"
 PG_VOLUME_GB="${FLY_PG_VOLUME_GB:-20}"
@@ -40,7 +41,7 @@ ADMIN_KEY_SOURCE="existing"
 INTERNAL_KEY_SOURCE="existing"
 
 echo "org=${ORG} region=${REGION}"
-echo "api=${API_APP} runner=${RUNNER_APP} postgres=${PG_APP}"
+echo "api=${API_APP} runner=${RUNNER_APP} scheduler=${SCHEDULER_APP} postgres=${PG_APP}"
 echo "secret_backend=${SECRET_BACKEND}"
 
 ensure_app() {
@@ -63,8 +64,26 @@ app_has_secret() {
     | grep -qx "${secret_name}"
 }
 
+first_machine_id() {
+  local app_name="$1"
+  fly machine list -a "${app_name}" 2>/dev/null \
+    | awk 'NR>4 && $1 != "" {print $1; exit}'
+}
+
+read_app_env_value() {
+  local app_name="$1"
+  local env_name="$2"
+  local machine_id
+  machine_id="$(first_machine_id "${app_name}")"
+  if [[ -z "${machine_id}" ]]; then
+    return 1
+  fi
+  fly ssh console -a "${app_name}" --machine "${machine_id}" -C "printenv ${env_name}" 2>/dev/null
+}
+
 ensure_app "${API_APP}"
 ensure_app "${RUNNER_APP}"
+ensure_app "${SCHEDULER_APP}"
 
 if [[ -n "${GUM_ADMIN_KEY:-}" ]]; then
   ADMIN_KEY_VALUE="${GUM_ADMIN_KEY}"
@@ -105,13 +124,20 @@ fi
 
 echo "attaching postgres to api app (idempotent)"
 if ! fly postgres attach --app "${API_APP}" "${PG_APP}" --yes; then
-  if fly secrets list -a "${API_APP}" 2>/dev/null | grep -q "DATABASE_URL"; then
+  if app_has_secret "${API_APP}" "DATABASE_URL"; then
     echo "postgres already attached to ${API_APP}; continuing"
   else
     echo "postgres attach failed and DATABASE_URL is missing" >&2
     exit 1
   fi
 fi
+
+SHARED_DATABASE_URL="$(read_app_env_value "${API_APP}" "DATABASE_URL" || true)"
+if [[ -z "${SHARED_DATABASE_URL}" ]]; then
+  echo "failed to read DATABASE_URL from ${API_APP}; scheduler must share the API database" >&2
+  exit 1
+fi
+echo "reusing ${API_APP} DATABASE_URL for ${SCHEDULER_APP}"
 
 API_SECRET_ARGS=(
   GUM_API_BIND_ADDR="0.0.0.0"
@@ -167,11 +193,51 @@ fi
 
 fly secrets set -a "${RUNNER_APP}" "${RUNNER_SECRET_ARGS[@]}"
 
+echo "setting scheduler secrets"
+SCHEDULER_SECRET_ARGS=(
+  DATABASE_URL="${SHARED_DATABASE_URL}"
+  GUM_SECRET_BACKEND="${SECRET_BACKEND}"
+)
+
+if [[ -n "${API_KEY_VALUE}" ]]; then
+  SCHEDULER_SECRET_ARGS+=(GUM_API_KEY="${API_KEY_VALUE}")
+fi
+
+if [[ -n "${ADMIN_KEY_VALUE}" ]]; then
+  SCHEDULER_SECRET_ARGS+=(GUM_ADMIN_KEY="${ADMIN_KEY_VALUE}")
+fi
+
+if [[ -n "${INTERNAL_KEY_VALUE}" ]]; then
+  SCHEDULER_SECRET_ARGS+=(GUM_INTERNAL_KEY="${INTERNAL_KEY_VALUE}")
+fi
+
+if [[ "${SECRET_BACKEND}" == "postgres" || "${SECRET_BACKEND}" == "postgresql" ]]; then
+  if [[ -n "${GUM_SECRET_MASTER_KEY:-}" ]]; then
+    SCHEDULER_SECRET_ARGS+=(GUM_SECRET_MASTER_KEY="${GUM_SECRET_MASTER_KEY}")
+  elif app_has_secret "${SCHEDULER_APP}" "GUM_SECRET_MASTER_KEY"; then
+    :
+  else
+    API_SECRET_MASTER_KEY="$(read_app_env_value "${API_APP}" "GUM_SECRET_MASTER_KEY" || true)"
+    if [[ -n "${API_SECRET_MASTER_KEY}" ]]; then
+      SCHEDULER_SECRET_ARGS+=(GUM_SECRET_MASTER_KEY="${API_SECRET_MASTER_KEY}")
+      echo "copied existing GUM_SECRET_MASTER_KEY from ${API_APP} to ${SCHEDULER_APP}"
+    else
+      echo "scheduler is missing GUM_SECRET_MASTER_KEY and no value is available to set" >&2
+      exit 1
+    fi
+  fi
+fi
+
+fly secrets set -a "${SCHEDULER_APP}" "${SCHEDULER_SECRET_ARGS[@]}"
+
 echo "deploying api"
 fly deploy -c "${REPO_ROOT}/deploy/fly/api.fly.toml" --app "${API_APP}" --remote-only
 
 echo "deploying runner"
 fly deploy -c "${REPO_ROOT}/deploy/fly/runner.fly.toml" --app "${RUNNER_APP}" --remote-only
+
+echo "deploying scheduler"
+fly deploy -c "${REPO_ROOT}/deploy/fly/scheduler.fly.toml" --app "${SCHEDULER_APP}" --remote-only
 
 echo
 echo "staging deploy complete"

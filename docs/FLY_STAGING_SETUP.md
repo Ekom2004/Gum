@@ -4,6 +4,7 @@ This document wires Gum staging on Fly with:
 
 - `gum-api-stg`
 - `gum-runner-stg`
+- `gum-scheduler-stg`
 - `gum-pg-stg`
 
 Default org: `gum`  
@@ -29,8 +30,14 @@ This script will:
 2. create Postgres if missing
 3. attach Postgres to API (`DATABASE_URL`)
 4. set API + admin + internal runner secrets
-5. configure the Gum secret backend through environment-driven adapter settings
-6. deploy API and runner
+5. point the scheduler at the same `DATABASE_URL` as the API and configure its secret/backend env
+6. configure the Gum secret backend through environment-driven adapter settings
+7. deploy API, runner, and scheduler
+
+Important:
+
+- The scheduler must share the same Gum database as the API.
+- Do not give the scheduler its own per-app Fly Postgres attachment/database, or it will tick an empty database and never see deployed jobs.
 
 Environment overrides:
 

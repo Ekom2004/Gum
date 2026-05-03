@@ -47,9 +47,9 @@ struct ProbeResult {
     status_code: Option<u16>,
 }
 
-pub async fn run_provider_probes<S: GumStore>(
+pub fn run_provider_probes<S: GumStore>(
     store: &S,
-    client: &reqwest::Client,
+    client: &reqwest::blocking::Client,
     now_epoch_ms: i64,
 ) -> Result<Vec<ProviderHealthRecord>, String> {
     let targets = store.list_provider_targets()?;
@@ -73,11 +73,7 @@ pub async fn run_provider_probes<S: GumStore>(
                         continue;
                     }
                     let degraded_latency_ms = config.degraded_latency_ms;
-                    (
-                        execute_http_probe(client, &config).await,
-                        degraded_latency_ms,
-                        None,
-                    )
+                    (execute_http_probe(client, &config), degraded_latency_ms, None)
                 }
                 Err(message) => (
                     ProbeResult {
@@ -176,14 +172,13 @@ fn probe_due(
     now_epoch_ms.saturating_sub(last_probe_epoch_ms) >= (interval_secs as i64) * 1000
 }
 
-async fn execute_http_probe(client: &reqwest::Client, config: &LoadedProbeConfig) -> ProbeResult {
+fn execute_http_probe(client: &reqwest::blocking::Client, config: &LoadedProbeConfig) -> ProbeResult {
     let started_at = std::time::Instant::now();
     let response = client
         .get(&config.url)
         .headers(config.headers.clone())
         .timeout(Duration::from_secs(config.timeout_secs))
-        .send()
-        .await;
+        .send();
     let elapsed_ms = elapsed_ms(started_at.elapsed());
 
     match response {
