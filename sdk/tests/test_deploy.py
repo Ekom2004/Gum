@@ -208,7 +208,10 @@ class DeployDiscoveryTests(unittest.TestCase):
     def test_package_project_creates_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname='demo'\ndependencies=['usegum']\n",
+                encoding="utf-8",
+            )
             (root / "jobs.py").write_text("print('hello')\n", encoding="utf-8")
 
             bundle_path = package_project(root)
@@ -216,6 +219,9 @@ class DeployDiscoveryTests(unittest.TestCase):
             self.assertTrue(bundle_path.exists())
             with tarfile.open(bundle_path, "r:gz") as archive:
                 self.assertIn("jobs.py", archive.getnames())
+                self.assertIn("requirements.txt", archive.getnames())
+                requirements_text = archive.extractfile("requirements.txt").read().decode("utf-8")
+                self.assertEqual(requirements_text, "usegum\n")
 
     def test_missing_manifest_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -294,8 +300,8 @@ class DeployDiscoveryTests(unittest.TestCase):
         self.assertEqual(client.payload["jobs"][0]["key_field"], "customer_id")
         self.assertIsNone(client.payload["jobs"][0]["compute_class"])
         self.assertEqual(client.payload["python_version"], "3.11")
-        self.assertIsNone(client.payload["deps_mode"])
-        self.assertIsNone(client.payload["deps_hash"])
+        self.assertEqual(client.payload["deps_mode"], "requirements_txt")
+        self.assertIsNotNone(client.payload["deps_hash"])
 
     def test_deploy_project_auto_syncs_fly_runner_capacity_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

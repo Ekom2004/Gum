@@ -4,6 +4,7 @@ import ast
 import base64
 import getpass
 import hashlib
+import io
 import os
 import re
 import sys
@@ -174,6 +175,7 @@ def package_project(project_root: Path) -> Path:
     if not (project_root / "pyproject.toml").exists():
         raise DeployError("pyproject.toml not found")
 
+    generated_requirements = _generated_requirements_text(project_root)
     bundle_dir = Path(tempfile.mkdtemp(prefix="gum-deploy-"))
     bundle_path = bundle_dir / "bundle.tar.gz"
     with tarfile.open(bundle_path, "w:gz") as archive:
@@ -183,6 +185,12 @@ def package_project(project_root: Path) -> Path:
             if ".git" in path.parts or "__pycache__" in path.parts:
                 continue
             archive.add(path, arcname=path.relative_to(project_root))
+        if generated_requirements is not None:
+            requirements_bytes = generated_requirements.encode("utf-8")
+            info = tarfile.TarInfo("requirements.txt")
+            info.size = len(requirements_bytes)
+            info.mtime = int(time.time())
+            archive.addfile(info, io.BytesIO(requirements_bytes))
     return bundle_path
 
 
@@ -284,6 +292,14 @@ def discover_runtime_spec(project_root: Path) -> RuntimeSpec:
             python_version=python_version,
             deps_mode="requirements_txt",
             deps_hash=hashlib.sha256(requirements_path.read_bytes()).hexdigest(),
+        )
+
+    generated_requirements = _render_requirements_from_pyproject(pyproject)
+    if generated_requirements is not None:
+        return RuntimeSpec(
+            python_version=python_version,
+            deps_mode="requirements_txt",
+            deps_hash=hashlib.sha256(generated_requirements.encode("utf-8")).hexdigest(),
         )
 
     return RuntimeSpec(
@@ -415,6 +431,27 @@ def _distribution_name_for_import(import_name: str) -> str:
 
 def _normalize_distribution_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _generated_requirements_text(project_root: Path) -> str | None:
+    if (project_root / "uv.lock").exists():
+        return None
+    requirements_path = project_root / "requirements.txt"
+    if requirements_path.exists():
+        return None
+    pyproject_path = project_root / "pyproject.toml"
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    return _render_requirements_from_pyproject(pyproject)
+
+
+def _render_requirements_from_pyproject(pyproject: dict[str, object]) -> str | None:
+    project = pyproject.get("project")
+    if not isinstance(project, dict):
+        return None
+    dependencies = _project_dependency_strings(project)
+    if not dependencies:
+        return None
+    return "".join(f"{dependency}\n" for dependency in dependencies)
 
 
 def _ensure_project_config_file(
