@@ -445,6 +445,8 @@ class CliTests(unittest.TestCase):
                     )
                 ],
                 deploy=DeployRef(id="dep_test", registered_jobs=1),
+                added_dependencies=["resend"],
+                bootstrapped_project_config=True,
             )
 
         gum_deploy.deploy_project = fake_deploy_project
@@ -465,6 +467,8 @@ class CliTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Gum deploy", output)
         self.assertIn("Project: proj_live", output)
+        self.assertIn("Created: gum.toml", output)
+        self.assertIn("Added dependencies: resend", output)
         self.assertIn("sync_customer [manual, retries=3, timeout=300s", output)
         self.assertIn("cpu=2", output)
         self.assertIn("memory=1024mb", output)

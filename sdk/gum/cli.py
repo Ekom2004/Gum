@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"API: {resolved_base_url}")
         print("")
         print("Next:")
-        print("  1. Add @gum.job(...) functions to jobs.py.")
+        print("  1. Add @gum.job(...) functions to your project.")
         print("  2. Run: gum deploy")
         return 0
 
@@ -378,7 +378,7 @@ def render_init_summary(result) -> str:
             "",
             "Next:",
             "  1. Run: gum login",
-            "  2. Add @gum.job(...) functions to jobs.py.",
+            "  2. Add @gum.job(...) functions to your project.",
             "  3. Run: gum deploy",
         ]
     )
@@ -393,8 +393,15 @@ def render_deploy_summary(result) -> str:
         f"API:     {result.api_base_url}",
         f"Root:    {result.project_root.name}",
         "",
-        f"Found {len(result.jobs)} {function_word}:",
     ]
+    if getattr(result, "bootstrapped_project_config", False):
+        lines.append("Created: gum.toml")
+    added_dependencies = list(getattr(result, "added_dependencies", []) or [])
+    if added_dependencies:
+        lines.append(f"Added dependencies: {', '.join(added_dependencies)}")
+    if getattr(result, "bootstrapped_project_config", False) or added_dependencies:
+        lines.append("")
+    lines.append(f"Found {len(result.jobs)} {function_word}:")
     for job in result.jobs:
         lines.append(f"  - {job.name} [{format_job_policy(job)}]")
     lines.extend(

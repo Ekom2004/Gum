@@ -94,6 +94,8 @@ class DeployResult:
     bundle_path: Path
     jobs: list[DiscoveredJob]
     deploy: DeployRef
+    added_dependencies: list[str] | None = None
+    bootstrapped_project_config: bool = False
 
 
 @dataclass(slots=True)
@@ -194,12 +196,17 @@ def deploy_project(
     root = Path(project_root or os.getcwd()).resolve()
     resolved_project_id = resolve_project_id(root, project_id)
     resolved_api_base_url = resolve_api_base_url(root, api_base_url)
+    bootstrapped_project_config = _ensure_project_config_file(
+        root,
+        project_id=resolved_project_id,
+        api_base_url=resolved_api_base_url,
+    )
     deploy_client = client or client_from_project(root, api_base_url=api_base_url)
     jobs = discover_jobs(root)
     if not jobs:
         raise DeployError("no gum jobs found")
 
-    _ensure_declared_dependencies(root, [job.module_path for job in jobs])
+    added_dependencies = _ensure_declared_dependencies(root, [job.module_path for job in jobs])
     _ensure_required_secrets(
         root,
         jobs,
@@ -252,6 +259,8 @@ def deploy_project(
         bundle_path=bundle_path,
         jobs=jobs,
         deploy=deploy,
+        added_dependencies=added_dependencies,
+        bootstrapped_project_config=bootstrapped_project_config,
     )
 
 
@@ -284,7 +293,7 @@ def discover_runtime_spec(project_root: Path) -> RuntimeSpec:
     )
 
 
-def _ensure_declared_dependencies(project_root: Path, module_paths: list[str]) -> None:
+def _ensure_declared_dependencies(project_root: Path, module_paths: list[str]) -> list[str]:
     pyproject_path = project_root / "pyproject.toml"
     if not pyproject_path.exists():
         raise DeployError("pyproject.toml not found")
@@ -301,20 +310,14 @@ def _ensure_declared_dependencies(project_root: Path, module_paths: list[str]) -
         missing.append((module_path, import_name, distribution_name))
 
     if not missing:
-        return
+        return []
 
-    if _stdin_is_tty():
-        missing_distribution_names = [distribution_name for _, _, distribution_name in missing]
-        unique_distribution_names = sorted(dict.fromkeys(missing_distribution_names))
-        print(_render_missing_dependency_error(missing))
-        response = input(
-            f"Add {', '.join(unique_distribution_names)} to pyproject.toml and continue? [Y/n]: "
-        ).strip()
-        if response.lower() in {"", "y", "yes"}:
-            _add_dependencies_to_pyproject(pyproject_path, unique_distribution_names)
-            return
-
-    raise DeployError(_render_missing_dependency_error(missing))
+    unique_distribution_names = sorted(
+        dict.fromkeys(distribution_name for _, _, distribution_name in missing)
+    )
+    _add_dependencies_to_pyproject(pyproject_path, unique_distribution_names)
+    print(f"Added dependencies to pyproject.toml: {', '.join(unique_distribution_names)}")
+    return unique_distribution_names
 
 
 def _resolve_python_version(pyproject: dict[str, object]) -> str:
@@ -414,16 +417,17 @@ def _normalize_distribution_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _render_missing_dependency_error(missing: list[tuple[str, str, str]]) -> str:
-    lines = "\n".join(
-        f"  - {module_path} imports {import_name} but pyproject.toml does not include {distribution_name}"
-        for module_path, import_name, distribution_name in missing
+def _ensure_project_config_file(
+    project_root: Path, *, project_id: str, api_base_url: str
+) -> bool:
+    config_path = project_root / CONFIG_FILE_NAME
+    if config_path.exists():
+        return False
+    config_path.write_text(
+        _render_gum_toml(project_id=project_id, api_base_url=api_base_url),
+        encoding="utf-8",
     )
-    return (
-        "missing Python dependencies in pyproject.toml:\n"
-        f"{lines}\n"
-        "Add the missing package(s) and redeploy."
-    )
+    return True
 
 
 def _add_dependencies_to_pyproject(
